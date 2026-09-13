@@ -850,12 +850,10 @@ func TestStreamEndSitesReportAbandonmentMessageOnceReleaseHasGivenUp(t *testing.
 	})
 }
 
-// TestHandleAbandonmentDrainsQueuedResponseBeforeFinalizing is
-// red-first: it fails on the current handleAbandonment, which
-// finalizes the active turn without draining the inbox first, so a
-// prompt response already queued when abandonment is observed is
-// discarded and the turn is reported abandoned instead of carrying
-// the queued response's own outcome. Calling handleAbandonment
+// TestHandleAbandonmentDrainsQueuedResponseBeforeFinalizing asserts
+// that a prompt response already queued when abandonment is observed
+// decides the turn, rather than being discarded while the turn is
+// reported abandoned. Calling handleAbandonment
 // directly, rather than driving it through runPump's own select,
 // keeps this deterministic: the assertion does not depend on which of
 // two simultaneously ready channels a live pump's select would have
