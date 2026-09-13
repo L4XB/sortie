@@ -453,6 +453,18 @@ func (p *pumpState) handleAbandonment() {
 	})
 }
 
+// releaseAbandoned reports whether the session's release has given up on
+// the connection's reader, even before runPump has handled that: the pump
+// may take a ready inbox item, or drain one, first.
+func (p *pumpState) releaseAbandoned() bool {
+	select {
+	case <-p.state.release.Abandoned():
+		return true
+	default:
+		return false
+	}
+}
+
 // armWriteFailedDeadline arms the bounded wait a write failure starts
 // for the active turn, or returns nil when no turn is active: a write
 // failure with nothing in flight has nothing to end early. The reader
@@ -678,7 +690,7 @@ func (p *pumpState) handleStartTurn(ts *turnStart) {
 		}}
 		return
 	}
-	if p.streamEnded {
+	if p.streamEnded || p.releaseAbandoned() {
 		ts.reply <- turnVerdict{accepted: false, err: &domain.AgentError{
 			Kind:    domain.ErrPortExit,
 			Message: p.state.release.TurnEndMessage(sessionEndedBeforeTurnMessage),

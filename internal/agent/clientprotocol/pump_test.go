@@ -699,6 +699,64 @@ func TestPumpStartTurnAfterAbandonmentRefusedWithReleaseMessage(t *testing.T) {
 	}
 }
 
+// TestHandleStartTurnRefusedOnceReleaseAbandonedBeforePumpHandlesIt
+// asserts that a start the pump handles after the release has given up,
+// but before the pump's own abandonment arm has run, is refused with the
+// release's message rather than accepted and sent on a connection the
+// release is closing.
+func TestHandleStartTurnRefusedOnceReleaseAbandonedBeforePumpHandlesIt(t *testing.T) {
+	t.Parallel()
+
+	outPr, outPw := io.Pipe()
+	inPr, inPw := io.Pipe()
+	inbox := jsonrpc.NewInbox[pumpItem]()
+	conn := jsonrpc.NewConn(outPw, inPr, jsonrpc.Deliver(inbox, wrapPumpMessage),
+		jsonrpc.WithVersionMember(), jsonrpc.WithMaxLineBytes(clientProtocolMaxLineBytes))
+	t.Cleanup(func() {
+		conn.Close()
+		_ = inPw.Close()
+		_ = outPr.Close()
+		_ = outPw.Close()
+		_ = inPr.Close()
+	})
+
+	p := &pumpState{
+		state: &sessionState{
+			caps:    newCapabilityRecord(false),
+			logger:  discardLogger(),
+			release: buildAbandonedRelease(t),
+			inbox:   inbox,
+			conn:    conn,
+		},
+	}
+	ts := &turnStart{
+		prompt:   "go",
+		sink:     make(chan domain.AgentEvent, 4),
+		resultCh: make(chan turnEnd, 1),
+		done:     make(chan struct{}),
+		cancelCh: make(chan struct{}),
+		reply:    make(chan turnVerdict, 1),
+	}
+
+	p.handleStartTurn(ts)
+
+	var verdict turnVerdict
+	select {
+	case verdict = <-ts.reply:
+	default:
+		t.Fatal("handleStartTurn() sent no verdict")
+	}
+	if verdict.accepted {
+		t.Fatal("handleStartTurn() accepted a turn after the release had given up, want it refused")
+	}
+	if verdict.err == nil || verdict.err.Kind != domain.ErrPortExit || verdict.err.Message != procutil.OutputAbandonedMessage {
+		t.Errorf("handleStartTurn() refusal = %v, want kind %q with message %q", verdict.err, domain.ErrPortExit, procutil.OutputAbandonedMessage)
+	}
+	if p.activeTurn != nil {
+		t.Error("handleStartTurn() left an active turn after refusing, want none")
+	}
+}
+
 // TestPumpAbandonmentKeepsPendingCancelledOutcome asserts that a turn
 // already winding down toward cancellation when the release abandons
 // keeps that pending outcome rather than the abandonment message.
