@@ -4,7 +4,7 @@
 //
 // The helper lives in this child package, rather than in agenttest itself,
 // because it imports agentcore: agentcore's own in-package tests declare
-// package agentcore and import agenttest for WriteScript and LogSpy, so an
+// package agentcore and import agenttest for FakeRuntime and LogSpy, so an
 // agenttest import of agentcore would close an import cycle and fail
 // go test ./internal/agent/agentcore with "import cycle not allowed in
 // test". agenttest MUST NOT import agentcore, directly or transitively, for
