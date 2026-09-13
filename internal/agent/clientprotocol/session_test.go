@@ -189,6 +189,23 @@ func TestRunTurnPreTurnWaits(t *testing.T) {
 	}
 }
 
+// takeQueuedItem takes the item runTurn left queued in state's inbox.
+// It fails t within awaitTimeout when nothing was queued, so a missing
+// startTurn control fails the test instead of blocking it.
+func takeQueuedItem(t *testing.T, state *sessionState) pumpItem {
+	t.Helper()
+	select {
+	case <-state.inbox.Ready():
+	case <-time.After(awaitTimeout):
+		t.Fatal("nothing was queued in the session inbox within awaitTimeout, want the startTurn control")
+	}
+	item, ok := state.inbox.Take()
+	if !ok {
+		t.Fatal("Take() ok = false, want the queued startTurn control")
+	}
+	return item
+}
+
 func TestDelayedTurnVerdictCannotBlockPump(t *testing.T) {
 	t.Parallel()
 
@@ -207,11 +224,7 @@ func TestDelayedTurnVerdictCannotBlockPump(t *testing.T) {
 	if !errors.As(outcome.err, &agentErr) || agentErr.Kind != domain.ErrResponseTimeout {
 		t.Fatalf("runTurn() error = %v, want *domain.AgentError kind %q", outcome.err, domain.ErrResponseTimeout)
 	}
-	<-state.inbox.Ready()
-	item, ok := state.inbox.Take()
-	if !ok {
-		t.Fatal("Take() ok = false, want the queued startTurn control")
-	}
+	item := takeQueuedItem(t, state)
 	pump := &pumpState{
 		state: state,
 		activeTurn: &activeTurn{
@@ -256,11 +269,7 @@ func TestAbandonedTurnIsNotStarted(t *testing.T) {
 		t.Fatalf("runTurn() error = %v, want *domain.AgentError kind %q", outcome.err, domain.ErrResponseTimeout)
 	}
 
-	<-state.inbox.Ready()
-	item, ok := state.inbox.Take()
-	if !ok {
-		t.Fatal("Take() ok = false, want the queued startTurn control")
-	}
+	item := takeQueuedItem(t, state)
 	// state.conn is nil here, so a pump that starts the turn anyway
 	// reaches the prompt send and panics rather than failing quietly.
 	pump := &pumpState{state: state}

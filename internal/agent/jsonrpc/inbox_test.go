@@ -264,6 +264,20 @@ func TestDeliver_PanicsOnNilInboxOrWrap(t *testing.T) {
 	})
 }
 
+// takeWithin waits up to timeout for inbox to hold an item or be
+// closed, then takes one. It fails t when nothing arrives in time, so
+// a delivery that never happens fails the test instead of blocking it
+// until the package timeout.
+func takeWithin[T any](t *testing.T, inbox *Inbox[T], timeout time.Duration) (T, bool) {
+	t.Helper()
+	select {
+	case <-inbox.Ready():
+	case <-time.After(timeout):
+		t.Fatalf("inbox held nothing to take within %v", timeout)
+	}
+	return inbox.Take()
+}
+
 // extractRequestID reads id from a JSON-RPC request line without
 // decoding the rest.
 func extractRequestID(t *testing.T, line []byte) int64 {
@@ -428,18 +442,15 @@ func TestInbox_StreamEndDeliveredLast(t *testing.T) {
 		_ = peerW.CloseWithError(errors.New("boom"))
 	}()
 
-	<-inbox.Ready()
-	msg1, ok := inbox.Take()
+	msg1, ok := takeWithin(t, inbox, 2*time.Second)
 	if !ok || msg1.Method != "one" {
 		t.Fatalf("first message = %+v, ok=%v, want method %q", msg1, ok, "one")
 	}
-	<-inbox.Ready()
-	msg2, ok := inbox.Take()
+	msg2, ok := takeWithin(t, inbox, 2*time.Second)
 	if !ok || msg2.Method != "two" {
 		t.Fatalf("second message = %+v, ok=%v, want method %q", msg2, ok, "two")
 	}
-	<-inbox.Ready()
-	msg3, ok := inbox.Take()
+	msg3, ok := takeWithin(t, inbox, 2*time.Second)
 	if !ok || msg3.Kind != KindStreamEnd {
 		t.Fatalf("third message = %+v, ok=%v, want Kind %v", msg3, ok, KindStreamEnd)
 	}

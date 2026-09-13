@@ -122,6 +122,7 @@ func TestConn_RealSubprocessNeverReadingStdin(t *testing.T) {
 	baseline := runtime.NumGoroutine()
 
 	stdin, stdout, releaseChild := startNeverReadingChild(t)
+	t.Cleanup(releaseChild)
 
 	conn := jsonrpc.NewConn(stdin, stdout, discardSink())
 
