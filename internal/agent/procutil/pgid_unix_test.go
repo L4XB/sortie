@@ -147,7 +147,10 @@ func runGroupLeader(_ []string, params groupLeaderParams) int {
 		fmt.Fprintf(os.Stderr, "group leader: start descendant: %v\n", err)
 		return 1
 	}
-	_ = cmd.Wait()
+	if err := cmd.Wait(); err != nil {
+		fmt.Fprintf(os.Stderr, "group leader: wait for descendant: %v\n", err)
+		return 1
+	}
 	return 0
 }
 
@@ -160,13 +163,17 @@ type groupDescendantParams struct {
 }
 
 func runGroupDescendant(_ []string, params groupDescendantParams) int {
+	// The handler is installed before the PID file publishes readiness:
+	// the test cancels as soon as it reads that file, and the default
+	// disposition would end this process before it records the signal.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGTERM)
+
 	if err := os.WriteFile(params.PIDFile, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
 		fmt.Fprintf(os.Stderr, "group descendant: write pid: %v\n", err)
 		return 1
 	}
 
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGTERM)
 	<-sig
 
 	if err := os.WriteFile(params.Marker, []byte("terminated"), 0o600); err != nil {
