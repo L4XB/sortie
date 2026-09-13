@@ -38,7 +38,9 @@ type trapParams struct {
 // [procutil.SignalGraceful] sends there) onto it.
 func trapScenario(_ []string, p trapParams) int {
 	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGTERM)
+	// Windows carries the graceful stop as a console control event, which
+	// the runtime delivers as an interrupt rather than as SIGTERM.
+	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
 
 	if err := os.WriteFile(p.Marker, []byte("ready"), 0o600); err != nil {
 		fmt.Fprintln(os.Stderr, err)

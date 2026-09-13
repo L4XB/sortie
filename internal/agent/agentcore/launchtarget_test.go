@@ -102,7 +102,7 @@ func TestResolveLaunchTarget(t *testing.T) {
 			defaultCommand: "claude",
 			setup: func(t *testing.T) {
 				t.Helper()
-				t.Setenv("PATH", fakeSSHDir(t)+":"+os.Getenv("PATH"))
+				t.Setenv("PATH", fakeSSHDir(t)+string(os.PathListSeparator)+os.Getenv("PATH"))
 			},
 			params: func(t *testing.T) domain.StartSessionParams {
 				return makeParams(t, dir, "user@host", "")
@@ -139,7 +139,7 @@ func TestResolveLaunchTarget(t *testing.T) {
 			defaultCommand: "claude",
 			setup: func(t *testing.T) {
 				t.Helper()
-				t.Setenv("PATH", fakeSSHDir(t)+":"+os.Getenv("PATH"))
+				t.Setenv("PATH", fakeSSHDir(t)+string(os.PathListSeparator)+os.Getenv("PATH"))
 			},
 			params: func(t *testing.T) domain.StartSessionParams {
 				return makeParams(t, filepath.Join(dir, "nope"), "user@host", "")
@@ -151,7 +151,7 @@ func TestResolveLaunchTarget(t *testing.T) {
 			defaultCommand: "claude",
 			setup: func(t *testing.T) {
 				t.Helper()
-				t.Setenv("PATH", fakeSSHDir(t)+":"+os.Getenv("PATH"))
+				t.Setenv("PATH", fakeSSHDir(t)+string(os.PathListSeparator)+os.Getenv("PATH"))
 			},
 			params: func(t *testing.T) domain.StartSessionParams {
 				return makeParams(t, dir, "  user@host  ", "")
