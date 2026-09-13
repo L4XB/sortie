@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -48,8 +47,7 @@ func runTurnCounterScenario(_ []string, params turnCounterOutput) int {
 		fmt.Fprintf(os.Stderr, "turn counter: create marker: %v\n", err)
 		return 1
 	}
-	_, _ = io.WriteString(os.Stdout, params.Stdout)
-	return 0
+	return agenttest.Output{Stdout: params.Stdout}.Run()
 }
 
 // firstTurnOnlyBinary returns a fake copilot runtime that writes stdout

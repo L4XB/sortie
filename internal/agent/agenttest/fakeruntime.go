@@ -62,6 +62,26 @@ func Typed[P any](run func(args []string, params P) int) Scenario {
 	}
 }
 
+// Run writes Stdout and Stderr, blocks when Hang is set, and reports the
+// status the fake runtime exits with. A scenario of its own calls it for
+// the output half of its behavior.
+//
+// A failed write ends the runtime with status 2 instead of ExitCode, so a
+// fixture never reports the success of output the test never received.
+func (o Output) Run() int {
+	if _, err := io.WriteString(os.Stdout, o.Stdout); err != nil {
+		fmt.Fprintf(os.Stderr, "fake runtime: write stdout: %v\n", err)
+		return 2
+	}
+	if _, err := io.WriteString(os.Stderr, o.Stderr); err != nil {
+		return 2
+	}
+	if o.Hang {
+		Hang()
+	}
+	return o.ExitCode
+}
+
 // Hang blocks until the process is killed. It sleeps rather than
 // blocking on a channel because a pending timer keeps the Go runtime's
 // deadlock detector from ending the process on its own.
@@ -129,12 +149,7 @@ func runScenario(config []byte, scenarios map[string]Scenario) int {
 }
 
 func writeOutput(_ []string, out Output) int {
-	_, _ = io.WriteString(os.Stdout, out.Stdout)
-	_, _ = io.WriteString(os.Stderr, out.Stderr)
-	if out.Hang {
-		Hang()
-	}
-	return out.ExitCode
+	return out.Run()
 }
 
 func configPath(exe string) string {

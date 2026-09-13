@@ -42,15 +42,17 @@ type sequentialOutputParams struct {
 func scenarioSequentialOutput(_ []string, params sequentialOutputParams) int {
 	out := params.Then
 	if _, err := os.Stat(params.MarkerPath); err != nil {
+		if !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "sequential output: stat marker: %v\n", err)
+			return 2
+		}
 		out = params.First
-		_ = os.WriteFile(params.MarkerPath, nil, 0o600)
+		if err := os.WriteFile(params.MarkerPath, nil, 0o600); err != nil {
+			fmt.Fprintf(os.Stderr, "sequential output: create marker: %v\n", err)
+			return 2
+		}
 	}
-	_, _ = fmt.Fprint(os.Stdout, out.Stdout)
-	_, _ = fmt.Fprint(os.Stderr, out.Stderr)
-	if out.Hang {
-		agenttest.Hang()
-	}
-	return out.ExitCode
+	return out.Run()
 }
 
 func TestMain(m *testing.M) {

@@ -31,19 +31,31 @@ func runMCPToolServer(_ []string, params mcpToolServerParams) int {
 		if err := json.Unmarshal(line, &req); err != nil {
 			continue
 		}
+		var err error
 		switch req.Method {
 		case "initialize":
-			_, _ = fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":%q,"version":"0.0.0"}}}`+"\n", req.ID, toolServerName)
+			err = respond(`{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":%q,"version":"0.0.0"}}}`, req.ID, toolServerName)
 		case "tools/list":
-			_, _ = fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":%q,"description":"records that the qualification probe induced a call","inputSchema":{"type":"object","properties":{}}}]}}`+"\n", req.ID, probeToolName)
+			err = respond(`{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":%q,"description":"records that the qualification probe induced a call","inputSchema":{"type":"object","properties":{}}}]}}`, req.ID, probeToolName)
 		case "tools/call":
-			if err := recordToolCall(params.RecordPath, line); err != nil {
-				fmt.Fprintf(os.Stderr, "record tool call: %v\n", err)
+			if recordErr := recordToolCall(params.RecordPath, line); recordErr != nil {
+				fmt.Fprintf(os.Stderr, "record tool call: %v\n", recordErr)
+				return 1
 			}
-			_, _ = fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"ok"}]}}`+"\n", req.ID)
+			err = respond(`{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"ok"}]}}`, req.ID)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "respond to %s: %v\n", req.Method, err)
+			return 1
 		}
 	}
 	return 0
+}
+
+// respond writes one JSON-RPC response line to standard output.
+func respond(format string, args ...any) error {
+	_, err := fmt.Fprintf(os.Stdout, format+"\n", args...)
+	return err
 }
 
 // recordToolCall appends line, followed by a newline, to path.

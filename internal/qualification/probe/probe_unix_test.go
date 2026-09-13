@@ -5,7 +5,6 @@ package probe
 import (
 	"errors"
 	"fmt"
-	"io"
 	"math"
 	"os"
 	"os/exec"
@@ -58,9 +57,7 @@ func runVersionCanary(args []string, out agenttest.Output) int {
 		fmt.Fprintf(os.Stderr, "unexpected args: %s\n", strings.Join(args, " "))
 		return 9
 	}
-	_, _ = io.WriteString(os.Stdout, out.Stdout)
-	_, _ = io.WriteString(os.Stderr, out.Stderr)
-	return out.ExitCode
+	return out.Run()
 }
 
 // init registers this build tag's own fake-runtime scenarios into
