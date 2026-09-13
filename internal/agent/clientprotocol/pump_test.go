@@ -3,6 +3,7 @@ package clientprotocol
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -10,6 +11,7 @@ import (
 	"go/token"
 	"io"
 	"log/slog"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +21,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest/dispositiontest"
 	"github.com/sortie-ai/sortie/internal/agent/jsonrpc"
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
@@ -523,5 +526,426 @@ func TestRunTurn_StalledConsumerDoesNotParkPump(t *testing.T) {
 		if want := fmt.Sprintf("%d", i); text != want {
 			t.Errorf("notification %d text = %q, want %q (chunks out of order)", i, text, want)
 		}
+	}
+}
+
+// buildTestOwnedPipes returns a *procutil.OwnedPipes backed by real
+// pipe files, closed in cleanup. The release tests below need a valid
+// Pipes value to satisfy StartOutputRelease's nil check, but these
+// files are never wired to the connection under test: the release's
+// own CloseStdout call must never reach the connection's real reader,
+// which is what proves the pump reacts to abandonment on its own
+// rather than because closing this file happened to unpark anything.
+func buildTestOwnedPipes(t *testing.T) *procutil.OwnedPipes {
+	t.Helper()
+	outRead, outWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() error = %v", err)
+	}
+	errRead, errWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = outWrite.Close()
+		_ = outRead.Close()
+		_ = errWrite.Close()
+		_ = errRead.Close()
+	})
+	return &procutil.OwnedPipes{Stdout: outRead, Stderr: errRead}
+}
+
+// newTestSessionWithRelease behaves like newTestSession, except
+// state.release is a real *procutil.OutputRelease, constructed with
+// ReaderDone tied to the connection's own Done channel exactly as
+// startSession wires it in production, and Reaped left to the
+// caller so each test controls when the release's post-reap wait
+// begins.
+func newTestSessionWithRelease(t *testing.T, grace time.Duration, reaped <-chan struct{}) (*sessionState, *io.PipeReader, *io.PipeWriter) {
+	t.Helper()
+
+	outPr, outPw := io.Pipe()
+	inPr, inPw := io.Pipe()
+
+	state := &sessionState{
+		caps:     newCapabilityRecord(false),
+		stopCh:   make(chan struct{}),
+		pumpDone: make(chan struct{}),
+		logger:   discardLogger(),
+		origins:  &sessionOrigins{},
+	}
+	state.inbox = jsonrpc.NewInbox[pumpItem]()
+	state.conn = jsonrpc.NewConn(outPw, inPr, jsonrpc.Deliver(state.inbox, wrapPumpMessage),
+		jsonrpc.WithVersionMember(), jsonrpc.WithMaxLineBytes(clientProtocolMaxLineBytes))
+
+	state.release = procutil.StartOutputRelease(procutil.OutputReleaseParams{
+		Pipes:      buildTestOwnedPipes(t),
+		Reaped:     reaped,
+		ReaderDone: state.conn.Done(),
+		Grace:      grace,
+		Logger:     discardLogger(),
+	})
+
+	go runPump(state)
+
+	t.Cleanup(func() {
+		_ = inPw.Close()
+		state.stopOnce.Do(func() { close(state.stopCh) })
+		<-state.pumpDone
+		_ = outPr.Close()
+		_ = outPw.Close()
+		_ = inPr.Close()
+	})
+
+	return state, outPr, inPw
+}
+
+// TestPumpAbandonmentFinalizesActiveTurnWithoutWaitingOnConnDone asserts
+// that, with the connection's reader left parked for the whole test
+// (inPw is never closed, so state.conn.Done() never fires on its own),
+// an active turn still finalizes once the release gives up, inside a
+// bound derived from the injected grace, naming the runtime's exit.
+func TestPumpAbandonmentFinalizesActiveTurnWithoutWaitingOnConnDone(t *testing.T) {
+	t.Parallel()
+
+	const grace = 150 * time.Millisecond
+	reaped := make(chan struct{})
+	state, outPr, _ := newTestSessionWithRelease(t, grace, reaped)
+	out := newOutboundReader(outPr)
+	outcomeCh := startTurnAwaitingPrompt(t, state, out)
+
+	start := time.Now()
+	close(reaped)
+
+	outcome := awaitOutcome(t, outcomeCh)
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("the turn finalized after %v, want it bounded by the injected grace %v rather than the parked reader's own unbounded wait", elapsed, grace)
+	}
+	dispositiontest.AssertDispositionContract(t, agentcore.TurnEvidence{
+		Terminal:          agentcore.TerminalFailure,
+		TerminalErrorKind: domain.ErrPortExit,
+		TerminalMessage:   procutil.OutputAbandonedMessage,
+	}, outcome.result, outcome.err)
+}
+
+// TestPumpReaderDoneInsideGraceLeavesStreamEndOutcomeUntouched asserts
+// that a reader ending inside the grace leaves the release's latch
+// unset and the turn's outcome exactly what the ordinary stream-end
+// path decides, with no abandonment message substituted.
+func TestPumpReaderDoneInsideGraceLeavesStreamEndOutcomeUntouched(t *testing.T) {
+	t.Parallel()
+
+	const grace = 2 * time.Second
+	reaped := make(chan struct{})
+	close(reaped)
+	state, outPr, inPw := newTestSessionWithRelease(t, grace, reaped)
+	out := newOutboundReader(outPr)
+	outcomeCh := startTurnAwaitingPrompt(t, state, out)
+
+	if err := inPw.Close(); err != nil {
+		t.Fatalf("close the simulated agent stream: %v", err)
+	}
+
+	outcome := awaitOutcome(t, outcomeCh)
+	dispositiontest.AssertDispositionContract(t, agentcore.TurnEvidence{
+		Terminal:          agentcore.TerminalFailure,
+		TerminalErrorKind: domain.ErrPortExit,
+		TerminalMessage:   streamEndedMessage,
+	}, outcome.result, outcome.err)
+
+	// The outcome above finalizes within milliseconds of the reader
+	// ending, well before grace could have elapsed on its own; waiting
+	// out grace here, rather than checking right away, is what proves
+	// the release's own ReaderDone arm caught the close rather than the
+	// assertion simply running before an unattended timer could have
+	// fired.
+	select {
+	case <-state.release.Abandoned():
+		t.Error("the release abandoned though the reader ended inside its grace, want the latch to stay unset")
+	case <-time.After(grace + 500*time.Millisecond):
+	}
+}
+
+// TestPumpStartTurnAfterAbandonmentRefusedWithReleaseMessage asserts
+// that a turn started after the release has abandoned is refused through
+// handleStartTurn's streamEnded path, with the release's own message.
+func TestPumpStartTurnAfterAbandonmentRefusedWithReleaseMessage(t *testing.T) {
+	t.Parallel()
+
+	const grace = 30 * time.Millisecond
+	reaped := make(chan struct{})
+	state, _, _ := newTestSessionWithRelease(t, grace, reaped)
+	markSessionKnown(state)
+
+	close(reaped)
+	select {
+	case <-state.release.Abandoned():
+	case <-time.After(awaitTimeout):
+		t.Fatal("the release never abandoned within the test's wait bound")
+	}
+
+	outcomeCh := runTurnAsync(state, domain.RunTurnParams{Prompt: "go", OnEvent: func(domain.AgentEvent) {}})
+	outcome := awaitOutcome(t, outcomeCh)
+
+	var agentErr *domain.AgentError
+	if !errors.As(outcome.err, &agentErr) {
+		t.Fatalf("RunTurn() error = %v, want *domain.AgentError", outcome.err)
+	}
+	if agentErr.Kind != domain.ErrPortExit {
+		t.Errorf("RunTurn() error kind = %q, want %q", agentErr.Kind, domain.ErrPortExit)
+	}
+	if agentErr.Message != procutil.OutputAbandonedMessage {
+		t.Errorf("RunTurn() error message = %q, want %q", agentErr.Message, procutil.OutputAbandonedMessage)
+	}
+}
+
+// TestHandleStartTurnRefusedOnceReleaseAbandonedBeforePumpHandlesIt
+// asserts that a start the pump handles after the release has given up,
+// but before the pump's own abandonment arm has run, is refused with the
+// release's message rather than accepted and sent on a connection the
+// release is closing.
+func TestHandleStartTurnRefusedOnceReleaseAbandonedBeforePumpHandlesIt(t *testing.T) {
+	t.Parallel()
+
+	outPr, outPw := io.Pipe()
+	inPr, inPw := io.Pipe()
+	inbox := jsonrpc.NewInbox[pumpItem]()
+	conn := jsonrpc.NewConn(outPw, inPr, jsonrpc.Deliver(inbox, wrapPumpMessage),
+		jsonrpc.WithVersionMember(), jsonrpc.WithMaxLineBytes(clientProtocolMaxLineBytes))
+	t.Cleanup(func() {
+		conn.Close()
+		_ = inPw.Close()
+		_ = outPr.Close()
+		_ = outPw.Close()
+		_ = inPr.Close()
+	})
+
+	p := &pumpState{
+		state: &sessionState{
+			caps:    newCapabilityRecord(false),
+			logger:  discardLogger(),
+			release: buildAbandonedRelease(t),
+			inbox:   inbox,
+			conn:    conn,
+		},
+	}
+	ts := &turnStart{
+		prompt:   "go",
+		sink:     make(chan domain.AgentEvent, 4),
+		resultCh: make(chan turnEnd, 1),
+		done:     make(chan struct{}),
+		cancelCh: make(chan struct{}),
+		reply:    make(chan turnVerdict, 1),
+	}
+
+	p.handleStartTurn(ts)
+
+	var verdict turnVerdict
+	select {
+	case verdict = <-ts.reply:
+	default:
+		t.Fatal("handleStartTurn() sent no verdict")
+	}
+	if verdict.accepted {
+		t.Fatal("handleStartTurn() accepted a turn after the release had given up, want it refused")
+	}
+	if verdict.err == nil || verdict.err.Kind != domain.ErrPortExit || verdict.err.Message != procutil.OutputAbandonedMessage {
+		t.Errorf("handleStartTurn() refusal = %v, want kind %q with message %q", verdict.err, domain.ErrPortExit, procutil.OutputAbandonedMessage)
+	}
+	if p.activeTurn != nil {
+		t.Error("handleStartTurn() left an active turn after refusing, want none")
+	}
+}
+
+// TestPumpAbandonmentKeepsPendingCancelledOutcome asserts that a turn
+// already winding down toward cancellation when the release abandons
+// keeps that pending outcome rather than the abandonment message.
+func TestPumpAbandonmentKeepsPendingCancelledOutcome(t *testing.T) {
+	t.Parallel()
+
+	const grace = 150 * time.Millisecond
+	reaped := make(chan struct{})
+	state, outPr, _ := newTestSessionWithRelease(t, grace, reaped)
+	out := newOutboundReader(outPr)
+	markSessionKnown(state)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	outcomeCh := runTurnAsyncCtx(ctx, state, domain.RunTurnParams{Prompt: "go", OnEvent: func(domain.AgentEvent) {}})
+	out.awaitMethod(t, methodSessionPrompt)
+
+	cancel()
+	out.awaitMethod(t, methodSessionCancel)
+
+	close(reaped)
+
+	outcome := awaitOutcome(t, outcomeCh)
+	dispositiontest.AssertDispositionContract(t, agentcore.TurnEvidence{
+		Terminal: agentcore.TerminalCancelled,
+	}, outcome.result, outcome.err)
+}
+
+// TestPumpReturnsOnStopChAfterAbandonmentWithReaderDoneNeverClosing
+// asserts that once the release has abandoned, runPump also returns on
+// state.stopCh, even though the connection's reader (inPw) is never
+// closed and so never ends on its own.
+func TestPumpReturnsOnStopChAfterAbandonmentWithReaderDoneNeverClosing(t *testing.T) {
+	t.Parallel()
+
+	const grace = 30 * time.Millisecond
+	reaped := make(chan struct{})
+	state, _, _ := newTestSessionWithRelease(t, grace, reaped)
+
+	close(reaped)
+	select {
+	case <-state.release.Abandoned():
+	case <-time.After(awaitTimeout):
+		t.Fatal("the release never abandoned within the test's wait bound")
+	}
+
+	state.stopOnce.Do(func() { close(state.stopCh) })
+
+	select {
+	case <-state.pumpDone:
+	case <-time.After(awaitTimeout):
+		t.Fatal("runPump did not return on state.stopCh after abandonment, though the connection's reader never ended")
+	}
+}
+
+// buildAbandonedRelease returns a *procutil.OutputRelease that has
+// already given up, for a pumpState test that needs
+// release.TurnEndMessage to report the abandonment message without
+// driving a live pump or a real subprocess.
+func buildAbandonedRelease(t *testing.T) *procutil.OutputRelease {
+	t.Helper()
+	reaped := make(chan struct{})
+	close(reaped)
+	r := procutil.StartOutputRelease(procutil.OutputReleaseParams{
+		Pipes:      buildTestOwnedPipes(t),
+		Reaped:     reaped,
+		ReaderDone: make(chan struct{}),
+		Grace:      time.Millisecond,
+		Logger:     discardLogger(),
+	})
+	select {
+	case <-r.Abandoned():
+	case <-time.After(awaitTimeout):
+		t.Fatal("the release never abandoned")
+	}
+	return r
+}
+
+// newActiveTurnForDirectDispatch returns an *activeTurn suitable for
+// calling a pumpState method directly, bypassing runPump's own select
+// loop and the turnStart handshake that ordinarily builds one.
+func newActiveTurnForDirectDispatch() *activeTurn {
+	return &activeTurn{
+		sink:     make(chan domain.AgentEvent, 4),
+		resultCh: make(chan turnEnd, 1),
+		done:     make(chan struct{}),
+		cancelCh: make(chan struct{}),
+	}
+}
+
+// TestStreamEndSitesReportAbandonmentMessageOnceReleaseHasGivenUp
+// covers both sites that finalize an active turn on a stream end while
+// the release has already abandoned: handleStreamEnd (the Done() arm)
+// and handleStreamEndMessage's non-ErrTooLong arm (the ordinary
+// KindStreamEnd message arm). Each must report
+// procutil.OutputAbandonedMessage, matching what the release's own
+// TurnEndMessage resolves to, rather than the connection's generic
+// streamEndedMessage.
+func TestStreamEndSitesReportAbandonmentMessageOnceReleaseHasGivenUp(t *testing.T) {
+	t.Parallel()
+
+	t.Run("handleStreamEnd", func(t *testing.T) {
+		t.Parallel()
+
+		turn := newActiveTurnForDirectDispatch()
+		p := &pumpState{
+			state: &sessionState{
+				logger:  discardLogger(),
+				release: buildAbandonedRelease(t),
+				inbox:   jsonrpc.NewInbox[pumpItem](),
+			},
+			activeTurn: turn,
+		}
+
+		p.handleStreamEnd()
+
+		select {
+		case end := <-turn.resultCh:
+			if end.err == nil || end.err.Message != procutil.OutputAbandonedMessage {
+				t.Errorf("handleStreamEnd() turn error = %v, want message %q", end.err, procutil.OutputAbandonedMessage)
+			}
+		case <-time.After(awaitTimeout):
+			t.Fatal("handleStreamEnd() did not finalize the active turn")
+		}
+	})
+
+	t.Run("handleStreamEndMessage", func(t *testing.T) {
+		t.Parallel()
+
+		turn := newActiveTurnForDirectDispatch()
+		p := &pumpState{
+			state: &sessionState{
+				logger:  discardLogger(),
+				release: buildAbandonedRelease(t),
+			},
+			activeTurn: turn,
+		}
+
+		p.handleStreamEndMessage(&jsonrpc.Message{Kind: jsonrpc.KindStreamEnd, Err: io.ErrUnexpectedEOF})
+
+		select {
+		case end := <-turn.resultCh:
+			if end.err == nil || end.err.Message != procutil.OutputAbandonedMessage {
+				t.Errorf("handleStreamEndMessage() turn error = %v, want message %q", end.err, procutil.OutputAbandonedMessage)
+			}
+		case <-time.After(awaitTimeout):
+			t.Fatal("handleStreamEndMessage() did not finalize the active turn")
+		}
+	})
+}
+
+// TestHandleAbandonmentDrainsQueuedResponseBeforeFinalizing asserts
+// that a prompt response already queued when abandonment is observed
+// decides the turn, rather than being discarded while the turn is
+// reported abandoned. Calling handleAbandonment
+// directly, rather than driving it through runPump's own select,
+// keeps this deterministic: the assertion does not depend on which of
+// two simultaneously ready channels a live pump's select would have
+// picked.
+func TestHandleAbandonmentDrainsQueuedResponseBeforeFinalizing(t *testing.T) {
+	t.Parallel()
+
+	awaitedID := jsonrpc.NumberID(7)
+	turn := newActiveTurnForDirectDispatch()
+	turn.awaitedID = awaitedID
+
+	p := &pumpState{
+		state: &sessionState{
+			logger:  discardLogger(),
+			release: buildAbandonedRelease(t),
+			inbox:   jsonrpc.NewInbox[pumpItem](),
+		},
+		activeTurn: turn,
+	}
+
+	result, err := json.Marshal(promptResponse{StopReason: stopReasonEndTurn})
+	if err != nil {
+		t.Fatalf("marshal promptResponse: %v", err)
+	}
+	p.state.inbox.Put(pumpItem{msg: &jsonrpc.Message{Kind: jsonrpc.KindResponse, ID: awaitedID, Result: result}})
+
+	p.handleAbandonment()
+
+	select {
+	case end := <-turn.resultCh:
+		if end.err != nil {
+			t.Errorf("handleAbandonment() with a queued prompt response finalized the turn with error %v, want the queued response's own successful outcome (nil error): the response was already queued and must be drained before the turn is finalized as abandoned", end.err)
+		}
+	case <-time.After(awaitTimeout):
+		t.Fatal("handleAbandonment() did not finalize the active turn")
 	}
 }

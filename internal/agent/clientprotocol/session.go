@@ -84,6 +84,19 @@ type sessionState struct {
 	// origins is the adapter-wide creation ledger, shared by every
 	// session the adapter starts.
 	origins *sessionOrigins
+
+	// drainGrace bounds the post-reap release's wait for the
+	// connection's own reader to end normally after the subprocess has
+	// been reaped. Copied from ClientProtocolAdapter.drainGrace in
+	// startSession, resolving a non-positive value to
+	// procutil.DefaultDrainGrace.
+	drainGrace time.Duration
+
+	// release is the shared post-reap release that gives the
+	// connection's reader up to drainGrace to end on its own before
+	// giving up on it. Set once in startSession before the pump starts,
+	// read-only afterward.
+	release *procutil.OutputRelease
 }
 
 // pumpItem is either a message the connection's reader delivered or a
@@ -194,7 +207,7 @@ func readTimeout(state *sessionState) time.Duration {
 // stage-one states before the pump starts, and the pump applies
 // handshake- and continuation-based lowering to it once the
 // corresponding control message arrives.
-func startSession(ctx context.Context, origins *sessionOrigins, params domain.StartSessionParams) (domain.Session, error) {
+func startSession(ctx context.Context, a *ClientProtocolAdapter, params domain.StartSessionParams) (domain.Session, error) {
 	target, agentErr := agentcore.ResolveLaunchTarget(params, "")
 	if agentErr != nil {
 		return domain.Session{}, agentErr
@@ -213,7 +226,11 @@ func startSession(ctx context.Context, origins *sessionOrigins, params domain.St
 		stopCh:      make(chan struct{}),
 		pumpDone:    make(chan struct{}),
 		logger:      slog.Default().With(slog.String("component", "clientprotocol-adapter")),
-		origins:     origins,
+		origins:     &a.origins,
+	}
+	state.drainGrace = a.drainGrace
+	if state.drainGrace <= 0 {
+		state.drainGrace = procutil.DefaultDrainGrace
 	}
 	state.inbox = jsonrpc.NewInbox[pumpItem]()
 
@@ -276,6 +293,21 @@ func startSession(ctx context.Context, origins *sessionOrigins, params domain.St
 	// reader.
 	reaper := procutil.StartReaper(cmd)
 	state.waitCh = reaper.Done()
+
+	// The release ends a handshake call or a turn that would otherwise
+	// wait forever on a reaped runtime whose reader did not end inside
+	// the drain bound. Stderr stays nil: this kind's own
+	// drain_stderr_and_reap and close_pipes teardown steps already
+	// bound and release that stream, and moving the bound earlier would
+	// change the pinned teardown ceiling.
+	state.release = procutil.StartOutputRelease(procutil.OutputReleaseParams{
+		Pipes:      pipes,
+		Reaped:     reaper.Done(),
+		ReaderDone: state.conn.Done(),
+		OnAbandon:  state.conn.Close,
+		Grace:      state.drainGrace,
+		Logger:     state.logger,
+	})
 
 	// The capability record is built here, on this goroutine, with its
 	// stage-one states, before the pump starts. The pump's start orders

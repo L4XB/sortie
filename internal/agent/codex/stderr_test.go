@@ -407,7 +407,14 @@ func TestRelease_EndsAStderrDrainNothingElseCanEnd(t *testing.T) {
 	pipes := &procutil.OwnedPipes{Stdout: outRead, Stderr: errRead}
 	reaped := make(chan struct{})
 	close(reaped)
-	release(&sessionState{}, pipes, collector, grace, make(chan struct{}), reaped, slog.Default())
+	procutil.StartOutputRelease(procutil.OutputReleaseParams{
+		Pipes:      pipes,
+		Stderr:     collector,
+		Grace:      grace,
+		ReaderDone: make(chan struct{}),
+		Reaped:     reaped,
+		Logger:     slog.Default(),
+	})
 
 	deadline := time.Now().Add(5 * time.Second)
 	for !collector.WaitDone(0) {

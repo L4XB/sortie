@@ -8,6 +8,7 @@ package clientprotocol
 
 import (
 	"context"
+	"time"
 
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
@@ -38,6 +39,14 @@ var _ domain.AgentAdapter = (*ClientProtocolAdapter)(nil)
 // outliving any one of them.
 type ClientProtocolAdapter struct {
 	origins sessionOrigins
+
+	// drainGrace bounds the post-reap release's wait for the
+	// connection's own reader to end normally, once startSession copies
+	// it into sessionState.drainGrace. A non-positive value resolves to
+	// procutil.DefaultDrainGrace. Set by a test in this package before
+	// StartSession; every production caller reaches only
+	// NewClientProtocolAdapter, which leaves it at its zero value.
+	drainGrace time.Duration
 }
 
 // NewClientProtocolAdapter constructs a [ClientProtocolAdapter] from the
@@ -57,7 +66,7 @@ func NewClientProtocolAdapter(config map[string]any) (domain.AgentAdapter, error
 // StartSession launches the runtime, performs the initialize handshake,
 // and creates a session with session/new.
 func (a *ClientProtocolAdapter) StartSession(ctx context.Context, params domain.StartSessionParams) (domain.Session, error) {
-	return startSession(ctx, &a.origins, params)
+	return startSession(ctx, a, params)
 }
 
 // RunTurn runs one prompt turn on an existing session.

@@ -263,3 +263,47 @@ func TestAwaitAnswerOpen_PumpNeverAnswersReturnsWithinBound(t *testing.T) {
 		t.Error("a later teardown step did not run after awaitAnswerOpen returned, want teardown to continue")
 	}
 }
+
+// TestStopSessionReturnsBoundedWithReaderGenuinelyParked asserts that
+// StopSession still returns inside a bounded time once the release has
+// already abandoned a connection whose reader stays parked for the
+// whole test: the pipes StartOutputRelease closes on give-up are never
+// wired to this connection (newTestSessionWithRelease's own Pipes are
+// unconnected real files), so nothing but the abandonment-armed stop
+// arm in runPump's own select can end the pump. Removing that arm
+// leaves the pump waiting on a reader nothing here will ever unpark,
+// and this test times out instead of passing.
+func TestStopSessionReturnsBoundedWithReaderGenuinelyParked(t *testing.T) {
+	t.Parallel()
+
+	const grace = 30 * time.Millisecond
+	reaped := make(chan struct{})
+	state, _, _ := newTestSessionWithRelease(t, grace, reaped)
+
+	close(reaped)
+	select {
+	case <-state.release.Abandoned():
+	case <-time.After(awaitTimeout):
+		t.Fatal("the release never abandoned within the test's wait bound")
+	}
+
+	select {
+	case <-state.conn.Done():
+		t.Fatal("the connection's reader ended on its own, want it to stay parked for the rest of this test")
+	default:
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- stopSession(context.Background(), fakeSession(state))
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("stopSession() error = %v, want nil", err)
+		}
+	case <-time.After(awaitTimeout):
+		t.Fatal("stopSession() did not return within the bound though the release had already abandoned, want the abandonment-armed stop arm to end the pump")
+	}
+}
