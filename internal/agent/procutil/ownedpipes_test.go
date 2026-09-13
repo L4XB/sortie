@@ -1,5 +1,3 @@
-//go:build unix
-
 package procutil
 
 import (
@@ -9,6 +7,8 @@ import (
 	"os/exec"
 	"testing"
 	"time"
+
+	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 )
 
 // TestStartWithOwnedPipes_Success asserts that a successful launch wires
@@ -18,7 +18,7 @@ import (
 func TestStartWithOwnedPipes_Success(t *testing.T) {
 	t.Parallel()
 
-	cmd := exec.Command("/bin/sh", "-c", "echo out-line; echo err-line >&2")
+	cmd := fakeRuntimeCmd(t, agenttest.Output{Stdout: "out-line\n", Stderr: "err-line\n"})
 	pipes, err := StartWithOwnedPipes(cmd)
 	if err != nil {
 		t.Fatalf("StartWithOwnedPipes() error = %v, want nil", err)
@@ -192,7 +192,7 @@ func TestStartWithOwnedPipes_ParentWriteEndCloseIsLoadBearing(t *testing.T) {
 		}
 		t.Cleanup(func() { stdoutRead.Close() }) //nolint:errcheck // best-effort
 
-		cmd := exec.Command("/bin/true")
+		cmd := fakeRuntimeCmd(t, agenttest.Output{})
 		cmd.Stdout = stdoutWrite
 		if err := cmd.Start(); err != nil {
 			t.Fatalf("cmd.Start() = %v", err)
@@ -227,7 +227,7 @@ func TestStartWithOwnedPipes_ParentWriteEndCloseIsLoadBearing(t *testing.T) {
 	t.Run("with the real StartWithOwnedPipes, the read reaches EOF promptly", func(t *testing.T) {
 		t.Parallel()
 
-		cmd := exec.Command("/bin/true")
+		cmd := fakeRuntimeCmd(t, agenttest.Output{})
 		pipes, err := StartWithOwnedPipes(cmd)
 		if err != nil {
 			t.Fatalf("StartWithOwnedPipes() error = %v, want nil", err)

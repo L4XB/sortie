@@ -7,7 +7,18 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 )
+
+// probeScenarios collects every non-default fake-runtime scenario this
+// package's tests register. The unix build tag's own test file adds
+// its entries via init.
+var probeScenarios = map[string]agenttest.Scenario{}
+
+func TestMain(m *testing.M) {
+	agenttest.Main(m, probeScenarios)
+}
 
 // sampleProfileJSON is a fully valid runtime profile document,
 // independent of any tracked profile under
@@ -83,17 +94,13 @@ func writeValidProfileFixture(t *testing.T) string {
 	return profilePath
 }
 
-// writeFixtureExecutable writes an executable shell script under dir,
+// writeFixtureExecutable builds a fake runtime executable under dir,
 // returning its path. It is a cross-platform-shaped fixture: the
 // content never actually runs in these tests, only its path and
 // executable bit are read.
 func writeFixtureExecutable(t *testing.T, dir string) string {
 	t.Helper()
-	path := filepath.Join(dir, "fixture-executable")
-	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil { //nolint:gosec // a cross-platform fixture executable under the test's own temp directory
-		t.Fatalf("write fixture executable: %v", err)
-	}
-	return path
+	return agenttest.FakeRuntime(t, dir, "fixture-executable", agenttest.OutputScenario, agenttest.Output{})
 }
 
 // TestResolveCoordinates confirms the enabled gate fails, never

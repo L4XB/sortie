@@ -1,5 +1,3 @@
-//go:build unix
-
 package codex
 
 import (
@@ -76,52 +74,5 @@ func TestRunTurn_EndsOnCtxDeadlineAgainstAStalledWriter(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("RunTurn() did not return within 10s against a stalled writer, want it ended by its own ctx deadline")
-	}
-}
-
-// blockingStdin is an io.WriteCloser whose Close blocks until the test
-// releases it, standing in for a stdin handle whose OS-level close
-// never returns.
-type blockingStdin struct {
-	release chan struct{}
-}
-
-func (blockingStdin) Write(p []byte) (int, error) { return len(p), nil }
-
-func (b blockingStdin) Close() error {
-	<-b.release
-	return nil
-}
-
-// TestStopSession_StdinCloseNeverReturns drives StopSession against a
-// real subprocess that ignores the graceful signal, with state.stdin
-// replaced by a handle whose Close blocks forever. StopSession must
-// still send the graceful signal, reach the escalation kill, and
-// return within its configured grace, proving closing stdin cannot
-// hold up the rest of teardown.
-func TestStopSession_StdinCloseNeverReturns(t *testing.T) {
-	t.Parallel()
-
-	state := startFakeCodexProcess(t, `trap '' TERM
-while :; do :; done`, 200)
-
-	release := make(chan struct{})
-	state.stdin = blockingStdin{release: release}
-	t.Cleanup(func() { close(release) })
-
-	start := time.Now()
-	done := make(chan error, 1)
-	go func() { done <- (&CodexAdapter{}).StopSession(context.Background(), domain.Session{Internal: state}) }()
-
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Errorf("StopSession() error = %v, want nil", err)
-		}
-		if elapsed := time.Since(start); elapsed > 3*time.Second {
-			t.Errorf("StopSession() took %v, want well under 3s (a stdin Close that never returns must not block the signal, wait, or kill that follow it)", elapsed)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("StopSession() did not return within 5s against a stdin Close that never returns")
 	}
 }

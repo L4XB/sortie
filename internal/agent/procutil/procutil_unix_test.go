@@ -4,17 +4,16 @@ package procutil
 
 import (
 	"errors"
-	"os/exec"
 	"testing"
+
+	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 )
 
-// signalledErr starts a blocking subprocess, kills it with SIGKILL, and
-// returns the resulting *exec.ExitError. Uses sleep(1) which blocks
-// indefinitely without reading stdin, avoiding races where cat exits
-// immediately on a closed stdin (e.g. in CI).
+// signalledErr starts a hanging fake-runtime subprocess, kills it with
+// SIGKILL, and returns the resulting *exec.ExitError.
 func signalledErr(t *testing.T) error {
 	t.Helper()
-	cmd := exec.Command("sleep", "60")
+	cmd := fakeRuntimeCmd(t, agenttest.Output{Hang: true})
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("signalledErr: Start: %v", err)
 	}
@@ -48,7 +47,7 @@ func TestWasSignaled(t *testing.T) {
 			name: "normal exit returns false",
 			makeErr: func(t *testing.T) error {
 				t.Helper()
-				return exec.Command("/bin/sh", "-c", "exit 1").Run()
+				return fakeRuntimeCmd(t, agenttest.Output{ExitCode: 1}).Run()
 			},
 			want: false,
 		},

@@ -4,6 +4,7 @@ package probe
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"os/exec"
@@ -18,6 +19,55 @@ import (
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/qualification"
 )
+
+// spawnDetachedChildScenario names the Go fake runtime
+// TestLaunchNativeProbe's process-group case launches as its own
+// leader: it starts hangPath as a background child, left in the same
+// process group since it sets no SysProcAttr of its own, and writes
+// the child's pid to args[0] before exiting - mirroring a shell leader
+// that backgrounds a job and reports its own $!.
+const spawnDetachedChildScenario = "spawn-detached-child"
+
+func spawnDetachedChild(args []string, hangPath string) int {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "spawn-detached-child: missing pid file argument")
+		return 1
+	}
+	cmd := exec.Command(hangPath) //nolint:gosec // hangPath is a fake runtime this test built under its own temp directory
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "spawn-detached-child: start %s: %v\n", hangPath, err)
+		return 1
+	}
+	if err := os.WriteFile(args[0], []byte(strconv.Itoa(cmd.Process.Pid)), 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "spawn-detached-child: write pid file: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+// versionCanaryScenario names the Go fake runtime
+// TestRunAuthenticationCanary launches: it answers out when its first
+// argument is --version, matching sampleProfileJSON's own
+// version_args, and otherwise fails loudly so a canary that stopped
+// passing that argument would redden this control rather than pass it.
+const versionCanaryScenario = "version-canary"
+
+func runVersionCanary(args []string, out agenttest.Output) int {
+	if len(args) == 0 || args[0] != "--version" {
+		fmt.Fprintf(os.Stderr, "unexpected args: %s\n", strings.Join(args, " "))
+		return 9
+	}
+	return out.Run()
+}
+
+// init registers this build tag's own fake-runtime scenarios into
+// probeScenarios, declared in probe_test.go, alongside the
+// agenttest.OutputScenario every platform can already launch.
+func init() {
+	probeScenarios[mcpToolServerScenario] = agenttest.Typed(runMCPToolServer)
+	probeScenarios[spawnDetachedChildScenario] = agenttest.Typed(spawnDetachedChild)
+	probeScenarios[versionCanaryScenario] = agenttest.Typed(runVersionCanary)
+}
 
 // TestSetProcessGroup mirrors internal/agent/procutil's own coverage of
 // the function this one inlines: a nil SysProcAttr is allocated, and a
@@ -87,7 +137,8 @@ func TestSignalProcessGroup(t *testing.T) {
 	t.Run("a live process group is actually terminated", func(t *testing.T) {
 		t.Parallel()
 
-		cmd := exec.Command("sleep", "3600") //nolint:gosec // bounded fake local process killed below
+		hangPath := agenttest.FakeRuntime(t, t.TempDir(), "runtime", agenttest.OutputScenario, agenttest.Output{Hang: true})
+		cmd := exec.Command(hangPath) //nolint:gosec // hangPath is a fake runtime this test built under its own temp directory
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		if err := cmd.Start(); err != nil {
 			t.Fatalf("cmd.Start() error = %v, want nil", err)
@@ -118,9 +169,7 @@ func TestLaunchNativeProbe(t *testing.T) {
 	t.Run("captures combined stdout then stderr", func(t *testing.T) {
 		t.Parallel()
 
-		script := agenttest.WriteScript(t, t.TempDir(), "echo-both.sh", `printf 'stdout line\n'
-printf 'stderr line\n' 1>&2
-`)
+		script := agenttest.FakeRuntime(t, t.TempDir(), "runtime", agenttest.OutputScenario, agenttest.Output{Stdout: "stdout line\n", Stderr: "stderr line\n"})
 
 		output, err := launchNativeProbe(t, script, nil)
 		if err != nil {
@@ -149,7 +198,7 @@ printf 'stderr line\n' 1>&2
 	t.Run("a non-zero exit surfaces the raw wait error, unwrapped from either sentinel", func(t *testing.T) {
 		t.Parallel()
 
-		script := agenttest.WriteScript(t, t.TempDir(), "exit-seven.sh", "exit 7\n")
+		script := agenttest.FakeRuntime(t, t.TempDir(), "runtime", agenttest.OutputScenario, agenttest.Output{ExitCode: 7})
 
 		_, err := launchNativeProbe(t, script, nil)
 		if err == nil {
@@ -172,16 +221,15 @@ printf 'stderr line\n' 1>&2
 
 		dir := t.TempDir()
 		pidFile := filepath.Join(dir, "descendant.pid")
-		// The grandchild's stdout/stderr are redirected away from the
-		// leader's own, inherited pipes: os/exec's Wait blocks until
-		// every holder of the write end of a piped Stdout/Stderr closes
-		// it, and an unredirected background grandchild would hold that
-		// pipe open for the whole 60s sleep, stalling cmd.Wait() long
-		// after the leader itself has exited.
-		script := agenttest.WriteScript(t, dir, "leader.sh", `sleep 60 >/dev/null 2>&1 &
-echo $! > "$1"
-exit 0
-`)
+		// spawnDetachedChild starts the grandchild with a nil Stdout and
+		// Stderr, which os/exec connects to the null device rather than
+		// inheriting the leader's own piped Stdout and Stderr: os/exec's
+		// Wait blocks until every holder of the write end of a piped
+		// Stdout or Stderr closes it, and an inherited pipe would hold
+		// that open for as long as the grandchild hangs, stalling
+		// cmd.Wait() long after the leader itself has exited.
+		hangPath := agenttest.FakeRuntime(t, dir, "grandchild", agenttest.OutputScenario, agenttest.Output{Hang: true})
+		script := agenttest.FakeRuntime(t, dir, "leader", spawnDetachedChildScenario, hangPath)
 
 		if _, err := launchNativeProbe(t, script, []string{pidFile}); err != nil {
 			t.Fatalf("launchNativeProbe() error = %v, want nil", err)
@@ -204,18 +252,16 @@ exit 0
 
 // corroborateAbsentSurfaceCoordinates builds a Coordinates whose Profile
 // decodes from the package's own sampleProfileJSON fixture and whose
-// CommandPath is a stub script carrying scriptContent, so
-// corroborateAbsentSurface's native launch runs a real subprocess
-// rather than a canned return value.
-func corroborateAbsentSurfaceCoordinates(t *testing.T, scriptContent string) Coordinates {
+// CommandPath is runtimePath, so corroborateAbsentSurface's native
+// launch runs a real subprocess rather than a canned return value.
+func corroborateAbsentSurfaceCoordinates(t *testing.T, runtimePath string) Coordinates {
 	t.Helper()
 	profilePath := writeValidProfileFixture(t)
 	profile, err := qualification.ReadRuntimeProfileFile(profilePath)
 	if err != nil {
 		t.Fatalf("qualification.ReadRuntimeProfileFile(%q) error = %v, want nil", profilePath, err)
 	}
-	script := agenttest.WriteScript(t, t.TempDir(), "native.sh", scriptContent)
-	return Coordinates{CommandPath: script, Model: "fixture-model", Profile: profile}
+	return Coordinates{CommandPath: runtimePath, Model: "fixture-model", Profile: profile}
 }
 
 // TestCorroborateAbsentSurface confirms the ordinary path: a native
@@ -226,8 +272,8 @@ func corroborateAbsentSurfaceCoordinates(t *testing.T, scriptContent string) Coo
 func TestCorroborateAbsentSurface(t *testing.T) {
 	t.Parallel()
 
-	coords := corroborateAbsentSurfaceCoordinates(t, `printf 'plain unrecognized output\n'
-`)
+	runtimePath := agenttest.FakeRuntime(t, t.TempDir(), "native", agenttest.OutputScenario, agenttest.Output{Stdout: "plain unrecognized output\n"})
+	coords := corroborateAbsentSurfaceCoordinates(t, runtimePath)
 	corroborateAbsentSurface(t, coords, qualification.SurfaceNativeJSON)
 }
 
@@ -250,8 +296,8 @@ func TestCorroborateAbsentSurfaceFailsOnARecognizedTerminal(t *testing.T) {
 	t.Parallel()
 
 	if os.Getenv("PROBE_CORROBORATE_ABSENT_SURFACE_HELPER_PROCESS") == "1" {
-		coords := corroborateAbsentSurfaceCoordinates(t, `printf '{"response":{}}\n'
-`)
+		runtimePath := agenttest.FakeRuntime(t, t.TempDir(), "native", agenttest.OutputScenario, agenttest.Output{Stdout: `{"response":{}}` + "\n"})
+		coords := corroborateAbsentSurfaceCoordinates(t, runtimePath)
 		corroborateAbsentSurface(t, coords, qualification.SurfaceNativeJSON)
 		t.Fatal("corroborateAbsentSurface() returned instead of calling t.Fatalf for a recognized terminal outcome")
 		return
@@ -357,18 +403,13 @@ func TestMustRepositoryRoot(t *testing.T) {
 	}
 }
 
-// canaryStub wraps body in a stub that first asserts it received the
-// sample profile's own version_args. Without that assertion a stub
-// ignoring its arguments would keep the test green even if the canary
-// stopped passing VersionArgs at all.
-func canaryStub(body string) string {
-	return `[ "$1" = "--version" ] || { printf 'unexpected args: %s\n' "$*" 1>&2; exit 9; }
-` + body + "\n"
-}
-
 // TestRunAuthenticationCanary confirms the canary's two outcomes: a
 // runtime that serves version_args lets the run continue, and one that
-// fails them stops it before any graded surface spends a turn.
+// fails them stops it before any graded surface spends a turn. Both
+// outcomes launch versionCanaryScenario, which fails the run on its
+// own if it stopped receiving the sample profile's version_args at
+// all: a stub ignoring its arguments would keep this test green even
+// if the canary stopped passing them.
 //
 // The failing call runs in a subprocess, matching the idiom the tests
 // above already use: the canary reports its failure through t.Fatalf,
@@ -378,7 +419,8 @@ func TestRunAuthenticationCanary(t *testing.T) {
 	t.Parallel()
 
 	if os.Getenv("PROBE_AUTHENTICATION_CANARY_HELPER_PROCESS") == "1" {
-		runAuthenticationCanary(t, corroborateAbsentSurfaceCoordinates(t, canaryStub("exit 3")))
+		runtimePath := agenttest.FakeRuntime(t, t.TempDir(), "canary", versionCanaryScenario, agenttest.Output{ExitCode: 3})
+		runAuthenticationCanary(t, corroborateAbsentSurfaceCoordinates(t, runtimePath))
 		t.Fatal("runAuthenticationCanary() returned instead of calling t.Fatalf for a runtime that failed version_args")
 		return
 	}
@@ -386,7 +428,8 @@ func TestRunAuthenticationCanary(t *testing.T) {
 	t.Run("a runtime that serves version_args passes", func(t *testing.T) {
 		t.Parallel()
 
-		runAuthenticationCanary(t, corroborateAbsentSurfaceCoordinates(t, canaryStub("printf 'stub 1.0\\n'")))
+		runtimePath := agenttest.FakeRuntime(t, t.TempDir(), "canary", versionCanaryScenario, agenttest.Output{Stdout: "stub 1.0\n"})
+		runAuthenticationCanary(t, corroborateAbsentSurfaceCoordinates(t, runtimePath))
 	})
 
 	t.Run("a runtime that fails version_args stops the run", func(t *testing.T) {

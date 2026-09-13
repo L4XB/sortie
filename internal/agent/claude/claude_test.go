@@ -1,5 +1,3 @@
-//go:build unix
-
 package claude
 
 import (
@@ -23,6 +21,45 @@ import (
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
 )
+
+// sequentialOutputScenario is the fake runtime scenario a two-turn
+// session drives: the first invocation on a given marker file returns
+// one [agenttest.Output], every later invocation on the same marker
+// returns another.
+const sequentialOutputScenario = "claude.sequentialOutput"
+
+// sequentialOutputParams parameterizes sequentialOutputScenario.
+type sequentialOutputParams struct {
+	MarkerPath string
+	First      agenttest.Output
+	Then       agenttest.Output
+}
+
+// scenarioSequentialOutput implements sequentialOutputScenario: it
+// creates MarkerPath on its first invocation and returns First, then
+// returns Then on every later invocation that finds the marker already
+// present.
+func scenarioSequentialOutput(_ []string, params sequentialOutputParams) int {
+	out := params.Then
+	if _, err := os.Stat(params.MarkerPath); err != nil {
+		if !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "sequential output: stat marker: %v\n", err)
+			return 2
+		}
+		out = params.First
+		if err := os.WriteFile(params.MarkerPath, nil, 0o600); err != nil {
+			fmt.Fprintf(os.Stderr, "sequential output: create marker: %v\n", err)
+			return 2
+		}
+	}
+	return out.Run()
+}
+
+func TestMain(m *testing.M) {
+	agenttest.Main(m, map[string]agenttest.Scenario{
+		sequentialOutputScenario: agenttest.Typed(scenarioSequentialOutput),
+	})
+}
 
 func TestNewClaudeCodeAdapter(t *testing.T) {
 	t.Parallel()
@@ -84,8 +121,9 @@ func TestRegistration(t *testing.T) {
 func TestStartSession(t *testing.T) {
 	t.Parallel()
 
-	// Use /bin/sh as a stand-in for the claude binary (always on PATH).
-	existingCmd := "/bin/sh"
+	// Both subtests below fail during workspace resolution, before the
+	// command is ever looked up, so its value is unreached.
+	const existingCmd = "unused-command"
 
 	tests := []struct {
 		name    string
@@ -165,7 +203,7 @@ func TestStartSession_NewSession(t *testing.T) {
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
 		WorkspacePath: t.TempDir(),
-		AgentConfig:   domain.AgentConfig{Command: "/bin/sh"},
+		AgentConfig:   domain.AgentConfig{Command: fakeClaude(t, t.TempDir(), agenttest.Output{})},
 	})
 	if err != nil {
 		t.Fatalf("StartSession() error = %v", err)
@@ -192,7 +230,7 @@ func TestStartSession_ResumeSession(t *testing.T) {
 	resumeID := "resume-1234-5678-abcd-ef0123456789"
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
 		WorkspacePath:   t.TempDir(),
-		AgentConfig:     domain.AgentConfig{Command: "/bin/sh"},
+		AgentConfig:     domain.AgentConfig{Command: fakeClaude(t, t.TempDir(), agenttest.Output{})},
 		ResumeSessionID: resumeID,
 	})
 	if err != nil {
@@ -566,9 +604,24 @@ func TestStopSession_NilProc(t *testing.T) {
 	}
 }
 
-func writeScript(t *testing.T, dir, content string) string {
+// fakeClaude creates a fake runtime executable in dir that behaves per
+// out and returns its path, for use as [domain.AgentConfig.Command].
+func fakeClaude(t *testing.T, dir string, out agenttest.Output) string {
 	t.Helper()
-	return agenttest.WriteScript(t, dir, "fake-claude", content)
+	return agenttest.FakeRuntime(t, dir, "fake-claude", agenttest.OutputScenario, out)
+}
+
+// fakeSequentialClaude creates a fake runtime executable in dir that
+// returns first on its first invocation and then on every later
+// invocation, for use as [domain.AgentConfig.Command] across a
+// session's turns.
+func fakeSequentialClaude(t *testing.T, dir string, first, then agenttest.Output) string {
+	t.Helper()
+	return agenttest.FakeRuntime(t, dir, "fake-claude", sequentialOutputScenario, sequentialOutputParams{
+		MarkerPath: filepath.Join(dir, "invoked"),
+		First:      first,
+		Then:       then,
+	})
 }
 
 // TestRunTurn_SuccessfulSession verifies a successful session using a fake
@@ -577,14 +630,10 @@ func TestRunTurn_SuccessfulSession(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, `
-cat <<'JSONL'
-{"type":"system","subtype":"init","session_id":"test-session-id","cwd":"/tmp"}
+	script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: `{"type":"system","subtype":"init","session_id":"test-session-id","cwd":"/tmp"}
 {"type":"assistant","message":{"content":[{"type":"text","text":"Working on it."}]},"session_id":"test-session-id"}
 {"type":"result","subtype":"success","result":"All done.","is_error":false,"usage":{"input_tokens":100,"output_tokens":50},"session_id":"test-session-id"}
-JSONL
-exit 0
-`)
+`})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -669,14 +718,10 @@ func TestRunTurn_UsageMeasured_AbsentWhenNoUsageObserved(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, `
-cat <<'JSONL'
-{"type":"system","subtype":"init","session_id":"no-usage","cwd":"/tmp"}
+	script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: `{"type":"system","subtype":"init","session_id":"no-usage","cwd":"/tmp"}
 {"type":"assistant","message":{"content":[{"type":"text","text":"Working on it."}]},"session_id":"no-usage"}
 {"type":"result","subtype":"success","result":"All done.","is_error":false,"session_id":"no-usage"}
-JSONL
-exit 0
-`)
+`})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -708,14 +753,10 @@ func TestRunTurn_UsageMeasured_TrueOnResultUsage(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, `
-cat <<'JSONL'
-{"type":"system","subtype":"init","session_id":"result-usage","cwd":"/tmp"}
+	script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: `{"type":"system","subtype":"init","session_id":"result-usage","cwd":"/tmp"}
 {"type":"assistant","message":{"content":[{"type":"text","text":"Working on it."}]},"session_id":"result-usage"}
 {"type":"result","subtype":"success","result":"All done.","is_error":false,"usage":{"input_tokens":100,"output_tokens":50},"session_id":"result-usage"}
-JSONL
-exit 0
-`)
+`})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -745,13 +786,9 @@ func TestRunTurn_APIDurationMS_Success(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, `
-cat <<'JSONL'
-{"type":"system","subtype":"init","session_id":"api-dur-session","cwd":"/tmp"}
+	script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: `{"type":"system","subtype":"init","session_id":"api-dur-session","cwd":"/tmp"}
 {"type":"result","subtype":"success","result":"Done.","is_error":false,"duration_api_ms":1500,"usage":{"input_tokens":100,"output_tokens":50},"session_id":"api-dur-session"}
-JSONL
-exit 0
-`)
+`})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -794,13 +831,9 @@ func TestRunTurn_APIDurationMS_Error(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, `
-cat <<'JSONL'
-{"type":"system","subtype":"init","session_id":"api-dur-err","cwd":"/tmp"}
+	script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: `{"type":"system","subtype":"init","session_id":"api-dur-err","cwd":"/tmp"}
 {"type":"result","subtype":"error_max_turns","result":"","is_error":true,"duration_api_ms":2200,"usage":{"input_tokens":500,"output_tokens":100},"session_id":"api-dur-err"}
-JSONL
-exit 0
-`)
+`})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -840,13 +873,9 @@ func TestRunTurn_APIDurationMS_ZeroWhenAbsent(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, `
-cat <<'JSONL'
-{"type":"system","subtype":"init","session_id":"no-dur","cwd":"/tmp"}
+	script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: `{"type":"system","subtype":"init","session_id":"no-dur","cwd":"/tmp"}
 {"type":"result","subtype":"success","result":"OK","is_error":false,"usage":{"input_tokens":100,"output_tokens":50},"session_id":"no-dur"}
-JSONL
-exit 0
-`)
+`})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -888,14 +917,10 @@ func TestRunTurn_ResultOnlyFallback(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, `
-cat <<'JSONL'
-{"type":"system","subtype":"init","session_id":"fallback-sess","cwd":"/tmp"}
+	script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: `{"type":"system","subtype":"init","session_id":"fallback-sess","cwd":"/tmp"}
 {"type":"assistant","message":{"content":[{"type":"text","text":"Working."}]},"session_id":"fallback-sess"}
 {"type":"result","subtype":"success","result":"All done.","is_error":false,"usage":{"input_tokens":200,"output_tokens":80},"session_id":"fallback-sess"}
-JSONL
-exit 0
-`)
+`})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -957,11 +982,7 @@ func TestRunTurn_ParallelToolCalls_DedupesMessageID(t *testing.T) {
 
 	fixture := loadFixture(t, "usage_parallel_tools.jsonl")
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, fmt.Sprintf(`cat <<'JSONL'
-%s
-JSONL
-exit 0
-`, string(fixture)))
+	script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: string(fixture)})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -1015,11 +1036,7 @@ func TestAssertUsageReporting(t *testing.T) {
 
 	fixture := loadFixture(t, "tool_use_result_user_event.jsonl")
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, fmt.Sprintf(`cat <<'JSONL'
-%s
-JSONL
-exit 0
-`, string(fixture)))
+	script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: string(fixture)})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -1064,12 +1081,9 @@ func TestRunTurn_SubAgentUsage(t *testing.T) {
 		}
 
 		tmpDir := t.TempDir()
-		script := writeScript(t, tmpDir, fmt.Sprintf(`cat <<'JSONL'
-{"type":"system","subtype":"init","session_id":"7c2a9e10-3b4c-4d5e-9f6a-1b2c3d4e5f60","cwd":"/tmp"}
-%s
-JSONL
-exit 0
-`, compact.String()))
+		stdout := `{"type":"system","subtype":"init","session_id":"7c2a9e10-3b4c-4d5e-9f6a-1b2c3d4e5f60","cwd":"/tmp"}
+` + compact.String() + "\n"
+		script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: stdout})
 
 		adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 		session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -1108,13 +1122,9 @@ exit 0
 		// itself carries non-zero output, proving the fallback surfaces
 		// real figures rather than defaulting to zero.
 		tmpDir := t.TempDir()
-		script := writeScript(t, tmpDir, `
-cat <<'JSONL'
-{"type":"system","subtype":"init","session_id":"fallback-subagent","cwd":"/tmp"}
+		script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: `{"type":"system","subtype":"init","session_id":"fallback-subagent","cwd":"/tmp"}
 {"type":"result","subtype":"success","result":"done","session_id":"fallback-subagent","is_error":false,"usage":{"input_tokens":1000,"output_tokens":500}}
-JSONL
-exit 0
-`)
+`})
 
 		adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 		session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -1146,13 +1156,9 @@ func TestRunTurn_ErrorResult(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, `
-cat <<'JSONL'
-{"type":"system","subtype":"init","session_id":"err-session","cwd":"/tmp"}
+	script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: `{"type":"system","subtype":"init","session_id":"err-session","cwd":"/tmp"}
 {"type":"result","subtype":"error_max_turns","result":"","is_error":true,"usage":{"input_tokens":500,"output_tokens":100},"session_id":"err-session"}
-JSONL
-exit 0
-`)
+`})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -1195,7 +1201,7 @@ func TestRunTurn_NonZeroExit(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, `exit 1`)
+	script := fakeClaude(t, tmpDir, agenttest.Output{ExitCode: 1})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -1236,7 +1242,7 @@ func TestRunTurn_Exit127(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, `exit 127`)
+	script := fakeClaude(t, tmpDir, agenttest.Output{ExitCode: 127})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -1265,11 +1271,9 @@ func TestRunTurn_MalformedOutput(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, `
-echo 'this is not json'
-echo '{"type":"result","subtype":"success","result":"ok","is_error":false,"usage":{"input_tokens":10,"output_tokens":5}}'
-exit 0
-`)
+	script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: `this is not json
+{"type":"result","subtype":"success","result":"ok","is_error":false,"usage":{"input_tokens":10,"output_tokens":5}}
+`})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -1307,11 +1311,12 @@ func TestRunTurn_ContextCancellation(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	// Script that sleeps long enough for cancellation to fire.
-	script := writeScript(t, tmpDir, `
-echo '{"type":"system","subtype":"init","session_id":"cancel-test","cwd":"/tmp"}'
-exec sleep 60
-`)
+	// A runtime that hangs long enough for cancellation to fire.
+	script := fakeClaude(t, tmpDir, agenttest.Output{
+		Stdout: `{"type":"system","subtype":"init","session_id":"cancel-test","cwd":"/tmp"}
+`,
+		Hang: true,
+	})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -1365,7 +1370,7 @@ func TestRunTurn_ContextCancelledBeforeStart(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, "exit 0")
+	script := fakeClaude(t, tmpDir, agenttest.Output{})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -1415,9 +1420,11 @@ func TestRunTurn_PanicsOnNilOnEvent(t *testing.T) {
 	t.Parallel()
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
+	// OnEvent is nil, so RunTurn panics before this target is ever
+	// resolved or launched; its Command value is unreached.
 	session := domain.Session{
 		ID:       "panic-test",
-		Internal: &sessionState{target: agentcore.LaunchTarget{Command: "/bin/sh", WorkspacePath: t.TempDir()}},
+		Internal: &sessionState{target: agentcore.LaunchTarget{Command: "unused-command", WorkspacePath: t.TempDir()}},
 	}
 
 	defer func() {
@@ -1434,14 +1441,10 @@ func TestRunTurn_APIRetryEvent(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, `
-cat <<'JSONL'
-{"type":"system","subtype":"init","session_id":"retry-session","cwd":"/tmp"}
+	script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: `{"type":"system","subtype":"init","session_id":"retry-session","cwd":"/tmp"}
 {"type":"system","subtype":"api_retry","attempt":1,"max_retries":3,"retry_delay_ms":500,"error_status":429,"error":"rate_limit","session_id":"retry-session"}
 {"type":"result","subtype":"success","result":"ok","is_error":false,"usage":{"input_tokens":10,"output_tokens":5},"session_id":"retry-session"}
-JSONL
-exit 0
-`)
+`})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -1487,13 +1490,9 @@ func TestRunTurn_StreamEvent(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, `
-cat <<'JSONL'
-{"type":"stream_event","event":{"type":"content_block_delta"}}
+	script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: `{"type":"stream_event","event":{"type":"content_block_delta"}}
 {"type":"result","subtype":"success","result":"ok","is_error":false,"usage":{"input_tokens":1,"output_tokens":1}}
-JSONL
-exit 0
-`)
+`})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -1524,13 +1523,9 @@ func TestRunTurn_UnknownEventType(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, `
-cat <<'JSONL'
-{"type":"unknown_future_type","data":"something"}
+	script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: `{"type":"unknown_future_type","data":"something"}
 {"type":"result","subtype":"success","result":"ok","is_error":false,"usage":{"input_tokens":1,"output_tokens":1}}
-JSONL
-exit 0
-`)
+`})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -1568,14 +1563,10 @@ func TestRunTurn_PermissionDeniedContinuesTurn(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, `
-cat <<'JSONL'
-{"type":"system","subtype":"init","session_id":"perm-session","cwd":"/tmp"}
+	script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: `{"type":"system","subtype":"init","session_id":"perm-session","cwd":"/tmp"}
 {"type":"system","subtype":"permission_denied","tool_name":"Read"}
 {"type":"result","subtype":"success","result":"done","is_error":false,"usage":{"input_tokens":5,"output_tokens":5},"session_id":"perm-session"}
-JSONL
-exit 0
-`)
+`})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -1625,13 +1616,9 @@ func TestRunTurn_PermissionDeniedAskUserQuestionEndsAttempt(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, `
-cat <<'JSONL'
-{"type":"system","subtype":"init","session_id":"ask-session","cwd":"/tmp"}
+	script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: `{"type":"system","subtype":"init","session_id":"ask-session","cwd":"/tmp"}
 {"type":"system","subtype":"permission_denied","tool_name":"AskUserQuestion"}
-JSONL
-exit 0
-`)
+`})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -1654,11 +1641,9 @@ func TestRunTurn_NoOutputExitZero(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	// Script outputs no result event and exits 0.
-	script := writeScript(t, tmpDir, `
-echo '{"type":"system","subtype":"init","session_id":"noresult","cwd":"/tmp"}'
-exit 0
-`)
+	// Runtime outputs no result event and exits 0.
+	script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: `{"type":"system","subtype":"init","session_id":"noresult","cwd":"/tmp"}
+`})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -1693,11 +1678,9 @@ func TestRunTurn_PartialOutputNoResultExitZero(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, `
-echo '{"type":"system","subtype":"init","session_id":"partial","cwd":"/tmp"}'
-echo '{"type":"assistant","message":{"id":"msg_partial","role":"assistant","content":[{"type":"text","text":"hello"}],"usage":{"input_tokens":10,"output_tokens":42,"cache_read_input_tokens":0},"model":"claude-sonnet-4-20250514"}}'
-exit 0
-`)
+	script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: `{"type":"system","subtype":"init","session_id":"partial","cwd":"/tmp"}
+{"type":"assistant","message":{"id":"msg_partial","role":"assistant","content":[{"type":"text","text":"hello"}],"usage":{"input_tokens":10,"output_tokens":42,"cache_read_input_tokens":0},"model":"claude-sonnet-4-20250514"}}
+`})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -1750,11 +1733,7 @@ func TestRunTurn_ToolActivityOnlyNoResultExitZero(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	fixture := loadFixture(t, "tool_only_no_text.jsonl")
-	script := writeScript(t, tmpDir, fmt.Sprintf(`cat <<'JSONL'
-%s
-JSONL
-exit 0
-`, string(fixture)))
+	script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: string(fixture)})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -1802,11 +1781,7 @@ func TestRunTurn_AssistantAndToolNoUsageNoResultCompletes(t *testing.T) {
 	}
 
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, fmt.Sprintf(`cat <<'JSONL'
-%s
-JSONL
-exit 0
-`, jsonl))
+	script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: jsonl})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -1864,11 +1839,7 @@ func TestRunTurn_WorkSignalsObservedAcrossFixtureCorpus(t *testing.T) {
 
 			tmpDir := t.TempDir()
 			fixture := loadFixture(t, tt.fixture)
-			script := writeScript(t, tmpDir, fmt.Sprintf(`cat <<'JSONL'
-%s
-JSONL
-exit 0
-`, string(fixture)))
+			script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: string(fixture)})
 
 			adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 			session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -1899,11 +1870,11 @@ func TestRunTurn_StderrWarnOnNoOutputExitZero(t *testing.T) {
 	spy := agenttest.InstallLogSpy(t)
 
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, `
-echo 'MCP config parse error: unexpected token' >&2
-echo '{"type":"system","subtype":"init","session_id":"noout","cwd":"/tmp"}'
-exit 0
-`)
+	script := fakeClaude(t, tmpDir, agenttest.Output{
+		Stderr: "MCP config parse error: unexpected token\n",
+		Stdout: `{"type":"system","subtype":"init","session_id":"noout","cwd":"/tmp"}
+`,
+	})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -1943,10 +1914,11 @@ func TestStopSession_RunningProcess(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, `
-echo '{"type":"system","subtype":"init","session_id":"stop-test","cwd":"/tmp"}'
-exec sleep 60
-`)
+	script := fakeClaude(t, tmpDir, agenttest.Output{
+		Stdout: `{"type":"system","subtype":"init","session_id":"stop-test","cwd":"/tmp"}
+`,
+		Hang: true,
+	})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -1997,11 +1969,7 @@ func TestRunTurn_ToolResultInUserEvent(t *testing.T) {
 	fixture := loadFixture(t, "tool_use_result_user_event.jsonl")
 
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, fmt.Sprintf(`cat <<'JSONL'
-%s
-JSONL
-exit 0
-`, string(fixture)))
+	script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: string(fixture)})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -2068,11 +2036,7 @@ func TestRunTurn_ToolResultInAssistantEvent(t *testing.T) {
 	fixture := loadFixture(t, "tool_use_result_separate.jsonl")
 
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, fmt.Sprintf(`cat <<'JSONL'
-%s
-JSONL
-exit 0
-`, string(fixture)))
+	script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: string(fixture)})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -2132,11 +2096,7 @@ func TestRunTurn_ToolResultErrorText(t *testing.T) {
 	fixture := loadFixture(t, "tool_use_error_result.jsonl")
 
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, fmt.Sprintf(`cat <<'JSONL'
-%s
-JSONL
-exit 0
-`, string(fixture)))
+	script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: string(fixture)})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -2542,11 +2502,7 @@ func TestRunTurn_ToolResultXMLWrappedError(t *testing.T) {
 	fixture := loadFixture(t, "tool_use_error_xml_wrapped.jsonl")
 
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, fmt.Sprintf(`cat <<'JSONL'
-%s
-JSONL
-exit 0
-`, string(fixture)))
+	script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: string(fixture)})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -2611,16 +2567,12 @@ func TestRunTurn_PerRequestAPIDurationMS(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, `
-cat <<'JSONL'
-{"type":"system","subtype":"init","session_id":"per-req-timing","cwd":"/tmp"}
+	script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: `{"type":"system","subtype":"init","session_id":"per-req-timing","cwd":"/tmp"}
 {"type":"assistant","message":{"id":"msg_req01","model":"claude-sonnet-4-20250514","content":[{"type":"tool_use","id":"toolu_req01","name":"Read","input":{"file_path":"main.go"}}],"usage":{"input_tokens":100,"output_tokens":10}},"session_id":"per-req-timing"}
 {"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_req01","content":"package main","is_error":false}]}}
 {"type":"assistant","message":{"id":"msg_req02","model":"claude-sonnet-4-20250514","content":[{"type":"text","text":"Done."}],"usage":{"input_tokens":150,"output_tokens":5}},"session_id":"per-req-timing"}
 {"type":"result","subtype":"success","result":"Done.","is_error":false,"usage":{"input_tokens":250,"output_tokens":15},"session_id":"per-req-timing"}
-JSONL
-exit 0
-`)
+`})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -2672,16 +2624,12 @@ func TestRunTurn_PerRequestAPIDurationMS_NoDoubleCount(t *testing.T) {
 	tmpDir := t.TempDir()
 	// Same flow as PerRequestAPIDurationMS but result carries duration_api_ms.
 	// The turn-finalization guard must suppress it to prevent double-counting.
-	script := writeScript(t, tmpDir, `
-cat <<'JSONL'
-{"type":"system","subtype":"init","session_id":"no-double-count","cwd":"/tmp"}
+	script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: `{"type":"system","subtype":"init","session_id":"no-double-count","cwd":"/tmp"}
 {"type":"assistant","message":{"id":"msg_dc01","model":"claude-sonnet-4-20250514","content":[{"type":"tool_use","id":"toolu_dc01","name":"Read","input":{"file_path":"main.go"}}],"usage":{"input_tokens":100,"output_tokens":10}},"session_id":"no-double-count"}
 {"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_dc01","content":"package main","is_error":false}]}}
 {"type":"assistant","message":{"id":"msg_dc02","model":"claude-sonnet-4-20250514","content":[{"type":"text","text":"Done."}],"usage":{"input_tokens":150,"output_tokens":5}},"session_id":"no-double-count"}
 {"type":"result","subtype":"success","result":"Done.","is_error":false,"duration_api_ms":5000,"usage":{"input_tokens":250,"output_tokens":15},"session_id":"no-double-count"}
-JSONL
-exit 0
-`)
+`})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -2725,13 +2673,9 @@ func TestRunTurn_PerRequestAPIDurationMS_NoInitGuard(t *testing.T) {
 	// No system/init event: apiCallStart stays zero, so the guard
 	// !apiCallStart.IsZero() prevents any timing from being recorded.
 	// emittedAPITiming stays false, so the fallback path fires on result.
-	script := writeScript(t, tmpDir, `
-cat <<'JSONL'
-{"type":"assistant","message":{"id":"msg_no_init","model":"claude-sonnet-4-20250514","content":[{"type":"text","text":"Working."}],"usage":{"input_tokens":100,"output_tokens":10}}}
+	script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: `{"type":"assistant","message":{"id":"msg_no_init","model":"claude-sonnet-4-20250514","content":[{"type":"text","text":"Working."}],"usage":{"input_tokens":100,"output_tokens":10}}}
 {"type":"result","subtype":"success","result":"Done.","is_error":false,"duration_api_ms":1000,"usage":{"input_tokens":100,"output_tokens":10}}
-JSONL
-exit 0
-`)
+`})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -2784,10 +2728,10 @@ func TestRunTurn_StderrWarnOnExitCode127(t *testing.T) {
 	spy := agenttest.InstallLogSpy(t)
 
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, `
-echo "license check failed: no valid license" >&2
-exit 127
-`)
+	script := fakeClaude(t, tmpDir, agenttest.Output{
+		Stderr:   "license check failed: no valid license\n",
+		ExitCode: 127,
+	})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -2824,13 +2768,12 @@ func TestRunTurn_StderrWarnOnResultError(t *testing.T) {
 	spy := agenttest.InstallLogSpy(t)
 
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, `
-echo "max context window reached" >&2
-cat <<'JSONL'
-{"type":"system","subtype":"init","session_id":"warn-err-sess","cwd":"/tmp"}
+	script := fakeClaude(t, tmpDir, agenttest.Output{
+		Stderr: "max context window reached\n",
+		Stdout: `{"type":"system","subtype":"init","session_id":"warn-err-sess","cwd":"/tmp"}
 {"type":"result","subtype":"error_max_turns","result":"","is_error":true,"usage":{"input_tokens":100,"output_tokens":50},"session_id":"warn-err-sess"}
-JSONL
-`)
+`,
+	})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -2863,10 +2806,10 @@ func TestRunTurn_StderrWarnOnNonZeroExit(t *testing.T) {
 	spy := agenttest.InstallLogSpy(t)
 
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, `
-echo "internal agent panic" >&2
-exit 1
-`)
+	script := fakeClaude(t, tmpDir, agenttest.Output{
+		Stderr:   "internal agent panic\n",
+		ExitCode: 1,
+	})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -2902,13 +2845,12 @@ func TestRunTurn_StderrNoWarnOnSuccess(t *testing.T) {
 	spy := agenttest.InstallLogSpy(t)
 
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, `
-echo "minor diagnostic" >&2
-cat <<'JSONL'
-{"type":"system","subtype":"init","session_id":"no-warn-success","cwd":"/tmp"}
+	script := fakeClaude(t, tmpDir, agenttest.Output{
+		Stderr: "minor diagnostic\n",
+		Stdout: `{"type":"system","subtype":"init","session_id":"no-warn-success","cwd":"/tmp"}
 {"type":"result","subtype":"success","result":"Done.","is_error":false,"usage":{"input_tokens":100,"output_tokens":50},"session_id":"no-warn-success"}
-JSONL
-`)
+`,
+	})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -2943,13 +2885,9 @@ func TestRunTurn_SuccessfulResultZeroOutputTokens(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	script := writeScript(t, tmpDir, `
-cat <<'JSONL'
-{"type":"system","subtype":"init","session_id":"zero-output-success","cwd":"/tmp"}
+	script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: `{"type":"system","subtype":"init","session_id":"zero-output-success","cwd":"/tmp"}
 {"type":"result","subtype":"success","result":"Nothing to change.","is_error":false,"usage":{"input_tokens":10,"output_tokens":0},"session_id":"zero-output-success"}
-JSONL
-exit 0
-`)
+`})
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -2989,19 +2927,13 @@ func TestRunTurn_WorkPredicateIsPerTurn(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	counterFile := filepath.Join(tmpDir, "turn-count")
-	script := writeScript(t, tmpDir, fmt.Sprintf(`
-if [ -f '%s' ]; then
-  echo '{"type":"system","subtype":"init","session_id":"per-turn-work","cwd":"/tmp"}'
-else
-  touch '%s'
-  cat <<'JSONL'
-{"type":"system","subtype":"init","session_id":"per-turn-work","cwd":"/tmp"}
+	script := fakeSequentialClaude(t, tmpDir,
+		agenttest.Output{Stdout: `{"type":"system","subtype":"init","session_id":"per-turn-work","cwd":"/tmp"}
 {"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":10,"output_tokens":5}},"session_id":"per-turn-work"}
-JSONL
-fi
-exit 0
-`, counterFile, counterFile))
+`},
+		agenttest.Output{Stdout: `{"type":"system","subtype":"init","session_id":"per-turn-work","cwd":"/tmp"}
+`},
+	)
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -3044,20 +2976,14 @@ func TestRunTurn_SecondTurnFailsAfterFirstTurnBothSignals(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	counterFile := filepath.Join(tmpDir, "turn-count")
-	script := writeScript(t, tmpDir, fmt.Sprintf(`
-if [ -f '%s' ]; then
-  echo '{"type":"system","subtype":"init","session_id":"both-then-none","cwd":"/tmp"}'
-else
-  touch '%s'
-  cat <<'JSONL'
-{"type":"system","subtype":"init","session_id":"both-then-none","cwd":"/tmp"}
+	script := fakeSequentialClaude(t, tmpDir,
+		agenttest.Output{Stdout: `{"type":"system","subtype":"init","session_id":"both-then-none","cwd":"/tmp"}
 {"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"Reading."},{"type":"tool_use","id":"toolu_both","name":"Read","input":{"file_path":"main.go"}}]}}
 {"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_both","content":"package main","is_error":false}]}}
-JSONL
-fi
-exit 0
-`, counterFile, counterFile))
+`},
+		agenttest.Output{Stdout: `{"type":"system","subtype":"init","session_id":"both-then-none","cwd":"/tmp"}
+`},
+	)
 
 	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{

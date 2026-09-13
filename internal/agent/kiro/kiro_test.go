@@ -1,5 +1,3 @@
-//go:build unix
-
 package kiro
 
 import (
@@ -47,63 +45,88 @@ func TestNewKiroAdapter_TrustToolsConflictMatchesValidateConfig(t *testing.T) {
 	}
 }
 
-// fakeChatScript is the body of a fake kiro-cli that answers the StartSession
-// "whoami" canary and, for any other invocation (the "chat" turn), replays a
-// fixed stdout/stderr pair and exit code. Driving the real
-// agentcore.ForkPerTurnSession with this binary exercises the adapter's
-// OnFinalize and ParseLine closures end to end without a live kiro-cli.
-//
-// stdoutBody and stderrBody are written verbatim (no trailing newline added),
-// preserving the exact bytes the fixtures specify.
-func fakeChatScript(t *testing.T, dir, stdoutBody, stderrBody string, chatExit int) string {
-	t.Helper()
-	outFile := filepath.Join(dir, "chat_stdout")
-	errFile := filepath.Join(dir, "chat_stderr")
-	if err := os.WriteFile(outFile, []byte(stdoutBody), 0o644); err != nil {
-		t.Fatalf("writing chat stdout fixture: %v", err)
-	}
-	if err := os.WriteFile(errFile, []byte(stderrBody), 0o644); err != nil {
-		t.Fatalf("writing chat stderr fixture: %v", err)
-	}
+// chatScenario is the [agenttest.Scenario] a fake kiro-cli runs: it answers
+// the StartSession "whoami" canary and, for any other invocation (the
+// "chat" turn), replays the configured stdout/stderr pair and exit code.
+// Driving the real agentcore.ForkPerTurnSession against this binary
+// exercises the adapter's OnFinalize and ParseLine closures end to end
+// without a live kiro-cli.
+const chatScenario = "kiro-chat"
 
-	body := fmt.Sprintf(`if [ "$1" = "whoami" ]; then
-  printf '%%s\n' 'Authenticated with API key'
-  exit 0
-fi
-cat '%s'
-cat '%s' >&2
-exit %d
-`, outFile, errFile, chatExit)
+// chatParams parameterizes [chatScenario].
+type chatParams struct {
+	// WhoamiExitCode is the exit code the "whoami" canary returns. Zero,
+	// the default, answers with [whoamiSuccessMarker]; any other value
+	// exits with no output, simulating a canary failure.
+	WhoamiExitCode int
 
-	return agenttest.WriteScript(t, dir, "kiro-cli", body)
+	// Stdout, Stderr and ExitCode are replayed verbatim for any
+	// invocation other than "whoami".
+	Stdout   string
+	Stderr   string
+	ExitCode int
+
+	// ArgsLogPath, when non-empty, appends each non-whoami invocation's
+	// argument list to the named file before replaying Stdout/Stderr, so
+	// a test can inspect what buildArgs produced for each turn.
+	ArgsLogPath string
+
+	// MarkerFile, when non-empty, switches the reply after the first
+	// non-whoami invocation: that call replays Stdout and creates
+	// MarkerFile, and every later call replays MarkerStdout instead.
+	MarkerFile   string
+	MarkerStdout string
 }
 
-// fakeChatScriptWithArgsLog behaves exactly like fakeChatScript, except
-// every non-whoami invocation appends its argument list to argsLog
-// before replaying stdoutBody and stderrBody, so a test can inspect
-// what buildArgs produced for each turn.
-func fakeChatScriptWithArgsLog(t *testing.T, dir, stdoutBody, stderrBody string, chatExit int, argsLog string) string {
+func runChat(args []string, p chatParams) int {
+	if len(args) > 0 && args[0] == "whoami" {
+		if p.WhoamiExitCode != 0 {
+			return p.WhoamiExitCode
+		}
+		fmt.Print(whoamiSuccessMarker + "\n")
+		return 0
+	}
+
+	stdout := p.Stdout
+	if p.MarkerFile != "" {
+		if _, err := os.Stat(p.MarkerFile); err == nil {
+			stdout = p.MarkerStdout
+		} else if err := os.WriteFile(p.MarkerFile, nil, 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "kiro fake: write marker file: %v\n", err)
+			return 2
+		}
+	}
+
+	if p.ArgsLogPath != "" {
+		f, err := os.OpenFile(p.ArgsLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "kiro fake: open args log: %v\n", err)
+			return 2
+		}
+		_, writeErr := fmt.Fprintln(f, strings.Join(args, " "))
+		closeErr := f.Close()
+		if err := errors.Join(writeErr, closeErr); err != nil {
+			fmt.Fprintf(os.Stderr, "kiro fake: write args log: %v\n", err)
+			return 2
+		}
+	}
+
+	fmt.Print(stdout)
+	fmt.Fprint(os.Stderr, p.Stderr)
+	return p.ExitCode
+}
+
+// newKiroCLI creates a fake kiro-cli executable in dir running
+// [chatScenario] with params, and returns its path.
+func newKiroCLI(t *testing.T, dir string, params chatParams) string {
 	t.Helper()
-	outFile := filepath.Join(dir, "chat_stdout")
-	errFile := filepath.Join(dir, "chat_stderr")
-	if err := os.WriteFile(outFile, []byte(stdoutBody), 0o644); err != nil {
-		t.Fatalf("writing chat stdout fixture: %v", err)
-	}
-	if err := os.WriteFile(errFile, []byte(stderrBody), 0o644); err != nil {
-		t.Fatalf("writing chat stderr fixture: %v", err)
-	}
+	return agenttest.FakeRuntime(t, dir, "kiro-cli", chatScenario, params)
+}
 
-	body := fmt.Sprintf(`if [ "$1" = "whoami" ]; then
-  printf '%%s\n' 'Authenticated with API key'
-  exit 0
-fi
-printf '%%s\n' "$*" >> '%s'
-cat '%s'
-cat '%s' >&2
-exit %d
-`, argsLog, outFile, errFile, chatExit)
-
-	return agenttest.WriteScript(t, dir, "kiro-cli", body)
+func TestMain(m *testing.M) {
+	agenttest.Main(m, map[string]agenttest.Scenario{
+		chatScenario: agenttest.Typed(runChat),
+	})
 }
 
 // setValidAPIKey sets a usable KIRO_API_KEY for the test. It is incompatible
@@ -198,7 +221,7 @@ func TestOnFinalize_SuccessWithCredits(t *testing.T) {
 	// t.Setenv is incompatible with t.Parallel.
 	setValidAPIKey(t)
 
-	bin := fakeChatScript(t, t.TempDir(), "\x1b[38;5;141m> \x1b[0mPONG", creditsLine, 0)
+	bin := newKiroCLI(t, t.TempDir(), chatParams{Stdout: "\x1b[38;5;141m> \x1b[0mPONG", Stderr: creditsLine})
 	adapter, session, state := mustStartSession(t, bin)
 
 	events, result, err := runChatTurn(t, adapter, session, "ping")
@@ -231,7 +254,7 @@ func TestOnFinalize_AuthFailed(t *testing.T) {
 	// t.Setenv is incompatible with t.Parallel.
 	setValidAPIKey(t)
 
-	bin := fakeChatScript(t, t.TempDir(), "", authFailLine, 0)
+	bin := newKiroCLI(t, t.TempDir(), chatParams{Stderr: authFailLine})
 	adapter, session, state := mustStartSession(t, bin)
 
 	events, result, err := runChatTurn(t, adapter, session, "ping")
@@ -271,7 +294,7 @@ func TestOnFinalize_AuthFailedWithWhitespaceOnlyStdout(t *testing.T) {
 	// t.Setenv is incompatible with t.Parallel.
 	setValidAPIKey(t)
 
-	bin := fakeChatScript(t, t.TempDir(), "   \n", authFailLine, 0)
+	bin := newKiroCLI(t, t.TempDir(), chatParams{Stdout: "   \n", Stderr: authFailLine})
 	adapter, session, state := mustStartSession(t, bin)
 
 	events, result, err := runChatTurn(t, adapter, session, "ping")
@@ -304,7 +327,7 @@ func TestOnFinalize_ExitZeroNoSignal(t *testing.T) {
 	// and stdout carrying only whitespace: the observer's stricter
 	// trim-then-check threshold means a whitespace-only line is never
 	// work, so a bare exit 0 with nothing behind it is never a success.
-	bin := fakeChatScript(t, t.TempDir(), "   \n", "a warning with no markers\n", 0)
+	bin := newKiroCLI(t, t.TempDir(), chatParams{Stdout: "   \n", Stderr: "a warning with no markers\n"})
 	adapter, session, state := mustStartSession(t, bin)
 
 	events, result, err := runChatTurn(t, adapter, session, "ping")
@@ -348,7 +371,7 @@ func TestOnFinalize_NonZeroExit(t *testing.T) {
 	// t.Setenv is incompatible with t.Parallel.
 	setValidAPIKey(t)
 
-	bin := fakeChatScript(t, t.TempDir(), "", "kiro: internal error\n", 1)
+	bin := newKiroCLI(t, t.TempDir(), chatParams{Stderr: "kiro: internal error\n", ExitCode: 1})
 	adapter, session, _ := mustStartSession(t, bin)
 
 	events, result, err := runChatTurn(t, adapter, session, "ping")
@@ -393,7 +416,7 @@ func TestOnFinalize_AuthLineWithStdoutIsNotAuthError(t *testing.T) {
 	// t.Setenv is incompatible with t.Parallel.
 	setValidAPIKey(t)
 
-	bin := fakeChatScript(t, t.TempDir(), "partial answer", authFailLine, 0)
+	bin := newKiroCLI(t, t.TempDir(), chatParams{Stdout: "partial answer", Stderr: authFailLine})
 	adapter, session, _ := mustStartSession(t, bin)
 
 	_, result, err := runChatTurn(t, adapter, session, "ping")
@@ -420,7 +443,7 @@ func TestOnFinalize_TranscriptNoCreditsNoAuthCompletes(t *testing.T) {
 	// t.Setenv is incompatible with t.Parallel.
 	setValidAPIKey(t)
 
-	bin := fakeChatScript(t, t.TempDir(), "the answer is 42", "a warning with no markers\n", 0)
+	bin := newKiroCLI(t, t.TempDir(), chatParams{Stdout: "the answer is 42", Stderr: "a warning with no markers\n"})
 	adapter, session, state := mustStartSession(t, bin)
 
 	_, result, err := runChatTurn(t, adapter, session, "ping")
@@ -466,7 +489,7 @@ func TestOnFinalize_NoTokenEvent(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// No t.Parallel(): the shared KIRO_API_KEY env is process-global.
-			bin := fakeChatScript(t, t.TempDir(), tt.stdoutBody, tt.stderrBody, tt.chatExit)
+			bin := newKiroCLI(t, t.TempDir(), chatParams{Stdout: tt.stdoutBody, Stderr: tt.stderrBody, ExitCode: tt.chatExit})
 			adapter, session, _ := mustStartSession(t, bin)
 
 			events, result, _ := runChatTurn(t, adapter, session, "ping")
@@ -484,7 +507,7 @@ func TestAssertUsageReporting(t *testing.T) {
 	// t.Setenv is incompatible with t.Parallel.
 	setValidAPIKey(t)
 
-	bin := fakeChatScript(t, t.TempDir(), "\x1b[0mPONG", creditsLine, 0)
+	bin := newKiroCLI(t, t.TempDir(), chatParams{Stdout: "\x1b[0mPONG", Stderr: creditsLine})
 	adapter, session, _ := mustStartSession(t, bin)
 
 	events, result, err := runChatTurn(t, adapter, session, "ping")
@@ -507,7 +530,7 @@ func TestOnFinalize_ResumeRequestedOnSecondTurn(t *testing.T) {
 
 	dir := t.TempDir()
 	argsLog := filepath.Join(dir, "args.log")
-	bin := fakeChatScriptWithArgsLog(t, dir, "PONG", creditsLine, 0, argsLog)
+	bin := newKiroCLI(t, dir, chatParams{Stdout: "PONG", Stderr: creditsLine, ArgsLogPath: argsLog})
 	adapter, session, state := mustStartSession(t, bin)
 
 	_, result1, err := runChatTurn(t, adapter, session, "first")
@@ -551,18 +574,7 @@ func TestOnFinalize_SecondTurnFailsAfterFirstTurnNonBlankStdout(t *testing.T) {
 
 	dir := t.TempDir()
 	counterFile := filepath.Join(dir, "turn-count")
-	bin := agenttest.WriteScript(t, dir, "kiro-cli", fmt.Sprintf(`if [ "$1" = "whoami" ]; then
-  printf '%%s\n' 'Authenticated with API key'
-  exit 0
-fi
-if [ -f '%s' ]; then
-  printf '   \n'
-else
-  touch '%s'
-  printf 'the answer is 42\n'
-fi
-exit 0
-`, counterFile, counterFile))
+	bin := newKiroCLI(t, dir, chatParams{MarkerFile: counterFile, Stdout: "the answer is 42\n", MarkerStdout: "   \n"})
 
 	adapter, session, _ := mustStartSession(t, bin)
 
@@ -646,7 +658,7 @@ func TestStartSession_MissingCredential(t *testing.T) {
 	// t.Setenv is incompatible with t.Parallel.
 	t.Setenv("KIRO_API_KEY", "")
 
-	bin := fakeChatScript(t, t.TempDir(), "", "", 0)
+	bin := newKiroCLI(t, t.TempDir(), chatParams{})
 	adapter, err := NewKiroAdapter(map[string]any{})
 	if err != nil {
 		t.Fatalf("NewKiroAdapter: %v", err)
@@ -665,7 +677,7 @@ func TestStartSession_InvalidCredential(t *testing.T) {
 
 	// whoami reports the auth-failure marker, so the canary must reject the key.
 	dir := t.TempDir()
-	bin := agenttest.WriteScript(t, dir, "kiro-cli", "printf '%s\\n' 'Authentication failed.'\nexit 0")
+	bin := agenttest.FakeRuntime(t, dir, "kiro-cli", agenttest.OutputScenario, agenttest.Output{Stdout: "Authentication failed.\n"})
 
 	adapter, err := NewKiroAdapter(map[string]any{})
 	if err != nil {
@@ -691,10 +703,7 @@ func TestStartSession_CanaryNonZeroExitIsResponseError(t *testing.T) {
 	setValidAPIKey(t)
 
 	dir := t.TempDir()
-	bin := agenttest.WriteScript(t, dir, "kiro-cli", `if [ "$1" = "whoami" ]; then
-  exit 1
-fi
-exit 0`)
+	bin := newKiroCLI(t, dir, chatParams{WhoamiExitCode: 1})
 
 	adapter, err := NewKiroAdapter(map[string]any{})
 	if err != nil {
@@ -733,7 +742,7 @@ func TestStartSession_InvalidWorkspace(t *testing.T) {
 
 	_, err = adapter.StartSession(context.Background(), domain.StartSessionParams{
 		WorkspacePath: "/nonexistent/sortie-kiro-test-path-12345",
-		AgentConfig:   domain.AgentConfig{Command: "/bin/sh"},
+		AgentConfig:   domain.AgentConfig{Command: "kiro-cli"},
 	})
 	requireAgentError(t, err, domain.ErrInvalidWorkspaceCwd)
 }

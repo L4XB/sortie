@@ -4,9 +4,11 @@ package agentcore
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -18,63 +20,125 @@ import (
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
-// writePgidScript creates a script that spawns a long-running grandchild
-// (sleep 3600 &), writes the grandchild PID to pidFile, emits a JSONL
-// notification line to stdout, then blocks. Using agenttest.WriteScript
-// avoids the ETXTBSY race on Linux.
+// pgidLeaderParams parameterizes the pgid-family scenarios: it names the
+// fake runtime executable a leader starts as its descendant, and the file
+// the leader records the descendant's PID into for the test to poll.
+type pgidLeaderParams struct {
+	ChildPath string
+	PIDFile   string
+}
+
+// pgidLeaderScenario spawns a background descendant that inherits the
+// leader's process group (no Setsid), records its PID, emits a JSONL
+// notification line, and hangs. It is the Go equivalent of a shell
+// fixture running "sleep 3600 & ...; sleep 3600".
+func pgidLeaderScenario(_ []string, p pgidLeaderParams) int {
+	child := exec.Command(p.ChildPath) //nolint:gosec // p.ChildPath is a fake runtime under t.TempDir()
+	child.Stdout = os.Stdout
+	child.Stderr = os.Stderr
+	if err := child.Start(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if err := os.WriteFile(p.PIDFile, []byte(strconv.Itoa(child.Process.Pid)), 0o600); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	fmt.Println(`{"type":"notification"}`)
+	agenttest.Hang()
+	return 0
+}
+
+// escapedPgidLeaderScenario spawns a descendant with Setsid so it leaves the
+// leader's process group while still inheriting the leader's stdout handle,
+// the Go equivalent of "setsid sh -c '...' &". Go performs the setsid() call
+// as part of the fork/exec sequence before Start returns, so unlike the
+// shell fixture this needs no separate readiness marker for the child's own
+// PID: cmd.Process.Pid is already the detached session's PID.
+func escapedPgidLeaderScenario(_ []string, p pgidLeaderParams) int {
+	child := exec.Command(p.ChildPath) //nolint:gosec // p.ChildPath is a fake runtime under t.TempDir()
+	child.Stdout = os.Stdout
+	child.Stderr = os.Stderr
+	child.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := child.Start(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if err := os.WriteFile(p.PIDFile, []byte(strconv.Itoa(child.Process.Pid)), 0o600); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	fmt.Println(`{"type":"notification"}`)
+	agenttest.Hang()
+	return 0
+}
+
+// stderrOnlyLeaderScenario writes its own stderr line, starts a descendant
+// whose stdout is discarded but whose stderr is the leader's own (so it
+// keeps that pipe's write end open after the leader exits), records the
+// descendant's PID, and returns immediately instead of blocking.
+func stderrOnlyLeaderScenario(_ []string, p pgidLeaderParams) int {
+	fmt.Fprintln(os.Stderr, "direct child stderr")
+	child := exec.Command(p.ChildPath) //nolint:gosec // p.ChildPath is a fake runtime under t.TempDir()
+	child.Stderr = os.Stderr
+	if err := child.Start(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if err := os.WriteFile(p.PIDFile, []byte(strconv.Itoa(child.Process.Pid)), 0o600); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	fmt.Println(`{"type":"notification"}`)
+	return 0
+}
+
+// selfSignalScenario sends itself SIGTERM with no handler installed, so the
+// default disposition terminates the process the way a signal delivered by
+// another process would, and hangs as a fallback in the unreached case the
+// signal does not take effect immediately.
+func selfSignalScenario(_ []string, _ json.RawMessage) int {
+	_ = syscall.Kill(os.Getpid(), syscall.SIGTERM) //nolint:errcheck // best-effort self-signal; the point is the default disposition
+	agenttest.Hang()
+	return 0
+}
+
+func init() {
+	scenarios["pgidLeader"] = agenttest.Typed(pgidLeaderScenario)
+	scenarios["escapedPgidLeader"] = agenttest.Typed(escapedPgidLeaderScenario)
+	scenarios["stderrOnlyLeader"] = agenttest.Typed(stderrOnlyLeaderScenario)
+	scenarios["selfSignal"] = selfSignalScenario
+}
+
+// writePgidScript builds a leader fake runtime that spawns a long-running
+// grandchild in its own process group, writes the grandchild's PID to
+// pidFile, and emits a JSONL notification line before hanging.
 func writePgidScript(t *testing.T, dir, pidFile string) string {
 	t.Helper()
-	content := fmt.Sprintf(
-		"sleep 3600 &\n"+
-			"CHILD_PID=$!\n"+
-			"printf '%%s\\n' \"$CHILD_PID\" > '%s'\n"+
-			"printf '{\"type\":\"notification\"}\\n'\n"+
-			"sleep 3600\n",
-		pidFile,
-	)
-	return agenttest.WriteScript(t, dir, "agent-pgid", content)
+	child := agenttest.FakeRuntime(t, dir, "agent-pgid-child", agenttest.OutputScenario, agenttest.Output{Hang: true})
+	return agenttest.FakeRuntime(t, dir, "agent-pgid", "pgidLeader", pgidLeaderParams{ChildPath: child, PIDFile: pidFile})
 }
 
-// writeEscapedPgidScript creates a script that spawns a long-running
-// grandchild through setsid (so it leaves the process group while still
-// inheriting the parent's stdout handle), writes the grandchild PID to
-// pidFile, emits a JSONL notification line to stdout, then blocks like
+// writeEscapedPgidScript builds a leader fake runtime that spawns a
+// long-running grandchild via Setsid (so it leaves the process group while
+// still inheriting the parent's stdout handle), writes the grandchild's PID
+// to pidFile, and emits a JSONL notification line before hanging like
 // writePgidScript's own leader.
-//
-// The grandchild writes its own PID, using $$ from inside the process
-// setsid already transitioned, and the leader waits on that marker
-// before continuing. Waiting on the leader's own $! instead would only
-// prove the job was forked, not that its setsid() call had already
-// taken effect, so a group signal delivered in that window would still
-// reach a grandchild that had not yet escaped the group.
 func writeEscapedPgidScript(t *testing.T, dir, pidFile string) string {
 	t.Helper()
-	content := fmt.Sprintf(
-		"setsid sh -c 'echo $$ > %s; sleep 3600' &\n"+
-			"while [ ! -s %s ]; do sleep 0.01; done\n"+
-			"printf '{\"type\":\"notification\"}\\n'\n"+
-			"sleep 3600\n",
-		pidFile, pidFile,
-	)
-	return agenttest.WriteScript(t, dir, "agent-escaped-pgid", content)
+	child := agenttest.FakeRuntime(t, dir, "agent-escaped-pgid-child", agenttest.OutputScenario, agenttest.Output{Hang: true})
+	return agenttest.FakeRuntime(t, dir, "agent-escaped-pgid", "escapedPgidLeader", pgidLeaderParams{ChildPath: child, PIDFile: pidFile})
 }
 
-// writeStderrOnlyDescendantScript creates a script whose background job
-// redirects its own stdout away, so it inherits the parent script's stderr
-// handle only, and whose parent writes a stderr line of its own, the
-// descendant PID, and the notification line, then exits normally instead of
-// sleeping. Using agenttest.WriteScript avoids the ETXTBSY race on Linux.
+// writeStderrOnlyDescendantScript builds a leader fake runtime whose
+// background descendant has its stdout discarded and inherits only the
+// leader's stderr handle, and whose leader writes a stderr line of its own,
+// the descendant PID, and the notification line, then exits normally
+// instead of hanging.
 func writeStderrOnlyDescendantScript(t *testing.T, dir, pidFile string) string {
 	t.Helper()
-	content := fmt.Sprintf(
-		"printf '%%s\\n' 'direct child stderr' >&2\n"+
-			"sleep 3600 >/dev/null &\n"+
-			"CHILD_PID=$!\n"+
-			"printf '%%s\\n' \"$CHILD_PID\" > '%s'\n"+
-			"printf '{\"type\":\"notification\"}\\n'\n",
-		pidFile,
-	)
-	return agenttest.WriteScript(t, dir, "agent-stderr-only-descendant", content)
+	child := agenttest.FakeRuntime(t, dir, "agent-stderr-only-child", agenttest.OutputScenario, agenttest.Output{Hang: true})
+	return agenttest.FakeRuntime(t, dir, "agent-stderr-only-descendant", "stderrOnlyLeader", pgidLeaderParams{ChildPath: child, PIDFile: pidFile})
 }
 
 // pollPgidFileTimeout is the bound every pollPgidFile call in this file
@@ -147,6 +211,26 @@ func assertPgidProcessDead(t *testing.T, pid int, timeout time.Duration) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Errorf("assertPgidProcessDead: process %d still alive after %v", pid, timeout)
+}
+
+// TestForkPerTurnSession_Arm5_ExternalSIGTERM verifies that a subprocess
+// killed by an external signal it never asked for is classified through
+// procutil.WasSignaled as a cancelled turn, not a plain non-zero exit.
+func TestForkPerTurnSession_Arm5_ExternalSIGTERM(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	script := agenttest.FakeRuntime(t, tmpDir, "agent", "selfSignal", nil)
+	target := newTestTarget(tmpDir, script)
+	sess := NewForkPerTurnSession(target, noopHooks(), slog.Default(), 0)
+
+	emit, events := sinkEvents()
+	_, err := sess.RunTurn(context.Background(), "p", emit)
+
+	requireAgentError(t, err, domain.ErrTurnCancelled)
+	if !hasEventType(*events, domain.EventTurnCancelled) {
+		t.Errorf("EventTurnCancelled not emitted; got %v", *events)
+	}
 }
 
 // TestForkPerTurnSession_ProcessGroupIsolation verifies that cancelling the
@@ -315,7 +399,6 @@ func TestForkPerTurnSession_InGroupDescendantHoldsStdout(t *testing.T) {
 // property P7 (the same disposition and error as the identical
 // unabandoned turn).
 func TestForkPerTurnSession_EscapedDescendantHoldsStdout(t *testing.T) {
-	agenttest.RequireSetsid(t)
 	t.Parallel()
 
 	tmpDir := t.TempDir()

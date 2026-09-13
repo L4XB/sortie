@@ -7,17 +7,32 @@ import (
 	"io"
 	"log/slog"
 	"os/exec"
-	"runtime"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 )
 
+// fakeScenarios collects every non-default fake-runtime scenario this
+// package's tests register. Platform-specific test files add their own
+// entries via init.
+var fakeScenarios = map[string]agenttest.Scenario{}
+
+func TestMain(m *testing.M) {
+	agenttest.Main(m, fakeScenarios)
+}
+
+// fakeRuntimeCmd returns an unstarted command for a fake runtime that
+// behaves per out.
+func fakeRuntimeCmd(t *testing.T, out agenttest.Output) *exec.Cmd {
+	t.Helper()
+	path := agenttest.FakeRuntime(t, t.TempDir(), "fake", agenttest.OutputScenario, out)
+	return exec.Command(path) //nolint:gosec // fake runtime path under t.TempDir()
+}
+
 func TestExtractExitCode(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("subtests require /bin/sh")
-	}
 	t.Parallel()
 
 	tests := []struct {
@@ -34,7 +49,7 @@ func TestExtractExitCode(t *testing.T) {
 			name: "ExitError code 1",
 			makeErr: func(t *testing.T) error {
 				t.Helper()
-				return exec.Command("/bin/sh", "-c", "exit 1").Run()
+				return fakeRuntimeCmd(t, agenttest.Output{ExitCode: 1}).Run()
 			},
 			want: 1,
 		},
@@ -42,7 +57,7 @@ func TestExtractExitCode(t *testing.T) {
 			name: "ExitError code 42",
 			makeErr: func(t *testing.T) error {
 				t.Helper()
-				return exec.Command("/bin/sh", "-c", "exit 42").Run()
+				return fakeRuntimeCmd(t, agenttest.Output{ExitCode: 42}).Run()
 			},
 			want: 42,
 		},

@@ -3,24 +3,33 @@ package agentcore
 import (
 	"testing"
 
+	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
 func TestResolveBinary(t *testing.T) {
 	t.Parallel()
 
+	t.Run("binary on PATH", func(t *testing.T) {
+		t.Parallel()
+		bin := agenttest.FakeRuntime(t, t.TempDir(), "agent", agenttest.OutputScenario, agenttest.Output{})
+
+		got, agentErr := ResolveBinary(bin)
+
+		if agentErr != nil {
+			t.Fatalf("ResolveBinary(%q) unexpected error: %v", bin, agentErr)
+		}
+		if got == "" {
+			t.Errorf("ResolveBinary(%q) = %q, want non-empty path", bin, got)
+		}
+	})
+
 	tests := []struct {
-		name      string
-		command   string
-		wantKind  domain.AgentErrorKind
-		wantMsg   string
-		wantNoErr bool
+		name     string
+		command  string
+		wantKind domain.AgentErrorKind
+		wantMsg  string
 	}{
-		{
-			name:      "binary on PATH",
-			command:   "sh",
-			wantNoErr: true,
-		},
 		{
 			name:     "binary not found",
 			command:  "sortie-no-such-binary-xyzzy",
@@ -46,16 +55,6 @@ func TestResolveBinary(t *testing.T) {
 			t.Parallel()
 
 			got, agentErr := ResolveBinary(tt.command)
-
-			if tt.wantNoErr {
-				if agentErr != nil {
-					t.Fatalf("ResolveBinary(%q) unexpected error: %v", tt.command, agentErr)
-				}
-				if got == "" {
-					t.Errorf("ResolveBinary(%q) = %q, want non-empty path", tt.command, got)
-				}
-				return
-			}
 
 			if agentErr == nil {
 				t.Fatalf("ResolveBinary(%q) = %q, want error with kind %q", tt.command, got, tt.wantKind)

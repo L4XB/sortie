@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 	"github.com/sortie-ai/sortie/internal/agent/clientprotocol"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/qualification"
@@ -41,44 +42,14 @@ const (
 	permissionNoOptionNotice = "the agent needs a permission this unattended run cannot grant"
 )
 
-// mcpToolServerScript is a fake MCP stdio server that records every
-// tools/call it receives to callRecordPath, one line per call, and
-// otherwise answers only what a session/new declaring it needs:
-// initialize, tools/list, and tools/call. It follows
-// session_unix_test.go's mcpHandshakeScript shape, adapted from the
-// Agent Client Protocol's own wire to the Model Context Protocol's.
-func mcpToolServerScript(callRecordPath string) string {
-	return `record='` + callRecordPath + `'
-extract_id() {
-  printf '%s' "$1" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p'
-}
-while IFS= read -r line; do
-  id=$(extract_id "$line")
-  case "$line" in
-    *'"method":"initialize"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"` + toolServerName + `","version":"0.0.0"}}}\n' "$id"
-      ;;
-    *'"method":"tools/list"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"` + probeToolName + `","description":"records that the qualification probe induced a call","inputSchema":{"type":"object","properties":{}}}]}}\n' "$id"
-      ;;
-    *'"method":"tools/call"'*)
-      printf '%s\n' "$line" >> "$record"
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"ok"}]}}\n' "$id"
-      ;;
-  esac
-done
-`
-}
+// mcpToolServerScenario names the Go fake runtime induceToolServerCall
+// and inducePermissionRequest launch as the declared stdio server.
+const mcpToolServerScenario = "mcp-tool-server"
 
-// writeExecutableScript writes an executable POSIX shell script under
-// dir and returns its path.
-func writeExecutableScript(t *testing.T, dir, name, content string) string {
-	t.Helper()
-	path := filepath.Join(dir, name)
-	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+content), 0o700); err != nil { //nolint:gosec // the induction script is a test fixture the probe writes and launches under its own temp directory
-		t.Fatalf("write induction script %s: %v", path, err)
-	}
-	return path
+// mcpToolServerParams parameterizes mcpToolServerScenario: every
+// tools/call it receives is recorded to RecordPath, one line per call.
+type mcpToolServerParams struct {
+	RecordPath string
 }
 
 // writeToolServerMCPConfig writes a generated MCP configuration
@@ -112,8 +83,8 @@ func fileHasContent(path string) (bool, error) {
 // startInductionSession launches one protocol session with argv as the
 // runtime's own arguments and mcpConfigPath declaring the induced tool
 // server, in a fresh isolated workspace. It registers the session's own
-// teardown, including the step 3.1 process-group-absence assertion,
-// before returning.
+// teardown, including the process-group-absence assertion, before
+// returning.
 func startInductionSession(t *testing.T, coords Coordinates, argv []string, mcpConfigPath string) (domain.AgentAdapter, domain.Session, error) {
 	t.Helper()
 
@@ -155,7 +126,7 @@ func induceToolServerCall(t *testing.T, coords Coordinates) (qualification.Grade
 
 	dir := t.TempDir()
 	callRecordPath := filepath.Join(dir, "calls.jsonl")
-	scriptPath := writeExecutableScript(t, dir, "mcp-server.sh", mcpToolServerScript(callRecordPath))
+	scriptPath := agenttest.FakeRuntime(t, dir, "mcp-server", mcpToolServerScenario, mcpToolServerParams{RecordPath: callRecordPath})
 	mcpConfigPath := writeToolServerMCPConfig(t, dir, scriptPath)
 
 	argv, err := coords.Profile.EntryArgs(qualification.SurfaceProtocol, coords.Model, "", "")
@@ -237,7 +208,7 @@ func inducePermissionRequest(t *testing.T, coords Coordinates) (qualification.Gr
 
 	dir := t.TempDir()
 	callRecordPath := filepath.Join(dir, "calls.jsonl")
-	scriptPath := writeExecutableScript(t, dir, "mcp-server.sh", mcpToolServerScript(callRecordPath))
+	scriptPath := agenttest.FakeRuntime(t, dir, "mcp-server", mcpToolServerScenario, mcpToolServerParams{RecordPath: callRecordPath})
 	mcpConfigPath := writeToolServerMCPConfig(t, dir, scriptPath)
 
 	argv, err := permissionAskingArgs(coords)
