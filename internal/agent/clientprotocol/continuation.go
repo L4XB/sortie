@@ -131,9 +131,7 @@ func resolveLoad(ctx context.Context, state *sessionState, resumeID, cwd string,
 		}
 	}
 
-	if agentErr := sendControl(ctx, state, pumpItem{control: &pumpControl{expectLoad: resumeID}}); agentErr != nil {
-		return "", agentErr
-	}
+	state.inbox.Put(pumpItem{control: &pumpControl{expectLoad: resumeID}})
 
 	callCtx, cancel := context.WithTimeout(ctx, readTimeout(state))
 	defer cancel()
@@ -153,9 +151,7 @@ func resolveLoad(ctx context.Context, state *sessionState, resumeID, cwd string,
 	}
 
 	reply := make(chan bool, 1)
-	if agentErr := sendControl(ctx, state, pumpItem{control: &pumpControl{query: &replayQuery{reply: reply}}}); agentErr != nil {
-		return "", agentErr
-	}
+	state.inbox.Put(pumpItem{control: &pumpControl{query: &replayQuery{reply: reply}}})
 
 	timer := time.NewTimer(readTimeout(state))
 	defer timer.Stop()
@@ -206,27 +202,8 @@ func resolveResume(ctx context.Context, state *sessionState, resumeID, cwd strin
 // explicit error response or a timeout waiting for one. The fallback
 // itself never fails the run on its own account.
 func unconfirmedFallback(ctx context.Context, state *sessionState, cwd string, servers []mcpServer) (string, *domain.AgentError) {
-	if agentErr := sendControl(ctx, state, pumpItem{control: &pumpControl{query: &replayQuery{}}}); agentErr != nil {
-		return "", agentErr
-	}
+	state.inbox.Put(pumpItem{control: &pumpControl{query: &replayQuery{}}})
 	return createNewSession(ctx, state, cwd, servers)
-}
-
-// sendControl publishes item to the pump's input channel, bounded by
-// ctx and the connection's own read timeout, so a stalled pump can
-// never leave a continuation call blocked on an unbounded send the way
-// runTurn's own control publish is bounded.
-func sendControl(ctx context.Context, state *sessionState, item pumpItem) *domain.AgentError {
-	timer := time.NewTimer(readTimeout(state))
-	defer timer.Stop()
-	select {
-	case state.itemCh <- item:
-		return nil
-	case <-ctx.Done():
-		return &domain.AgentError{Kind: domain.ErrPortExit, Message: "context ended before a control message reached the agent connection", Err: ctx.Err()}
-	case <-timer.C:
-		return &domain.AgentError{Kind: domain.ErrResponseTimeout, Message: "timed out publishing a control message to the agent connection", Err: context.DeadlineExceeded}
-	}
 }
 
 // createNewSession creates a fresh session with session/new: the route

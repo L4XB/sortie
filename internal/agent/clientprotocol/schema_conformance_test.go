@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sortie-ai/sortie/internal/agent/jsonrpc"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
@@ -946,7 +947,7 @@ func TestSchemaConformance(t *testing.T) {
 			loadOutcomeCh <- resolveSessionOutcome{sessionID: sessionID, err: err}
 		}()
 		loadProbeID := loadOut.awaitMethod(t, negativeControlMethod)
-		respondErrorLine(t, loadInPw, loadProbeID, jsonrpcMethodNotFound, "method not found")
+		respondErrorLine(t, loadInPw, loadProbeID, jsonrpc.MethodNotFoundCode, "method not found")
 		loadRaw, loadReqID := nextRequestLine(t, loadOut, methodSessionLoad)
 		sendLine(t, loadInPw, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"prior-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"replayed"}}}}`)
 		respondLine(t, loadInPw, loadReqID, loadSessionResponse{})
@@ -962,7 +963,7 @@ func TestSchemaConformance(t *testing.T) {
 			resumeOutcomeCh <- resolveSessionOutcome{sessionID: sessionID, err: err}
 		}()
 		resumeProbeID := resumeOut.awaitMethod(t, negativeControlMethod)
-		respondErrorLine(t, resumeInPw, resumeProbeID, jsonrpcMethodNotFound, "method not found")
+		respondErrorLine(t, resumeInPw, resumeProbeID, jsonrpc.MethodNotFoundCode, "method not found")
 		resumeRaw, resumeReqID := nextRequestLine(t, resumeOut, methodSessionResume)
 		respondLine(t, resumeInPw, resumeReqID, resumeSessionResponse{})
 		awaitResolveSessionOutcome(t, resumeOutcomeCh)

@@ -274,9 +274,9 @@ func awaitReady(t *testing.T, readyFile string) {
 
 // TestStopSession_DoesNotReportStderrOfATurnItInterrupts covers the
 // contract StopSession states: the stop closes the connection, which
-// ends the message channel and sends the turn still running down the
-// same path a runtime that died takes. The operator asked for the stop,
-// so the runtime's standard error is not a failure to explain.
+// closes the inbox and sends the turn still running down the same path
+// a runtime that died takes. The operator asked for the stop, so the
+// runtime's standard error is not a failure to explain.
 //
 // Not run with t.Parallel(): it installs a global slog default and pins
 // CODEX_API_KEY via t.Setenv.
@@ -622,7 +622,7 @@ func TestReaderEnded_SeesTheConnectionBeforeTheWatcher(t *testing.T) {
 	})
 
 	state := &sessionState{readerDone: make(chan struct{})}
-	state.conn = jsonrpc.NewConn(io.Discard, reader, func(jsonrpc.Message) {})
+	state.conn = jsonrpc.NewConn(io.Discard, reader, jsonrpc.Deliver(jsonrpc.NewInbox[jsonrpc.Message](), identity))
 	t.Cleanup(state.conn.Close)
 
 	if state.readerEnded() {

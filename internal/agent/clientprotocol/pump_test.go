@@ -10,7 +10,9 @@ import (
 	"go/token"
 	"io"
 	"log/slog"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -79,9 +81,9 @@ func startTurnAwaitingPrompt(t *testing.T, state *sessionState, out *outboundRea
 }
 
 // TestPumpStreamEndCleanExit covers a clean end of stream mid-turn: it
-// delivers no handler message, closes jsonrpc.Conn.Done() alone, and
-// the turn must finalize on the process-exit row from that arm rather
-// than being left to the orchestrator's wall-clock ceiling.
+// delivers no message into the inbox, closes jsonrpc.Conn.Done() alone,
+// and the turn must finalize on the process-exit row from that arm
+// rather than being left to the orchestrator's wall-clock ceiling.
 func TestPumpStreamEndCleanExit(t *testing.T) {
 	t.Parallel()
 
@@ -187,8 +189,8 @@ func TestPumpDispatchNullID(t *testing.T) {
 	line := out.next(t)
 	assertRawID(t, line, "4242")
 	resp := decodeResponse(t, line)
-	if resp.Error == nil || resp.Error.Code != jsonrpcMethodNotFound {
-		t.Fatalf("response to the sentinel request = %+v, want a %d error; a different id or a decoded outcome here means the null-id session/update was answered instead of normalized", resp, jsonrpcMethodNotFound)
+	if resp.Error == nil || resp.Error.Code != jsonrpc.MethodNotFoundCode {
+		t.Fatalf("response to the sentinel request = %+v, want a %d error; a different id or a decoded outcome here means the null-id session/update was answered instead of normalized", resp, jsonrpc.MethodNotFoundCode)
 	}
 }
 
@@ -294,8 +296,8 @@ func TestAnsweredIDEcho(t *testing.T) {
 				}
 				return
 			}
-			if resp.Error == nil || resp.Error.Code != jsonrpcMethodNotFound {
-				t.Errorf("response = %+v, want a %d error for an unimplemented method", resp, jsonrpcMethodNotFound)
+			if resp.Error == nil || resp.Error.Code != jsonrpc.MethodNotFoundCode {
+				t.Errorf("response = %+v, want a %d error for an unimplemented method", resp, jsonrpc.MethodNotFoundCode)
 			}
 		})
 	}
@@ -316,7 +318,7 @@ func TestToolDeliveryReportSkippedDuringWindDownAndTeardown(t *testing.T) {
 		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 		state, outPr, inPw := newTestSessionWithLogger(t, domain.AgentConfig{ReadTimeoutMS: 2000}, clientProtocolMaxLineBytes, logger)
 		out := newOutboundReader(outPr)
-		state.itemCh <- pumpItem{control: &pumpControl{handshake: &handshakeFacts{toolServersDelivered: true}}}
+		state.inbox.Put(pumpItem{control: &pumpControl{handshake: &handshakeFacts{toolServersDelivered: true}}})
 		markSessionKnown(state)
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -367,11 +369,11 @@ func TestToolDeliveryReportSkippedDuringWindDownAndTeardown(t *testing.T) {
 		var buf bytes.Buffer
 		state := &sessionState{
 			caps:   newCapabilityRecord(false),
-			itemCh: make(chan pumpItem, pumpChannelCapacity),
 			stopCh: make(chan struct{}),
 			logger: slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})),
 		}
-		state.conn = jsonrpc.NewConn(outPw, inPr, pumpHandler(state.itemCh, state.stopCh),
+		state.inbox = jsonrpc.NewInbox[pumpItem]()
+		state.conn = jsonrpc.NewConn(outPw, inPr, jsonrpc.Deliver(state.inbox, wrapPumpMessage),
 			jsonrpc.WithVersionMember(), jsonrpc.WithMaxLineBytes(clientProtocolMaxLineBytes))
 		t.Cleanup(func() {
 			_ = outPr.Close()
@@ -414,7 +416,7 @@ func TestHandshakeToolServersDeliveredReachesPump(t *testing.T) {
 	state, outPr, inPw := newTestSessionWithLogger(t, domain.AgentConfig{ReadTimeoutMS: 2000}, clientProtocolMaxLineBytes, logger)
 	out := newOutboundReader(outPr)
 
-	state.itemCh <- pumpItem{control: &pumpControl{handshake: &handshakeFacts{toolServersDelivered: true}}}
+	state.inbox.Put(pumpItem{control: &pumpControl{handshake: &handshakeFacts{toolServersDelivered: true}}})
 	markSessionKnown(state)
 
 	var events []domain.AgentEvent
@@ -435,5 +437,91 @@ func TestHandshakeToolServersDeliveredReachesPump(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), toolDeliveryUncallableLog) {
 		t.Errorf("log output missing %q: %s", toolDeliveryUncallableLog, buf.String())
+	}
+}
+
+// stalledConsumerBurstCount is the number of session/update
+// notifications TestRunTurn_StalledConsumerDoesNotParkPump writes one
+// at a time while the turn's consumer never returns from OnEvent, well
+// past the capacity a bounded hand-off would once have held, so the
+// write that would have parked such a reader is reached long before
+// the burst ends.
+const stalledConsumerBurstCount = 4096
+
+// TestRunTurn_StalledConsumerDoesNotParkPump covers a turn whose
+// consumer never returns from OnEvent: the peer keeps writing
+// session/update notifications, and every one of those writes must
+// still return while the gate is held, because the connection's reader
+// must never park behind the pump's own stalled delivery.
+func TestRunTurn_StalledConsumerDoesNotParkPump(t *testing.T) {
+	t.Parallel()
+
+	state, outPr, inPw := newTestSession(t, domain.AgentConfig{}, clientProtocolMaxLineBytes)
+	out := newOutboundReader(outPr)
+	markSessionKnown(state)
+
+	gate := make(chan struct{})
+	var mu sync.Mutex
+	var events []domain.AgentEvent
+	outcomeCh := runTurnAsync(state, domain.RunTurnParams{
+		Prompt: "go",
+		OnEvent: func(e domain.AgentEvent) {
+			mu.Lock()
+			events = append(events, e)
+			mu.Unlock()
+			// Only a burst chunk's own event, a notification whose
+			// message is one of the texts the burst below writes, holds
+			// the gate: the turn's own session-started event and its
+			// once-per-session capability notice must reach the caller
+			// before the prompt request is even sent, or this test could
+			// never observe it being sent.
+			if _, err := strconv.Atoi(e.Message); err == nil {
+				<-gate
+			}
+		},
+	})
+	promptID := out.awaitMethod(t, methodSessionPrompt)
+
+	for i := range stalledConsumerBurstCount {
+		line := fmt.Sprintf(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-test","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"%d"}}}}`, i)
+		errCh := make(chan error, 1)
+		go func() {
+			_, writeErr := fmt.Fprintln(inPw, line)
+			errCh <- writeErr
+		}()
+		select {
+		case writeErr := <-errCh:
+			if writeErr != nil {
+				t.Fatalf("write session/update chunk %d: %v", i, writeErr)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("peer write %d did not return within 10s while the OnEvent gate was held, want the reader to never park behind the pump's own stalled delivery", i)
+		}
+	}
+	close(gate)
+
+	respondLine(t, inPw, promptID, promptResponse{StopReason: stopReasonEndTurn})
+	outcome := awaitOutcome(t, outcomeCh)
+	if outcome.err != nil {
+		t.Fatalf("RunTurn() error = %v, want nil", outcome.err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	var texts []string
+	for _, e := range events {
+		if e.Type == domain.EventNotification {
+			if _, err := strconv.Atoi(e.Message); err == nil {
+				texts = append(texts, e.Message)
+			}
+		}
+	}
+	if len(texts) != stalledConsumerBurstCount {
+		t.Fatalf("notification events = %d, want %d", len(texts), stalledConsumerBurstCount)
+	}
+	for i, text := range texts {
+		if want := fmt.Sprintf("%d", i); text != want {
+			t.Errorf("notification %d text = %q, want %q (chunks out of order)", i, text, want)
+		}
 	}
 }

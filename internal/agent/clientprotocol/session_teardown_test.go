@@ -113,7 +113,6 @@ func newParkedTeardownSession(t *testing.T) *parkedTeardownFixture {
 		pid:         cmd.Process.Pid,
 		stdinCloser: stdinCloser,
 		pipes:       pipes,
-		itemCh:      make(chan pumpItem, pumpChannelCapacity),
 		stopCh:      make(chan struct{}),
 		pumpDone:    make(chan struct{}),
 		logger:      discardLogger(),
@@ -125,7 +124,8 @@ func newParkedTeardownSession(t *testing.T) *parkedTeardownFixture {
 	reaper := procutil.StartReaper(cmd)
 	state.waitCh = reaper.Done()
 
-	state.conn = jsonrpc.NewConn(stdinCloser, pipes.Stdout, pumpHandler(state.itemCh, state.stopCh),
+	state.inbox = jsonrpc.NewInbox[pumpItem]()
+	state.conn = jsonrpc.NewConn(stdinCloser, pipes.Stdout, jsonrpc.Deliver(state.inbox, wrapPumpMessage),
 		jsonrpc.WithVersionMember(), jsonrpc.WithMaxLineBytes(8<<20))
 
 	go runPump(state)
@@ -205,7 +205,6 @@ func newParkedTeardownSessionWithStderrHolder(t *testing.T) *parkedTeardownFixtu
 		pid:         cmd.Process.Pid,
 		stdinCloser: stdinCloser,
 		pipes:       pipes,
-		itemCh:      make(chan pumpItem, pumpChannelCapacity),
 		stopCh:      make(chan struct{}),
 		pumpDone:    make(chan struct{}),
 		logger:      discardLogger(),
@@ -217,7 +216,8 @@ func newParkedTeardownSessionWithStderrHolder(t *testing.T) *parkedTeardownFixtu
 	reaper := procutil.StartReaper(cmd)
 	state.waitCh = reaper.Done()
 
-	state.conn = jsonrpc.NewConn(stdinCloser, pipes.Stdout, pumpHandler(state.itemCh, state.stopCh),
+	state.inbox = jsonrpc.NewInbox[pumpItem]()
+	state.conn = jsonrpc.NewConn(stdinCloser, pipes.Stdout, jsonrpc.Deliver(state.inbox, wrapPumpMessage),
 		jsonrpc.WithVersionMember(), jsonrpc.WithMaxLineBytes(8<<20))
 
 	go runPump(state)
@@ -531,7 +531,7 @@ func TestStopSessionTeardownReturnsWithConnectionClosedFirst(t *testing.T) {
 
 	fx := newParkedTeardownSession(t)
 	steps := []teardownStep{
-		{name: "answer_open", run: signalAnswerOpen},
+		{name: "answer_open", run: func(state *sessionState) { signalAnswerOpen(state) }},
 		{name: "close_connection", run: closeConnection},
 		{name: "kill_process_group", run: killProcessGroup},
 		{name: "close_stdin", run: closeStdin},
@@ -565,7 +565,7 @@ func TestStopSessionTeardownControlNoStdoutClose(t *testing.T) {
 
 	fx := newParkedTeardownSession(t)
 	runTeardownControl(t, fx, []teardownStep{
-		{name: "answer_open", run: signalAnswerOpen},
+		{name: "answer_open", run: func(state *sessionState) { signalAnswerOpen(state) }},
 		{name: "kill_process_group", run: killProcessGroup},
 		{name: "close_stdin", run: closeStdin},
 		{name: "close_connection", run: closeConnection},
@@ -651,14 +651,14 @@ func newGracefulTeardownSession(t *testing.T, script, readyPath string, logger *
 		pid:         cmd.Process.Pid,
 		stdinCloser: stdinPipe,
 		pipes:       pipes,
-		itemCh:      make(chan pumpItem, pumpChannelCapacity),
 		stopCh:      make(chan struct{}),
 		pumpDone:    make(chan struct{}),
 		logger:      logger,
 		caps:        newCapabilityRecord(false),
 	}
 	state.stderrCollector = procutil.NewStderrCollector(pipes.Stderr, state.logger)
-	state.conn = jsonrpc.NewConn(stdinPipe, pipes.Stdout, pumpHandler(state.itemCh, state.stopCh),
+	state.inbox = jsonrpc.NewInbox[pumpItem]()
+	state.conn = jsonrpc.NewConn(stdinPipe, pipes.Stdout, jsonrpc.Deliver(state.inbox, wrapPumpMessage),
 		jsonrpc.WithVersionMember(), jsonrpc.WithMaxLineBytes(8<<20))
 
 	reaper := procutil.StartReaper(cmd)
@@ -735,7 +735,7 @@ func TestStopSessionTeardownGracefulHandler(t *testing.T) {
 		graceCtx, cancel := context.WithTimeout(callerCtx, procutil.DefaultStopGrace)
 		defer cancel()
 		runTeardown(state, []teardownStep{
-			{name: "answer_open", run: signalAnswerOpen},
+			{name: "answer_open", run: func(state *sessionState) { signalAnswerOpen(state) }},
 			{name: "kill_process_group", run: killProcessGroup},
 			{name: "close_stdin", run: closeStdin},
 			{name: "await_exit", run: awaitExit(callerCtx, graceCtx, procutil.DefaultStopGrace)},
@@ -761,7 +761,7 @@ func TestStopSessionTeardownGracefulHandler(t *testing.T) {
 
 		callerCtx := context.Background()
 		runTeardown(state, []teardownStep{
-			{name: "answer_open", run: signalAnswerOpen},
+			{name: "answer_open", run: func(state *sessionState) { signalAnswerOpen(state) }},
 			{name: "signal_graceful", run: signalGraceful},
 			{name: "close_stdin", run: closeStdin},
 			{name: "kill_process_group", run: killProcessGroup},

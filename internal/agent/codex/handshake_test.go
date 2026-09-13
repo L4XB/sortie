@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +17,13 @@ import (
 	"github.com/sortie-ai/sortie/internal/agent/jsonrpc"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
+
+// discardTestLogger returns a logger that discards every record, for a
+// test exercising a handshake helper's logging parameter with nothing
+// to assert about its output.
+func discardTestLogger() *slog.Logger {
+	return slog.New(slog.DiscardHandler)
+}
 
 // newHandshakeConn builds a sessionState wired to a real jsonrpc.Conn
 // whose peer replays lines (joined as a flat JSONL fixture), for
@@ -42,12 +50,11 @@ func newHandshakeConn(t *testing.T, recorder *capturingWriteCloser, lines ...str
 
 	state := &sessionState{
 		target:     agentcore.LaunchTarget{WorkspacePath: "/tmp"},
-		msgCh:      make(chan jsonrpc.Message, 16),
+		inbox:      jsonrpc.NewInbox[jsonrpc.Message](),
 		readerDone: make(chan struct{}),
-		stopCh:     make(chan struct{}),
 		acc:        agentcore.NewRunUsage(),
 	}
-	state.conn = jsonrpc.NewConn(w, inPr, sessionHandler(state))
+	state.conn = jsonrpc.NewConn(w, inPr, jsonrpc.Deliver(state.inbox, identity))
 	go watchTermination(state)
 
 	segments := splitFixtureSegments([]byte(strings.Join(lines, "\n")))
@@ -91,12 +98,11 @@ func openEndedHandshakeState(t *testing.T, repliesByID map[int64]string) *sessio
 
 	state := &sessionState{
 		target:     agentcore.LaunchTarget{WorkspacePath: "/tmp"},
-		msgCh:      make(chan jsonrpc.Message, 16),
+		inbox:      jsonrpc.NewInbox[jsonrpc.Message](),
 		readerDone: make(chan struct{}),
-		stopCh:     make(chan struct{}),
 		acc:        agentcore.NewRunUsage(),
 	}
-	state.conn = jsonrpc.NewConn(outPw, inPr, sessionHandler(state))
+	state.conn = jsonrpc.NewConn(outPw, inPr, jsonrpc.Deliver(state.inbox, identity))
 	go watchTermination(state)
 
 	go func() {
@@ -115,14 +121,10 @@ func openEndedHandshakeState(t *testing.T, repliesByID map[int64]string) *sessio
 
 // authWaitState builds a sessionState like openEndedHandshakeState,
 // resolving exactly repliesByID's calls and never terminating on its
-// own, but without a watchTermination goroutine racing the test's own
-// direct control of state.msgCh: jsonrpc.Conn.Call does not read
-// state.msgCh at all, so closing it, or pushing a message onto it,
-// directly from the test cannot race Call's own resolution; the two
-// channels are entirely independent. This is the deterministic way to
-// end a msgCh-reading wait loop from a test: any attempt to close, or
-// force an error on, the underlying connection instead would race
-// Call's own pending-response delivery on the same connection.
+// own, and without a watchTermination goroutine racing the test's own
+// direct control of state.inbox: jsonrpc.Conn.Call does not take from
+// state.inbox at all, so closing it, or putting a message onto it,
+// directly from the test cannot race Call's own resolution.
 func authWaitState(t *testing.T, repliesByID map[int64]string) *sessionState {
 	t.Helper()
 
@@ -137,16 +139,10 @@ func authWaitState(t *testing.T, repliesByID map[int64]string) *sessionState {
 
 	state := &sessionState{
 		target: agentcore.LaunchTarget{WorkspacePath: "/tmp"},
-		msgCh:  make(chan jsonrpc.Message, 16),
-		stopCh: make(chan struct{}),
+		inbox:  jsonrpc.NewInbox[jsonrpc.Message](),
 		acc:    agentcore.NewRunUsage(),
 	}
-	// The handler is a no-op, never sessionHandler: every message the
-	// test cares about is delivered by acting on state.msgCh directly
-	// (closing it, or pushing a message), and once a test has closed
-	// it, a real sessionHandler would panic sending into it once the
-	// connection eventually errors at t.Cleanup.
-	state.conn = jsonrpc.NewConn(outPw, inPr, func(jsonrpc.Message) {})
+	state.conn = jsonrpc.NewConn(outPw, inPr, jsonrpc.Deliver(state.inbox, identity))
 
 	go func() {
 		scanOutboundLines(outPr, func(line []byte) {
@@ -203,7 +199,7 @@ func TestAuthenticateIfNeeded_AlreadyLoggedIn(t *testing.T) {
 	// account/read response with non-null account.
 	state := handshakeState(t, `{"id":1,"result":{"account":{"id":"user-1","email":"user@example.com"}}}`)
 
-	if err := authenticateIfNeeded(context.Background(), state); err != nil {
+	if err := authenticateIfNeeded(context.Background(), state, discardTestLogger()); err != nil {
 		t.Fatalf("authenticateIfNeeded() error = %v, want nil for logged-in account", err)
 	}
 }
@@ -214,7 +210,7 @@ func TestAuthenticateIfNeeded_NullAccountNoAPIKey(t *testing.T) {
 	// account/read response with null account, CODEX_API_KEY not set → return nil.
 	state := handshakeState(t, `{"id":1,"result":{"account":null}}`)
 
-	if err := authenticateIfNeeded(context.Background(), state); err != nil {
+	if err := authenticateIfNeeded(context.Background(), state, discardTestLogger()); err != nil {
 		t.Fatalf("authenticateIfNeeded() error = %v, want nil when API key absent", err)
 	}
 }
@@ -224,7 +220,7 @@ func TestAuthenticateIfNeeded_AccountReadError(t *testing.T) {
 
 	state := handshakeState(t, `{"id":1,"error":{"code":-32000,"message":"server error"}}`)
 
-	err := authenticateIfNeeded(context.Background(), state)
+	err := authenticateIfNeeded(context.Background(), state, discardTestLogger())
 	if err == nil {
 		t.Fatal("authenticateIfNeeded() expected error for account/read error response")
 	}
@@ -243,7 +239,7 @@ func TestAuthenticateIfNeeded_LoginSuccess(t *testing.T) {
 		`{"method":"account/login/completed","params":{"success":true}}`,
 	)
 
-	if err := authenticateIfNeeded(context.Background(), state); err != nil {
+	if err := authenticateIfNeeded(context.Background(), state, discardTestLogger()); err != nil {
 		t.Fatalf("authenticateIfNeeded() error = %v, want nil on successful login", err)
 	}
 }
@@ -259,7 +255,7 @@ func TestAuthenticateIfNeeded_LoginResponseError(t *testing.T) {
 		`{"id":2,"error":{"code":-32001,"message":"invalid API key"}}`,
 	)
 
-	err := authenticateIfNeeded(context.Background(), state)
+	err := authenticateIfNeeded(context.Background(), state, discardTestLogger())
 	if err == nil {
 		t.Fatal("authenticateIfNeeded() expected error for login failure")
 	}
@@ -275,7 +271,7 @@ func TestAuthenticateIfNeeded_LoginCompletedFailed(t *testing.T) {
 		`{"method":"account/login/completed","params":{"success":false}}`,
 	)
 
-	err := authenticateIfNeeded(context.Background(), state)
+	err := authenticateIfNeeded(context.Background(), state, discardTestLogger())
 	if err == nil {
 		t.Fatal("authenticateIfNeeded() expected error for failed login completion")
 	}
@@ -296,7 +292,7 @@ func TestStartThread_Success(t *testing.T) {
 		`{"method":"thread/started","params":{"threadId":"thread-abc"}}`,
 	)
 
-	threadID, _, err := startThread(context.Background(), state, passthroughConfig{})
+	threadID, _, err := startThread(context.Background(), state, passthroughConfig{}, discardTestLogger())
 	if err != nil {
 		t.Fatalf("startThread() error = %v", err)
 	}
@@ -317,7 +313,7 @@ func TestStartThread_DefaultApprovalPolicyIsNever(t *testing.T) {
 		`{"method":"thread/started","params":{"threadId":"thread-abc"}}`,
 	)
 
-	if _, _, err := startThread(context.Background(), state, passthroughConfig{}); err != nil {
+	if _, _, err := startThread(context.Background(), state, passthroughConfig{}, discardTestLogger()); err != nil {
 		t.Fatalf("startThread() error = %v", err)
 	}
 
@@ -354,7 +350,7 @@ func TestStartThread_WithModelAndPersonality(t *testing.T) {
 		ThreadSandbox:  "workspaceWrite",
 	}
 
-	threadID, _, err := startThread(context.Background(), state, pt)
+	threadID, _, err := startThread(context.Background(), state, pt, discardTestLogger())
 	if err != nil {
 		t.Fatalf("startThread() error = %v", err)
 	}
@@ -368,7 +364,7 @@ func TestStartThread_ErrorResponse(t *testing.T) {
 
 	state := handshakeState(t, `{"id":1,"error":{"code":-32000,"message":"workspace not found"}}`)
 
-	_, _, err := startThread(context.Background(), state, passthroughConfig{})
+	_, _, err := startThread(context.Background(), state, passthroughConfig{}, discardTestLogger())
 	if err == nil {
 		t.Fatal("startThread() expected error for error response")
 	}
@@ -380,7 +376,7 @@ func TestStartThread_EmptyThreadID(t *testing.T) {
 	// Response with empty thread ID.
 	state := handshakeState(t, `{"id":1,"result":{"thread":{"id":""}}}`)
 
-	_, _, err := startThread(context.Background(), state, passthroughConfig{})
+	_, _, err := startThread(context.Background(), state, passthroughConfig{}, discardTestLogger())
 	if err == nil {
 		t.Fatal("startThread() expected error for empty thread ID")
 	}
@@ -404,7 +400,7 @@ func TestStartThread_FixtureThreadStartResponse(t *testing.T) {
 	lines[0] = strings.Replace(lines[0], `"id":4,`, `"id":1,`, 1)
 	state := handshakeState(t, lines...)
 
-	_, model, err := startThread(context.Background(), state, passthroughConfig{})
+	_, model, err := startThread(context.Background(), state, passthroughConfig{}, discardTestLogger())
 	if err != nil {
 		t.Fatalf("startThread() error = %v", err)
 	}
@@ -424,7 +420,7 @@ func TestStartThread_NoModelMember(t *testing.T) {
 		`{"method":"thread/started","params":{"threadId":"thread-abc"}}`,
 	)
 
-	_, model, err := startThread(context.Background(), state, passthroughConfig{})
+	_, model, err := startThread(context.Background(), state, passthroughConfig{}, discardTestLogger())
 	if err != nil {
 		t.Fatalf("startThread() error = %v", err)
 	}
@@ -494,7 +490,7 @@ func TestAuthenticateIfNeeded_ContextCancelledDuringLoginWait(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- authenticateIfNeeded(ctx, state)
+		done <- authenticateIfNeeded(ctx, state, discardTestLogger())
 	}()
 
 	cancel()
@@ -521,7 +517,7 @@ func TestStartThread_ContextCancelledDuringNotificationWait(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_, _, err := startThread(ctx, state, passthroughConfig{})
+	_, _, err := startThread(ctx, state, passthroughConfig{}, discardTestLogger())
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("startThread() = %v, want context.Canceled", err)
 	}

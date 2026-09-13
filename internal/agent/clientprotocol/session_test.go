@@ -11,6 +11,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest/dispositiontest"
+	"github.com/sortie-ai/sortie/internal/agent/jsonrpc"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
@@ -114,38 +115,28 @@ func TestRunTurnFinalize(t *testing.T) {
 	})
 }
 
+// TestRunTurnPreTurnWaits covers the missing-pump-verdict wait: with no
+// pump running, runTurn's publish always succeeds (the inbox never
+// waits), so runTurn returns only through its verdict wait, either on
+// its own bound or on context cancellation, leaving the startTurn
+// control it published still queued.
 func TestRunTurnPreTurnWaits(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name       string
-		fillQueue  bool
-		cancel     bool
-		wantErr    error
-		wantKind   domain.AgentErrorKind
-		wantQueued bool
+		name     string
+		cancel   bool
+		wantErr  error
+		wantKind domain.AgentErrorKind
 	}{
 		{
-			name:      "blocked publication times out",
-			fillQueue: true,
-			wantKind:  domain.ErrResponseTimeout,
+			name:     "missing pump verdict times out",
+			wantKind: domain.ErrResponseTimeout,
 		},
 		{
-			name:      "blocked publication observes context cancellation",
-			fillQueue: true,
-			cancel:    true,
-			wantErr:   context.Canceled,
-		},
-		{
-			name:       "missing pump verdict times out",
-			wantKind:   domain.ErrResponseTimeout,
-			wantQueued: true,
-		},
-		{
-			name:       "missing pump verdict observes context cancellation",
-			cancel:     true,
-			wantErr:    context.Canceled,
-			wantQueued: true,
+			name:    "missing pump verdict observes context cancellation",
+			cancel:  true,
+			wantErr: context.Canceled,
 		},
 	}
 
@@ -155,11 +146,8 @@ func TestRunTurnPreTurnWaits(t *testing.T) {
 
 			state := &sessionState{
 				agentConfig: domain.AgentConfig{ReadTimeoutMS: 50},
-				itemCh:      make(chan pumpItem, 1),
+				inbox:       jsonrpc.NewInbox[pumpItem](),
 				caps:        newCapabilityRecord(false),
-			}
-			if tt.fillQueue {
-				state.itemCh <- pumpItem{}
 			}
 			ctx, cancel := context.WithCancel(context.Background())
 			t.Cleanup(cancel)
@@ -169,16 +157,6 @@ func TestRunTurnPreTurnWaits(t *testing.T) {
 				OnEvent: func(domain.AgentEvent) {},
 			})
 			if tt.cancel {
-				if tt.wantQueued {
-					// Wait for the publication instead of hoping a fixed
-					// window covers it: drain the item runTurn published
-					// and restore it, so the cancellation below lands on
-					// the verdict wait rather than racing the send. The
-					// assertion further down drains it again.
-					state.itemCh <- <-state.itemCh
-				}
-				// With the queue full the send can never complete, so the
-				// cancellation is observed whenever it arrives.
 				cancel()
 			}
 
@@ -197,15 +175,15 @@ func TestRunTurnPreTurnWaits(t *testing.T) {
 					t.Errorf("runTurn() AgentError.Kind = %q, want %q", agentErr.Kind, tt.wantKind)
 				}
 			}
-			if tt.wantQueued {
-				select {
-				case item := <-state.itemCh:
-					if item.control == nil || item.control.startTurn == nil {
-						t.Fatalf("runTurn() queued item = %+v, want startTurn control", item)
-					}
-				case <-time.After(awaitTimeout):
-					t.Fatal("runTurn() queued no startTurn control, want publication before verdict wait")
+
+			select {
+			case <-state.inbox.Ready():
+				item, ok := state.inbox.Take()
+				if !ok || item.control == nil || item.control.startTurn == nil {
+					t.Fatalf("runTurn() queued item = %+v, ok=%v, want a startTurn control", item, ok)
 				}
+			case <-time.After(awaitTimeout):
+				t.Fatal("runTurn() queued no startTurn control, want it put before the verdict wait")
 			}
 		})
 	}
@@ -216,7 +194,7 @@ func TestDelayedTurnVerdictCannotBlockPump(t *testing.T) {
 
 	state := &sessionState{
 		agentConfig: domain.AgentConfig{ReadTimeoutMS: 20},
-		itemCh:      make(chan pumpItem, 1),
+		inbox:       jsonrpc.NewInbox[pumpItem](),
 		logger:      discardLogger(),
 		caps:        newCapabilityRecord(false),
 	}
@@ -229,7 +207,11 @@ func TestDelayedTurnVerdictCannotBlockPump(t *testing.T) {
 	if !errors.As(outcome.err, &agentErr) || agentErr.Kind != domain.ErrResponseTimeout {
 		t.Fatalf("runTurn() error = %v, want *domain.AgentError kind %q", outcome.err, domain.ErrResponseTimeout)
 	}
-	item := <-state.itemCh
+	<-state.inbox.Ready()
+	item, ok := state.inbox.Take()
+	if !ok {
+		t.Fatal("Take() ok = false, want the queued startTurn control")
+	}
 	pump := &pumpState{
 		state: state,
 		activeTurn: &activeTurn{
@@ -260,7 +242,7 @@ func TestAbandonedTurnIsNotStarted(t *testing.T) {
 
 	state := &sessionState{
 		agentConfig: domain.AgentConfig{ReadTimeoutMS: 20},
-		itemCh:      make(chan pumpItem, 1),
+		inbox:       jsonrpc.NewInbox[pumpItem](),
 		logger:      discardLogger(),
 		caps:        newCapabilityRecord(false),
 	}
@@ -274,7 +256,11 @@ func TestAbandonedTurnIsNotStarted(t *testing.T) {
 		t.Fatalf("runTurn() error = %v, want *domain.AgentError kind %q", outcome.err, domain.ErrResponseTimeout)
 	}
 
-	item := <-state.itemCh
+	<-state.inbox.Ready()
+	item, ok := state.inbox.Take()
+	if !ok {
+		t.Fatal("Take() ok = false, want the queued startTurn control")
+	}
 	// state.conn is nil here, so a pump that starts the turn anyway
 	// reaches the prompt send and panics rather than failing quietly.
 	pump := &pumpState{state: state}

@@ -25,17 +25,12 @@ const (
 	malformedLineMessage             = "received a line that could not be parsed as JSON-RPC"
 	unrecognizedSessionUpdateMessage = "received a session update of an unrecognized kind"
 	unimplementedMethodMessage       = "the agent called a method this client does not implement"
-	jsonrpcMethodNotFoundMessage     = "method not found"
 	elicitationDetail                = "an answer to a question"
 	turnAlreadyInFlightMessage       = "a turn is already in flight for this session"
 	sessionEndedBeforeTurnMessage    = "the agent connection ended before this turn could start"
 	toolDeliveryUncallableNotice     = "this session delivered tool servers and the agent runtime asked for consent before running a tool; an unattended run grants no consent, so any delivered tool the runtime gates the same way cannot be called unless that runtime's own configuration allows it"
 	toolDeliveryUncallableLog        = "a tool call was gated by consent in a session that delivered tool servers"
 )
-
-// jsonrpcMethodNotFound is the JSON-RPC error code for a method the
-// client does not implement.
-const jsonrpcMethodNotFound = -32601
 
 // turnEndKind names why an active turn is winding down toward a forced
 // disposition rather than the one its eventual response would
@@ -156,6 +151,8 @@ func runPump(state *sessionState) {
 
 	doneCh := state.conn.Done()
 	doneFired := false
+	writeFailedCh := state.conn.WriteFailed()
+	var writeFailDeadlineC <-chan time.Time
 
 	for {
 		var cancelSig <-chan struct{}
@@ -169,11 +166,20 @@ func runPump(state *sessionState) {
 
 		if !doneFired {
 			select {
-			case item := <-state.itemCh:
-				p.handleItem(item)
+			case <-state.inbox.Ready():
+				if item, ok := state.inbox.Take(); ok {
+					p.handleItem(item)
+				}
 			case <-doneCh:
 				doneFired = true
+				writeFailDeadlineC = nil
 				p.handleStreamEnd()
+			case <-writeFailedCh:
+				writeFailedCh = nil
+				writeFailDeadlineC = p.armWriteFailedDeadline()
+			case <-writeFailDeadlineC:
+				writeFailDeadlineC = nil
+				p.handleWriteFailed()
 			case <-cancelSig:
 				p.beginEndAttempt(turnEndCancelled, "")
 			case <-deadlineC:
@@ -189,8 +195,10 @@ func runPump(state *sessionState) {
 		// until teardown closes the stop channel, which is the second
 		// condition the pump's own exit requires.
 		select {
-		case item := <-state.itemCh:
-			p.handleItem(item)
+		case <-state.inbox.Ready():
+			if item, ok := state.inbox.Take(); ok {
+				p.handleItem(item)
+			}
 		case <-cancelSig:
 			p.beginEndAttempt(turnEndCancelled, "")
 		case <-deadlineC:
@@ -259,8 +267,9 @@ func (p *pumpState) handleControl(ctrl pumpControl) {
 	case ctrl.startTurn != nil:
 		p.handleStartTurn(ctrl.startTurn)
 
-	case ctrl.answerOpen:
+	case ctrl.answerOpen != nil:
 		p.handleAnswerOpen()
+		close(ctrl.answerOpen)
 	}
 }
 
@@ -374,28 +383,26 @@ func (p *pumpState) lowerCapability(entry *capabilityState, label string) {
 	}
 }
 
-// drainReadyItems processes every item already in the pump's input
-// channel, without blocking.
+// drainReadyItems takes every item already queued in the pump's inbox,
+// until Take reports none left.
 func (p *pumpState) drainReadyItems() {
 	for {
-		select {
-		case item := <-p.state.itemCh:
-			p.handleItem(item)
-		default:
+		item, ok := p.state.inbox.Take()
+		if !ok {
 			return
 		}
+		p.handleItem(item)
 	}
 }
 
 // handleStreamEnd runs when jsonrpc.Conn.Done() closes. It first drains
-// every item already in the pump's input channel, because the shared
-// package's reader goroutine completes the handler's send into that
-// channel before it closes Done(), so a KindStreamEnd message the
-// connection produced is already there for the drain to find. Only when
-// the drain leaves a turn still in flight does this method finalize it
-// itself, on the process-exit row: a turn the drain already finalized,
-// through the ordinary KindStreamEnd message handling below, is not
-// touched again.
+// every item already queued in the pump's inbox, because the reader
+// completes its delivery into the inbox before it closes Done(), so a
+// KindStreamEnd message the connection produced is already there for
+// the drain to find. Only when the drain leaves a turn still in flight
+// does this method finalize it itself, on the process-exit row: a turn
+// the drain already finalized, through the ordinary KindStreamEnd
+// message handling below, is not touched again.
 func (p *pumpState) handleStreamEnd() {
 	p.drainReadyItems()
 	p.streamEnded = true
@@ -406,6 +413,36 @@ func (p *pumpState) handleStreamEnd() {
 		Terminal:          agentcore.TerminalFailure,
 		TerminalErrorKind: domain.ErrPortExit,
 		TerminalMessage:   streamEndedMessage,
+	})
+}
+
+// armWriteFailedDeadline arms the bounded wait a write failure starts
+// for the active turn, or returns nil when no turn is active: a write
+// failure with nothing in flight has nothing to end early. The reader
+// stays free to end the turn through the stream-end path in the
+// meantime; only a turn still active once this deadline elapses falls
+// to handleWriteFailed.
+func (p *pumpState) armWriteFailedDeadline() <-chan time.Time {
+	if p.activeTurn == nil {
+		return nil
+	}
+	return time.After(readTimeout(p.state))
+}
+
+// handleWriteFailed ends the active turn with the send-failure outcome.
+// It runs only once a write failure's own bounded wait has elapsed with
+// the turn still active and the reader still running: a reader that
+// ends inside that wait reports the turn through handleStreamEnd or
+// handleStreamEndMessage instead, both of which clear the active turn
+// before this can run, making this a no-op in that case.
+func (p *pumpState) handleWriteFailed() {
+	if p.activeTurn == nil {
+		return
+	}
+	p.finalizeTurn(agentcore.TurnEvidence{
+		Terminal:          agentcore.TerminalFailure,
+		TerminalErrorKind: domain.ErrPortExit,
+		TerminalMessage:   promptSendFailedMessage,
 	})
 }
 
@@ -667,7 +704,7 @@ func (p *pumpState) emitCapabilityGapNoticeOnce(turn *activeTurn) {
 // exactly once. When the turn is winding down toward a cancelled or
 // human-input-required outcome, that outcome overrides whatever
 // evidence the caller passed, per the shared rule's first row and the
-// end-attempt sequence's own step 4.
+// end-attempt sequence's own final step.
 func (p *pumpState) finalizeTurn(ev agentcore.TurnEvidence) {
 	turn := p.activeTurn
 	if turn == nil {
@@ -793,7 +830,7 @@ func (p *pumpState) answerMethodNotFound(msg *jsonrpc.Message) {
 	p.openRequests[msg.ID] = msg.Method
 	defer delete(p.openRequests, msg.ID)
 
-	if err := p.state.conn.RespondError(msg.ID, jsonrpcMethodNotFound, jsonrpcMethodNotFoundMessage); err != nil {
+	if err := p.state.conn.RespondError(msg.ID, jsonrpc.MethodNotFoundCode, jsonrpc.MethodNotFoundMessage); err != nil {
 		p.state.logger.Debug("failed to write method-not-found reply", slog.Any("error", err))
 	}
 
@@ -856,7 +893,7 @@ func (p *pumpState) handleAnswerOpen() {
 	for id, method := range p.openRequests {
 		if method == methodSessionRequestPermission {
 			p.respondCancelled(id)
-		} else if err := p.state.conn.RespondError(id, jsonrpcMethodNotFound, jsonrpcMethodNotFoundMessage); err != nil {
+		} else if err := p.state.conn.RespondError(id, jsonrpc.MethodNotFoundCode, jsonrpc.MethodNotFoundMessage); err != nil {
 			p.state.logger.Debug("failed to write method-not-found reply", slog.Any("error", err))
 		}
 		delete(p.openRequests, id)

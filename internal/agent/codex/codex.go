@@ -81,15 +81,8 @@ type sessionState struct {
 
 	// conn is the JSON-RPC connection to the app-server. It owns
 	// request-id allocation, the write path, and the reader goroutine
-	// that classifies and routes every message.
+	// that classifies and delivers every message into inbox.
 	conn *jsonrpc.Conn
-
-	// turnPhase reports whether the session has moved past the
-	// handshake. It is read only by the reader goroutine, inside the
-	// handler bound to this state, and written once by
-	// beginTurnPhase, so it is an atomic.Bool rather than
-	// mutex-guarded.
-	turnPhase atomic.Bool
 
 	// outputAbandoned reports that the release path gave up on the
 	// connection's reader: the runtime had been reaped and the reader
@@ -113,11 +106,11 @@ type sessionState struct {
 	reportMu sync.Mutex
 
 	// stopping reports that StopSession has begun tearing the session
-	// down. The stop closes the connection, which ends the message
-	// channel and sends an in-flight turn down the same path a runtime
-	// that died takes, so without this the operator would be warned
-	// about a runtime they stopped themselves. Set before anything is
-	// closed, read by reportStderr.
+	// down. The stop closes the connection, which closes the inbox and
+	// sends an in-flight turn down the same path a runtime that died
+	// takes, so without this the operator would be warned about a
+	// runtime they stopped themselves. Set before anything is closed,
+	// read by reportStderr.
 	stopping atomic.Bool
 
 	// acc holds the session's run-cumulative token usage. Constructed
@@ -142,7 +135,7 @@ type sessionState struct {
 	// concurrent access from StopSession, the process-exit watcher, and
 	// the stderr reporting the handshake and turn failure paths reach
 	// through reportStderr. It guards no write to the peer; conn owns
-	// its own write mutex.
+	// its own outgoing queue and writer goroutine.
 	mu              sync.Mutex
 	proc            *os.Process
 	waitCh          <-chan struct{}
@@ -156,36 +149,22 @@ type sessionState struct {
 	// resolving a non-positive value to procutil.DefaultDrainGrace.
 	drainGrace time.Duration
 
-	// Session-scoped delivery channel. The handler bound to this
-	// state, invoked on conn's reader goroutine, delivers every
-	// routed message to msgCh, which the handshake wait loops and
-	// RunTurn read. stopCh is closed by StopSession to unblock the
-	// handler if msgCh is full during the turn phase. readerDone is
-	// closed by the termination watcher once conn's reader has
-	// exited and msgCh has been closed. closeStop guards against
-	// double-closing stopCh when StopSession is called more than
-	// once.
-	msgCh      chan jsonrpc.Message
+	// inbox is where conn's reader delivers every routed message. The
+	// handshake wait loops, then RunTurn, are its only takers.
+	// readerDone is closed by the termination watcher once conn's
+	// reader has exited and inbox has been closed.
+	inbox      *jsonrpc.Inbox[jsonrpc.Message]
 	readerDone chan struct{}
-	stopCh     chan struct{}
-	closeStop  sync.Once
 }
 
-// closeConnAndStop closes stopCh and conn together, inside the
-// sync.Once that guards stopCh, so a session torn down from more than
-// one failure path neither double-closes a channel nor races between
-// the two teardown paths. It tolerates state.conn and state.stopCh
-// being nil, which a session that never reached construction leaves
-// unset.
-func (state *sessionState) closeConnAndStop() {
-	state.closeStop.Do(func() {
-		if state.stopCh != nil {
-			close(state.stopCh)
-		}
-		if state.conn != nil {
-			state.conn.Close()
-		}
-	})
+// closeConn closes state.conn when it is non-nil, tolerating a
+// session that never reached construction. jsonrpc.Conn.Close is
+// idempotent, so callers do not need to guard against calling this
+// more than once.
+func (state *sessionState) closeConn() {
+	if state.conn != nil {
+		state.conn.Close()
+	}
 }
 
 // reportStderr re-emits what the runtime wrote to standard error at
@@ -263,44 +242,26 @@ func (state *sessionState) readerEnded() bool {
 	}
 }
 
-// sessionHandler returns the [jsonrpc.Handler] bound to state. Before
-// the turn phase begins, it performs a non-blocking send and drops
-// the message on a full msgCh, since nothing drains msgCh while a
-// handshake wait loop is itself the one reading it directly. Once
-// beginTurnPhase runs, it becomes the same two-arm blocking send
-// RunTurn's caller depends on for back-pressure and shutdown.
-func sessionHandler(state *sessionState) jsonrpc.Handler {
-	return func(msg jsonrpc.Message) {
-		if !state.turnPhase.Load() {
-			select {
-			case state.msgCh <- msg:
-			default:
-			}
-			return
-		}
-		select {
-		case state.msgCh <- msg:
-		case <-state.stopCh:
-		}
-	}
-}
-
-// watchTermination closes state.msgCh once state.conn's reader
+// watchTermination closes state.inbox once state.conn's reader
 // goroutine has exited, then closes state.readerDone. It is the
 // adapter's own signal, distinct from conn itself, to the handshake
 // wait loops and to RunTurn that no further message will arrive.
 func watchTermination(state *sessionState) {
 	<-state.conn.Done()
-	close(state.msgCh)
+	state.inbox.Close()
 	close(state.readerDone)
 }
+
+// identity returns msg unchanged. It is the wrap state.conn delivers
+// through, since this adapter carries jsonrpc.Message values through
+// the inbox with no adaptation.
+func identity(msg jsonrpc.Message) jsonrpc.Message { return msg }
 
 // outputAbandonedMessage is a turn's terminal message when the release
 // path gave up on the connection's reader, and nothing else: the WARN
 // record it accompanies keeps its own text. It states what the adapter
-// observed rather than why, because the give-up arm cannot tell a
-// reader parked in a read from one parked in the handler apart, and it
-// names no channel, field, method, or file.
+// observed rather than why, and it names no channel, field, method, or
+// file.
 const outputAbandonedMessage = "the agent runtime exited before the session finished collecting its output"
 
 // turnEndMessage returns outputAbandonedMessage when the release path
@@ -315,17 +276,15 @@ func turnEndMessage(state *sessionState, fallback string) string {
 // release starts a goroutine that waits for the subprocess to be
 // reaped, then gives the connection's own reader up to grace to end on
 // its own before giving up on it. Without it, a runtime that dies with
-// its output handle still open, or with the session's message channel
-// full, leaves every handshake call and turn waiting on a reader that
-// cannot end. Every value it touches is captured at construction
-// rather than read from session state, so a failure path that clears
-// state.pipes under state.mu cannot race it.
+// its output handle still open leaves every handshake call and turn
+// waiting on a reader that cannot end. Every value it touches is
+// captured at construction rather than read from session state, so a
+// failure path that clears state.pipes under state.mu cannot race it.
 //
-// The give-up arm frees both ways a reader can be stuck: closing the
-// standard-output read end releases one parked in a read, and closing
-// the stop channel releases one parked inside the handler on a full
-// message channel. It does not reach a runtime that is still alive:
-// that reader is freed only once the reaper fires.
+// The give-up arm frees a reader parked in a read: closing the
+// standard-output read end releases it. It does not reach a runtime
+// that is still alive: that reader is freed only once the reaper
+// fires.
 //
 // release also anchors the session's one standard-error bound: once
 // the subprocess is reaped, a second goroutine runs
@@ -353,29 +312,93 @@ func release(state *sessionState, pipes *procutil.OwnedPipes, collector *procuti
 		case <-timer.C:
 			state.outputAbandoned.Store(true)
 			pipes.CloseStdout() //nolint:errcheck,gosec // best-effort; releases a reader parked on a dead runtime's descendant
-			state.closeConnAndStop()
+			state.closeConn()
 			logger.Warn("agent stdout was not fully collected before the session ended",
 				slog.Duration("drain_bound", grace))
 		}
 	}()
 }
 
-// beginTurnPhase discards whatever the handshake-phase handler
-// buffered into msgCh and moves the session into the turn phase, so
-// the first turn starts with nothing already queued, exactly as it
-// does before the handshake completes today.
-func beginTurnPhase(state *sessionState) {
+// drainHandshakeMessages processes every message the handshake left
+// queued in state.inbox, the same way handleOutOfTurnMessage processes
+// one a wait loop observes while waiting for something else, so the
+// first turn starts with nothing already queued and nothing observed
+// before it is silently lost. state.threadID is already set by the
+// time this runs, so it reports through the same session-scoped logger
+// RunTurn uses.
+func drainHandshakeMessages(state *sessionState, logger *slog.Logger) {
+	sessionLogger := logging.WithSession(logger, state.threadID)
 	for {
-		select {
-		case _, ok := <-state.msgCh:
-			if !ok {
-				state.turnPhase.Store(true)
-				return
-			}
-		default:
-			state.turnPhase.Store(true)
+		msg, ok := state.inbox.Take()
+		if !ok {
 			return
 		}
+		handleOutOfTurnMessage(state, msg, sessionLogger)
+	}
+}
+
+// handleOutOfTurnMessage answers or reports one message that arrived
+// outside a turn: while a handshake wait loop is waiting for something
+// else, or queued in the interval between the handshake finishing and
+// the first turn starting. A server-initiated request this adapter
+// recognizes by method is answered the same way the turn loop answers
+// it; any other request gets method-not-found, so a request still gets
+// exactly one reply regardless of when it arrives. An
+// mcpServer/startupStatus/updated failure is reported, through logger,
+// the same way the turn loop reports it. Every other notification is
+// consumed without report: none of the session-level notifications
+// observed before a turn exists names anything actionable, and nothing
+// handled here is replayed into the first turn as one of its events.
+func handleOutOfTurnMessage(state *sessionState, msg jsonrpc.Message, logger *slog.Logger) {
+	switch msg.Kind {
+	case jsonrpc.KindRequest:
+		// A null id is present on the wire but names no request to
+		// answer; the app-server sends none, and the matching guard in
+		// RunTurn treats it the same way.
+		if !msg.ID.Present() || msg.ID.IsNull() {
+			return
+		}
+		if msg.Method == "mcpServer/elicitation/request" {
+			answerElicitationRequest(state, msg.ID)
+			return
+		}
+		answerUnrecognizedRequest(state, msg.ID)
+
+	case jsonrpc.KindNotification:
+		if msg.Method == "mcpServer/startupStatus/updated" {
+			reportMCPStartupFailure(msg, logger)
+		}
+	}
+}
+
+// answerElicitationRequest answers a mcpServer/elicitation/request the
+// same way regardless of when it arrives: declined, since sortie runs
+// unattended and no person is present to supply the requested input.
+func answerElicitationRequest(state *sessionState, requestID jsonrpc.ID) {
+	state.conn.Respond(requestID, map[string]any{"action": "decline"}) //nolint:errcheck,gosec // best-effort refusal
+}
+
+// answerUnrecognizedRequest answers a server-initiated request this
+// adapter does not implement, in whichever phase it arrives, with the
+// shared method-not-found reply.
+func answerUnrecognizedRequest(state *sessionState, requestID jsonrpc.ID) {
+	state.conn.RespondError(requestID, jsonrpc.MethodNotFoundCode, jsonrpc.MethodNotFoundMessage) //nolint:errcheck,gosec // best-effort
+}
+
+// reportMCPStartupFailure logs, at Warn, an
+// mcpServer/startupStatus/updated notification reporting a server that
+// failed to start, in whichever phase it arrives.
+func reportMCPStartupFailure(msg jsonrpc.Message, logger *slog.Logger) {
+	var su mcpServerStartupStatus
+	if err := json.Unmarshal(msg.Params, &su); err != nil {
+		logger.Debug("mcpServer/startupStatus/updated unmarshal failed", slog.Any("error", err))
+		return
+	}
+	if su.Status == "failed" {
+		reason := cmp.Or(su.FailureReason, su.Error)
+		logger.Warn("MCP server failed to start",
+			slog.String("mcp_server", su.Name),
+			slog.String("reason", reason))
 	}
 }
 
@@ -509,9 +532,7 @@ func (a *CodexAdapter) StartSession(ctx context.Context, params domain.StartSess
 	// killOnError is a cleanup closure used if any handshake step fails.
 	killOnError := func() {
 		state.mu.Lock()
-		if state.stdin != nil {
-			state.stdin.Close() //nolint:errcheck,gosec // best-effort cleanup
-		}
+		procutil.CloseWithoutWaiting(state.stdin)
 		if state.pipes != nil {
 			state.pipes.CloseStdout() //nolint:errcheck,gosec // unblock the reader goroutine on the read end
 		}
@@ -538,16 +559,15 @@ func (a *CodexAdapter) StartSession(ctx context.Context, params domain.StartSess
 		state.mu.Unlock()
 	}
 
-	// Create stopCh, msgCh, and readerDone before the connection, so
-	// the handler (bound to state below) has every resource it
+	// Create the inbox and readerDone before the connection, so the
+	// sink delivering into state.inbox below has every resource it
 	// touches ready before the reader goroutine can call it.
-	state.stopCh = make(chan struct{})
-	state.msgCh = make(chan jsonrpc.Message, 16)
+	state.inbox = jsonrpc.NewInbox[jsonrpc.Message]()
 	state.readerDone = make(chan struct{})
 
-	state.conn = jsonrpc.NewConn(stdinPipe, pipes.Stdout, sessionHandler(state))
+	state.conn = jsonrpc.NewConn(stdinPipe, pipes.Stdout, jsonrpc.Deliver(state.inbox, identity))
 	// Started before the handshake so the handshake wait loops observe
-	// a closed msgCh, rather than timing out, when stdout ends mid-handshake.
+	// a closed inbox, rather than timing out, when stdout ends mid-handshake.
 	go watchTermination(state)
 	// release ends a handshake call or a turn that would otherwise wait
 	// forever on a reaped runtime whose reader did not end inside the
@@ -557,7 +577,7 @@ func (a *CodexAdapter) StartSession(ctx context.Context, params domain.StartSess
 	release(state, pipes, state.stderrCollector, state.drainGrace, state.conn.Done(), reaper.Done(), logger)
 
 	if err := initializeHandshake(ctx, state); err != nil {
-		state.closeConnAndStop()
+		state.closeConn()
 		killOnError()
 		return domain.Session{}, &domain.AgentError{
 			Kind:    domain.ErrResponseError,
@@ -566,8 +586,8 @@ func (a *CodexAdapter) StartSession(ctx context.Context, params domain.StartSess
 		}
 	}
 
-	if err := authenticateIfNeeded(ctx, state); err != nil {
-		state.closeConnAndStop()
+	if err := authenticateIfNeeded(ctx, state, logger); err != nil {
+		state.closeConn()
 		killOnError()
 		var agentErr *domain.AgentError
 		if ok := isAgentError(err, &agentErr); ok {
@@ -588,9 +608,9 @@ func (a *CodexAdapter) StartSession(ctx context.Context, params domain.StartSess
 			logger.Warn("thread resume failed, starting new thread",
 				slog.String("resume_id", params.ResumeSessionID),
 				slog.Any("error", resumeErr))
-			tid, startedModel, startErr := startThread(ctx, state, a.passthrough)
+			tid, startedModel, startErr := startThread(ctx, state, a.passthrough, logger)
 			if startErr != nil {
-				state.closeConnAndStop()
+				state.closeConn()
 				killOnError()
 				return domain.Session{}, &domain.AgentError{
 					Kind:    domain.ErrResponseError,
@@ -605,9 +625,9 @@ func (a *CodexAdapter) StartSession(ctx context.Context, params domain.StartSess
 			model = resumedModel
 		}
 	} else {
-		tid, startedModel, startErr := startThread(ctx, state, a.passthrough)
+		tid, startedModel, startErr := startThread(ctx, state, a.passthrough, logger)
 		if startErr != nil {
-			state.closeConnAndStop()
+			state.closeConn()
 			killOnError()
 			return domain.Session{}, &domain.AgentError{
 				Kind:    domain.ErrResponseError,
@@ -621,7 +641,7 @@ func (a *CodexAdapter) StartSession(ctx context.Context, params domain.StartSess
 
 	state.threadID = threadID
 	state.model = model
-	beginTurnPhase(state)
+	drainHandshakeMessages(state, logger)
 
 	return domain.Session{
 		ID:       threadID,
@@ -769,9 +789,10 @@ func (a *CodexAdapter) RunTurn(ctx context.Context, session domain.Session, para
 			}
 			return result, nil
 
-		case msg, ok := <-state.msgCh:
+		case <-state.inbox.Ready():
+			msg, ok := state.inbox.Take()
 			if !ok {
-				// Channel closed, subprocess stdout ended.
+				// Inbox closed, subprocess stdout ended.
 				state.reportStderr(logger)
 				ev := agentcore.TurnEvidence{
 					Terminal:          agentcore.TerminalFailure,
@@ -1010,7 +1031,7 @@ func (a *CodexAdapter) RunTurn(ctx context.Context, session domain.Session, para
 
 				case "mcpServer/elicitation/request":
 					posture := agentcore.DecideHumanRequest(agentcore.ClassHumanInput, true, agentcore.AnswerPending)
-					state.conn.Respond(requestID, map[string]any{"action": "decline"}) //nolint:errcheck,gosec // best-effort refusal
+					answerElicitationRequest(state, requestID)
 					agentcore.EmitNotification(params.OnEvent, posture.NoticeWithDetail(detailAnswerToQuestion))
 
 					meta := agentcore.TurnMeta{
@@ -1058,17 +1079,7 @@ func (a *CodexAdapter) RunTurn(ctx context.Context, session domain.Session, para
 				logger.Debug("diff updated")
 
 			case "mcpServer/startupStatus/updated":
-				var su mcpServerStartupStatus
-				if err := json.Unmarshal(msg.Params, &su); err != nil {
-					logger.Debug("mcpServer/startupStatus/updated unmarshal failed", slog.Any("error", err))
-					continue
-				}
-				if su.Status == "failed" {
-					reason := cmp.Or(su.FailureReason, su.Error)
-					logger.Warn("MCP server failed to start",
-						slog.String("mcp_server", su.Name),
-						slog.String("reason", reason))
-				}
+				reportMCPStartupFailure(msg, logger)
 
 			case "model/rerouted":
 				p, parseErr := parseModelRerouted(msg.Params)
@@ -1083,6 +1094,9 @@ func (a *CodexAdapter) RunTurn(ctx context.Context, session domain.Session, para
 				agentcore.EmitNotification(params.OnEvent, reroutedMessage(p.ToModel))
 
 			default:
+				if msg.Kind == jsonrpc.KindRequest && msg.ID.Present() && !msg.ID.IsNull() {
+					answerUnrecognizedRequest(state, msg.ID)
+				}
 				params.OnEvent(domain.AgentEvent{
 					Type:      domain.EventOtherMessage,
 					Timestamp: now,
@@ -1132,23 +1146,21 @@ func (a *CodexAdapter) StopSession(ctx context.Context, session domain.Session) 
 		return fmt.Errorf("unexpected session internal type %T", session.Internal)
 	}
 
-	// Before anything is closed: closing the connection ends the message
-	// channel, and a turn still running reads that as its runtime having
+	// Before anything is closed: closing the connection closes the
+	// inbox, and a turn still running reads that as its runtime having
 	// died. A session the operator stopped has nothing to explain.
 	state.reportMu.Lock()
 	state.stopping.Store(true)
 	state.reportMu.Unlock()
 
-	// Signal the reader goroutine to stop and close the connection
-	// before closing stdin, preventing the handler from blocking on a
-	// full msgCh during teardown.
-	state.closeConnAndStop()
+	// Close the connection before closing stdin: this stops delivery and
+	// fails any call still in flight first.
+	state.closeConn()
 
-	// Close stdin to signal EOF to the app-server.
+	// Close stdin to signal EOF to the app-server. Closing it must not be
+	// able to hold up the signal, the wait, and the kill that follow.
 	state.mu.Lock()
-	if state.stdin != nil {
-		state.stdin.Close() //nolint:errcheck,gosec // best-effort cleanup
-	}
+	procutil.CloseWithoutWaiting(state.stdin)
 	waitCh := state.waitCh
 	pipes := state.pipes
 	pid := 0

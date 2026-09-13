@@ -1,9 +1,11 @@
 // Package jsonrpc implements newline-delimited JSON-RPC framing over a
 // byte stream. A [Conn] writes requests, notifications, and
 // responses, correlates a response to the call awaiting it by request
-// id, and routes every other message, including one that arrives
-// when no call is in flight, to a caller-supplied [Handler]. Start
-// from [NewConn].
+// id, and delivers every other message, including one that arrives
+// when no call is in flight, into a caller-supplied [Sink]. Every
+// outgoing line is queued and written by the connection's own writer
+// goroutine, so no send waits on the peer reading it. Start from
+// [NewConn].
 package jsonrpc
 
 import (
@@ -24,6 +26,14 @@ const MaxLineBytes = 1 << 20
 // scanner grows it toward the connection's bound.
 const initialLineBytes = 64 << 10
 
+// MethodNotFoundCode is the JSON-RPC 2.0 reserved error code for a
+// method the receiver does not implement or recognize.
+const MethodNotFoundCode = -32601
+
+// MethodNotFoundMessage is the message this package pairs with
+// [MethodNotFoundCode].
+const MethodNotFoundMessage = "method not found"
+
 // ErrClosed is returned, wrapped, by a write or a call issued after
 // [Conn.Close].
 var ErrClosed = errors.New("connection closed")
@@ -31,14 +41,24 @@ var ErrClosed = errors.New("connection closed")
 // Conn is one JSON-RPC session over a newline-delimited byte stream.
 // A Conn is safe for concurrent use.
 type Conn struct {
-	w io.Writer
-	r io.Reader
-	h Handler
+	w    io.Writer
+	r    io.Reader
+	sink Sink
 
 	versionMember bool
 	maxLineBytes  int
 
-	writeMu sync.Mutex
+	// outbox is the ordered, unbounded queue of encoded lines and flush
+	// markers the writer goroutine drains. Every write method appends
+	// to it and returns without waiting for the line to reach w.
+	outbox *Inbox[outboxItem]
+
+	// writeFailedCh closes once a write to w has failed. The failure is
+	// terminal for the connection: every call already pending fails,
+	// and every later Notify, Respond, RespondError, SendRequest, and
+	// Call fails at the enqueue check instead of attempting a write.
+	writeFailedCh chan struct{}
+	writeErr      error // set before writeFailedCh closes; read only after
 
 	// callMu guards nextID and pending together, so a request id is
 	// never allocated without its waiter being registered under the
@@ -52,6 +72,14 @@ type Conn struct {
 
 	done    chan struct{}
 	termErr error
+}
+
+// outboxItem is one entry in a [Conn]'s write queue: either an
+// already-encoded line to write, or a flush marker whose done channel
+// closes once every line queued ahead of it has been written.
+type outboxItem struct {
+	line []byte
+	done chan struct{}
 }
 
 // callResult is what a pending call receives: either the correlated
@@ -92,19 +120,21 @@ func WithMaxLineBytes(n int) Option {
 }
 
 // NewConn starts a connection that writes to w, reads newline-
-// delimited JSON-RPC messages from r, and hands every message that is
-// not a correlated response to h.
+// delimited JSON-RPC messages from r, and delivers every message that
+// is not a correlated response into sink.
 //
-// NewConn panics when h is nil. It starts one reader goroutine before
-// returning, and it does not close w or r; closing them is the
-// caller's responsibility, closing r is how the caller unblocks a
-// read parked on the stream, and closing w is how the caller unblocks
-// a write parked on it. With no options passed, behavior is
-// byte-identical to a connection with none of this package's options
-// applied.
-func NewConn(w io.Writer, r io.Reader, h Handler, opts ...Option) *Conn {
-	if h == nil {
-		panic("jsonrpc: handler must be non-nil")
+// NewConn panics when sink is nil. It starts a reader goroutine and a
+// writer goroutine before returning, and it does not close w or r:
+// closing them is the caller's responsibility. Closing r is how the
+// caller ends a read parked on the stream. Closing w is what finally
+// ends a write the writer goroutine is in the middle of; until then,
+// that write keeps the writer goroutine busy, but every other queued
+// line still waits its turn rather than being attempted out of order.
+// With no options passed, behavior is byte-identical to a connection
+// with none of this package's options applied.
+func NewConn(w io.Writer, r io.Reader, sink Sink, opts ...Option) *Conn {
+	if sink == nil {
+		panic("jsonrpc: sink must be non-nil")
 	}
 	cfg := connConfig{maxLineBytes: MaxLineBytes}
 	for _, opt := range opts {
@@ -119,14 +149,17 @@ func NewConn(w io.Writer, r io.Reader, h Handler, opts ...Option) *Conn {
 	c := &Conn{
 		w:             w,
 		r:             r,
-		h:             h,
+		sink:          sink,
 		versionMember: cfg.versionMember,
 		maxLineBytes:  cfg.maxLineBytes,
+		outbox:        NewInbox[outboxItem](),
+		writeFailedCh: make(chan struct{}),
 		pending:       make(map[int64]chan callResult),
 		closed:        make(chan struct{}),
 		done:          make(chan struct{}),
 	}
 	go c.readLoop()
+	go c.writeLoop()
 	return c
 }
 
@@ -139,26 +172,23 @@ type wireRequest struct {
 	Params  any    `json:"params,omitempty"`
 }
 
-// write serializes one already-encoded line against every other
-// write on the connection, and reports ErrClosed after Close without
-// touching w.
-//
-// A write already past the closed check is not stopped by Close. A
-// write still waiting for the write mutex is not released by Close
-// either, and it reports ErrClosed only once the write ahead of it
-// finishes.
-func (c *Conn) write(line []byte) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-
+// enqueue appends line to the outbox for the writer goroutine to send,
+// and reports ErrClosed after [Conn.Close] or the write-failure error
+// after a prior write has failed, in either case without touching the
+// outbox at all.
+func (c *Conn) enqueue(line []byte) error {
 	select {
 	case <-c.closed:
 		return ErrClosed
 	default:
 	}
-
-	_, err := c.w.Write(line)
-	return err
+	select {
+	case <-c.writeFailedCh:
+		return fmt.Errorf("write failed: %w", c.writeErr)
+	default:
+	}
+	c.outbox.Put(outboxItem{line: line})
+	return nil
 }
 
 func (c *Conn) marshalAndWriteRequest(method string, id int64, params any) error {
@@ -170,7 +200,7 @@ func (c *Conn) marshalAndWriteRequest(method string, id int64, params any) error
 	if err != nil {
 		return fmt.Errorf("marshal request %s: %w", method, err)
 	}
-	if err := c.write(append(data, '\n')); err != nil {
+	if err := c.enqueue(append(data, '\n')); err != nil {
 		return fmt.Errorf("write request %s: %w", method, err)
 	}
 	return nil
@@ -186,7 +216,7 @@ func (c *Conn) Notify(method string, params any) error {
 	if err != nil {
 		return fmt.Errorf("marshal notification %s: %w", method, err)
 	}
-	if err := c.write(append(data, '\n')); err != nil {
+	if err := c.enqueue(append(data, '\n')); err != nil {
 		return fmt.Errorf("write notification %s: %w", method, err)
 	}
 	return nil
@@ -214,7 +244,7 @@ func (c *Conn) Respond(id ID, result any) error {
 	if err != nil {
 		return fmt.Errorf("marshal response id=%s: %w", id, err)
 	}
-	if err := c.write(append(data, '\n')); err != nil {
+	if err := c.enqueue(append(data, '\n')); err != nil {
 		return fmt.Errorf("write response id=%s: %w", id, err)
 	}
 	return nil
@@ -242,7 +272,7 @@ func (c *Conn) RespondError(id ID, code int, message string) error {
 	if err != nil {
 		return fmt.Errorf("marshal error response id=%s: %w", id, err)
 	}
-	if err := c.write(append(data, '\n')); err != nil {
+	if err := c.enqueue(append(data, '\n')); err != nil {
 		return fmt.Errorf("write error response id=%s: %w", id, err)
 	}
 	return nil
@@ -300,9 +330,9 @@ func (c *Conn) removePending(id int64) {
 
 // SendRequest writes a request and returns its id without registering
 // a waiter. One caller uses it for a request whose response it
-// deliberately ignores; the response later reaches the handler as an
+// deliberately ignores; the response later reaches the sink as an
 // unmatched KindResponse message. A second caller uses it so the
-// response arrives through the [Handler] in wire order, behind the
+// response arrives through the sink in wire order, behind the
 // notifications that preceded it, rather than being delivered ahead
 // of them the way [Conn.Call] would deliver it; that caller compares
 // the returned id against a later [Message.ID] with [ID.Equal].
@@ -314,12 +344,13 @@ func (c *Conn) SendRequest(method string, params any) (ID, error) {
 	return NumberID(id), nil
 }
 
-// Call writes a request for method and waits for its response.
-//
-// Call writes before it checks ctx, so a request whose context is
-// already done is still sent. It returns (Response, nil) when the
-// response arrives, including when the response carries a JSON-RPC
-// error: an error response is an answer, not a transport failure.
+// Call writes a request for method and enqueues it without waiting for
+// it to reach the peer, then waits for its response, for ctx to end,
+// for [Conn.Close], for the reader to terminate, or for a write on
+// this connection to fail, whichever happens first. It returns
+// (Response, nil) when the response arrives, including when the
+// response carries a JSON-RPC error: an error response is an answer,
+// not a transport failure.
 func (c *Conn) Call(ctx context.Context, method string, params any) (Response, error) {
 	id := c.allocateID()
 	ch := c.addPending(id)
@@ -341,23 +372,60 @@ func (c *Conn) Call(ctx context.Context, method string, params any) (Response, e
 	case <-c.done:
 		c.removePending(id)
 		return Response{}, c.termErrorFor(id)
+	case <-c.writeFailedCh:
+		c.removePending(id)
+		return Response{}, &writeFailedCallError{id: id, err: c.writeErr}
+	}
+}
+
+// Flush waits until every line enqueued on this connection before this
+// call returns has been written to the underlying writer, or until ctx
+// ends, the connection closes, or a write fails, whichever happens
+// first. A caller building on this synchronization point can be sure
+// that once Flush returns nil, every reply it enqueued earlier has
+// already reached the peer.
+func (c *Conn) Flush(ctx context.Context) error {
+	select {
+	case <-c.closed:
+		return ErrClosed
+	default:
+	}
+	select {
+	case <-c.writeFailedCh:
+		return fmt.Errorf("flush: write failed: %w", c.writeErr)
+	default:
+	}
+
+	marker := make(chan struct{})
+	c.outbox.Put(outboxItem{done: marker})
+
+	select {
+	case <-marker:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.writeFailedCh:
+		return fmt.Errorf("flush: write failed: %w", c.writeErr)
+	case <-c.closed:
+		return ErrClosed
 	}
 }
 
 // Close stops the connection. It fails every call in flight with an
 // error wrapping ErrClosed and makes every later write return an
-// error wrapping ErrClosed. Close is idempotent and safe to call from
-// any goroutine, and it does not close the underlying writer or
-// reader.
+// error wrapping ErrClosed without attempting it. Close is idempotent
+// and safe to call from any goroutine, and it does not close the
+// underlying writer or reader.
 //
-// Close never waits for the peer. At most one write, one that has
-// already passed the closed check, may still reach the underlying
-// writer after Close returns, and Close neither waits for it nor
-// interrupts it. Such a write reports whatever the underlying writer
-// reports, which once the caller closes that writer is the writer's
-// own error rather than one wrapping ErrClosed.
+// Close never waits for the peer. Lines already enqueued before Close
+// runs are still written afterward, in order, by the writer goroutine;
+// Close neither waits for them nor interrupts them, and it does not
+// stop the writer goroutine from draining them.
 func (c *Conn) Close() {
-	c.closeOnce.Do(func() { close(c.closed) })
+	c.closeOnce.Do(func() {
+		close(c.closed)
+		c.outbox.Close()
+	})
 
 	for id, ch := range c.drainPending() {
 		ch <- callResult{err: &closedCallError{id: id}}
@@ -365,8 +433,18 @@ func (c *Conn) Close() {
 }
 
 // Done returns a channel closed once the reader goroutine has
-// exited. The handler is not invoked after Done closes.
+// exited. Nothing is delivered into the sink after Done closes.
 func (c *Conn) Done() <-chan struct{} { return c.done }
+
+// WriteFailed returns a channel that closes once a write on this
+// connection has failed. The failure is terminal for the connection:
+// it fails every call already pending, and every later Notify,
+// Respond, RespondError, SendRequest, and Call fails at the enqueue
+// check instead of attempting a write. A caller with something in
+// flight that does not itself wait for a response, such as a
+// fire-and-forget [Conn.Notify] or [Conn.SendRequest], can watch this
+// channel to learn that the send it issued may never reach the peer.
+func (c *Conn) WriteFailed() <-chan struct{} { return c.writeFailedCh }
 
 // Err reports the read side's terminal condition. It is nil after a
 // clean end of stream and after Close, and the read error otherwise.
@@ -403,6 +481,56 @@ func (e *unexpectedEOFCallError) Error() string {
 
 func (e *unexpectedEOFCallError) Unwrap() error { return io.EOF }
 
+// writeFailedCallError is returned by a call in flight when a write on
+// this connection fails before its response arrives.
+type writeFailedCallError struct {
+	id  int64
+	err error
+}
+
+func (e *writeFailedCallError) Error() string {
+	return fmt.Sprintf("write failed waiting for response id=%d: %v", e.id, e.err)
+}
+
+func (e *writeFailedCallError) Unwrap() error { return e.err }
+
+// writeLoop is the connection's sole writer. It takes each item the
+// outbox holds in order, writes its line to w or, for a flush marker,
+// closes its done channel, and exits once the outbox has been closed
+// and fully drained or once a write fails. No deadline bounds a write:
+// a peer that has stopped reading, not merely one that reads slowly,
+// is the only thing that ever parks this goroutine, and closing w is
+// what a caller uses to end that park.
+func (c *Conn) writeLoop() {
+	for {
+		<-c.outbox.Ready()
+		item, ok := c.outbox.Take()
+		if !ok {
+			return
+		}
+		if item.done != nil {
+			close(item.done)
+			continue
+		}
+		if _, err := c.w.Write(item.line); err != nil {
+			c.failWrite(err)
+			return
+		}
+	}
+}
+
+// failWrite records err as the connection's terminal write failure,
+// exactly once, and fails every pending call with it. Later calls to
+// enqueue observe writeFailedCh closed and fail without attempting a
+// write.
+func (c *Conn) failWrite(err error) {
+	c.writeErr = err
+	close(c.writeFailedCh)
+	for id, ch := range c.drainPending() {
+		ch <- callResult{err: &writeFailedCallError{id: id, err: err}}
+	}
+}
+
 // readLoop scans one line at a time, dispatches it per the routing
 // rule, and reports the terminal condition once the scan ends.
 func (c *Conn) readLoop() {
@@ -438,7 +566,7 @@ scanLoop:
 				}
 			}
 		}
-		c.h(msg)
+		c.sink.deliver(msg)
 	}
 
 	if !closedEarly {
@@ -447,7 +575,7 @@ scanLoop:
 			ch <- callResult{err: c.termErrorFor(id)}
 		}
 		if c.termErr != nil {
-			c.h(Message{Kind: KindStreamEnd, Err: c.termErr})
+			c.sink.deliver(Message{Kind: KindStreamEnd, Err: c.termErr})
 		}
 	}
 	close(c.done)

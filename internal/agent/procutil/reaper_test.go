@@ -3,6 +3,7 @@
 package procutil
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"os"
@@ -93,6 +94,74 @@ func TestReaper_DoneAndErr(t *testing.T) {
 			t.Fatal("Done() did not close after the subprocess was killed")
 		}
 	})
+}
+
+// TestReaper_OutputSurvivesAfterDoneCloses asserts that a child's
+// standard-output line, written before it exits, is still readable
+// once StartReaper's Done has closed: reaping the child does not close
+// the caller-owned read end out from under a reader that has not yet
+// consumed it.
+func TestReaper_OutputSurvivesAfterDoneCloses(t *testing.T) {
+	t.Parallel()
+
+	script := agenttest.WriteScript(t, t.TempDir(), "reaper-output", "printf 'hello from the child\\n'\n")
+	cmd := exec.Command(script) //nolint:gosec // fixed path under t.TempDir()
+	SetProcessGroup(cmd)
+
+	pipes, err := StartWithOwnedPipes(cmd)
+	if err != nil {
+		t.Fatalf("StartWithOwnedPipes() error = %v", err)
+	}
+	t.Cleanup(func() { pipes.Close() }) //nolint:errcheck // best-effort cleanup
+
+	r := StartReaper(cmd)
+	select {
+	case <-r.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("Done() did not close within 5s")
+	}
+
+	line, err := bufio.NewReader(pipes.Stdout).ReadString('\n')
+	if err != nil {
+		t.Fatalf("read standard output after Done closed: %v", err)
+	}
+	if want := "hello from the child\n"; line != want {
+		t.Errorf("standard output = %q, want %q", line, want)
+	}
+}
+
+// TestReaper_ClosingStdoutAtDoneLosesOutput is the negative control for
+// TestReaper_OutputSurvivesAfterDoneCloses: closing the read end at the
+// instant Done closes, the way an unowned pipe closes automatically at
+// that point, loses the line the positive case recovers. A green
+// result here would mean the positive case never actually raced the
+// reap, and the fixture, not production code, would be what to fix.
+func TestReaper_ClosingStdoutAtDoneLosesOutput(t *testing.T) {
+	t.Parallel()
+
+	script := agenttest.WriteScript(t, t.TempDir(), "reaper-output-lost", "printf 'hello from the child\\n'\n")
+	cmd := exec.Command(script) //nolint:gosec // fixed path under t.TempDir()
+	SetProcessGroup(cmd)
+
+	pipes, err := StartWithOwnedPipes(cmd)
+	if err != nil {
+		t.Fatalf("StartWithOwnedPipes() error = %v", err)
+	}
+	t.Cleanup(func() { pipes.Close() }) //nolint:errcheck // best-effort cleanup
+
+	r := StartReaper(cmd)
+	select {
+	case <-r.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("Done() did not close within 5s")
+	}
+	if err := pipes.CloseStdout(); err != nil {
+		t.Fatalf("CloseStdout() error = %v", err)
+	}
+
+	if line, err := bufio.NewReader(pipes.Stdout).ReadString('\n'); err == nil {
+		t.Fatalf("read standard output after closing it at the reap = %q, want an error (the negative control did not reproduce the loss)", line)
+	}
 }
 
 // isReaperTestZombie reports whether pid is a zombie by reading
