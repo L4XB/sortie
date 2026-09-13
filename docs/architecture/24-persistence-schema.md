@@ -2,10 +2,7 @@
 
 ### 19.1 Overview
 
-Sortie uses an embedded SQLite database for durable state. The database file path defaults to
-`.sortie.db` in the same directory as `WORKFLOW.md` and can be overridden with the `db_path`
-front matter field (see Section 5.3.7). On startup, Sortie opens or creates the database and
-runs all pending schema migrations before beginning normal operation.
+Sortie uses an embedded SQLite database for durable state. The database file path defaults to `.sortie.db` in the same directory as `WORKFLOW.md` and can be overridden with the `db_path` front matter field (see Section 5.3.7). On startup, Sortie opens or creates the database and runs all pending schema migrations before beginning normal operation.
 
 ### 19.2 Tables
 
@@ -51,68 +48,21 @@ Note: `timer_handle` is runtime-only and is not stored.
 | `cache_read_tokens` | INTEGER | Accumulated cache-read tokens, 0 for pre-migration rows (migration 011) |
 | `tokens_measured`   | INTEGER | `1` when the four token columns above carry a figure the coding agent's runtime reported; `0` when the run's spend is unknown and all four are zero (migration 012) |
 
-`status` is no longer a pure mapping from the worker's exit kind. A normal exit that reaches an
-otherwise-eligible handoff and is withheld by the handoff-evidence policy records `failed`, with its
-`error` value naming the evidence verdict as the cause, only when a verification read taken
-immediately before that recording does not find the issue in a terminal tracker state (§11.5,
-§14.2). When that read does find the issue terminal, the exit takes the terminal disposition
-instead and records `succeeded` with no error, exactly as an exit whose observation was terminal
-earlier already does. For an otherwise-normal exit on that handoff path, `succeeded` means the
-policy did not withhold it, or withheld it but the verification read then found the issue terminal.
-It does not assert that work was positively observed: an undeterminable verdict under `observed`,
-every normal exit under `off`, and a withheld verdict suppressed by that verification read may all
-still record `succeeded`.
+`status` is no longer a pure mapping from the worker's exit kind. A normal exit that reaches an otherwise-eligible handoff and is withheld by the handoff-evidence policy records `failed`, with its `error` value naming the evidence verdict as the cause, only when a verification read taken immediately before that recording does not find the issue in a terminal tracker state (§11.5, §14.2). When that read does find the issue terminal, the exit takes the terminal disposition instead and records `succeeded` with no error, exactly as an exit whose observation was terminal earlier already does. For an otherwise-normal exit on that handoff path, `succeeded` means the policy did not withhold it, or withheld it but the verification read then found the issue terminal. It does not assert that work was positively observed: an undeterminable verdict under `observed`, every normal exit under `off`, and a withheld verdict suppressed by that verification read may all still record `succeeded`.
 
-Rows written before this rule and rows written under `tracker.handoff_evidence: off` retain the
-earlier exit-kind-only meaning and are not rewritten. Reports spanning the change therefore span
-three definitions of `succeeded`, not two, and must not present a changed success rate as proof that
-agent behavior changed.
+Rows written before this rule and rows written under `tracker.handoff_evidence: off` retain the earlier exit-kind-only meaning and are not rewritten. Reports spanning the change therefore span three definitions of `succeeded`, not two, and must not present a changed success rate as proof that agent behavior changed.
 
-No column stores the handoff-evidence verdict. The verdict is logged and counted, and a withheld
-run carries it in the existing `error` field. In particular, this change adds no evidence field to
-`run_history` and requires no rewrite of historical rows. Because `succeeded` does not assert that
-work was observed, it cannot serve as the reset for a consecutive-absence sequence; that reset is
-recorded per issue in `handoff_absence_resets` below.
+No column stores the handoff-evidence verdict. The verdict is logged and counted, and a withheld run carries it in the existing `error` field. In particular, this change adds no evidence field to `run_history` and requires no rewrite of historical rows. Because `succeeded` does not assert that work was observed, it cannot serve as the reset for a consecutive-absence sequence; that reset is recorded per issue in `handoff_absence_resets` below.
 
-`budget_stopped` records a run the per-issue token ceiling stopped while it was in flight,
-distinct from `cancelled`, which still covers a run stopped by stall detection, a terminal
-tracker state, or shutdown. The distinction lets a consumer attribute a stop to the budget
-ceiling from the durable record alone, without parsing `error` text.
+`budget_stopped` records a run the per-issue token ceiling stopped while it was in flight, distinct from `cancelled`, which still covers a run stopped by stall detection, a terminal tracker state, or shutdown. The distinction lets a consumer attribute a stop to the budget ceiling from the durable record alone, without parsing `error` text.
 
-A row with `tokens_measured = 0` always carries zero in all four token columns; the invariant
-runs in one direction only, because a measured run can legitimately report a zero spend. Every
-writer sets `tokens_measured` explicitly rather than relying on the column's default: the SQL
-default is `1`, but the Go zero value of the corresponding struct field is `false`, so a writer
-that omits the field records an unmeasured run rather than inheriting the default. The column
-default of `1` exists solely to answer for rows written before migration 012, whose provenance
-is not recoverable and are treated as measured.
+A row with `tokens_measured = 0` always carries zero in all four token columns; the invariant runs in one direction only, because a measured run can legitimately report a zero spend. Every writer sets `tokens_measured` explicitly rather than relying on the column's default: the SQL default is `1`, but the Go zero value of the corresponding struct field is `false`, so a writer that omits the field records an unmeasured run rather than inheriting the default. The column default of `1` exists solely to answer for rows written before migration 012, whose provenance is not recoverable and are treated as measured.
 
-The token columns mirror those on `session_metadata`. The per-issue token budget
-(`agent.max_tokens`) sums `total_tokens` here; the other three are recorded for parity and
-future use. The in-flight lane that stops a run mid-turn adds the running session's own live
-in-memory total to that sum, rather than waiting for the session's own row to land. The
-`session_metadata` write cadence changed to throttled-incremental during a
-running session (at most one write per issue per two seconds, on the orchestrator event loop)
-so the `cost_budget` tool can read in-flight spend before the session's `run_history` row
-exists.
+The token columns mirror those on `session_metadata`. The per-issue token budget (`agent.max_tokens`) sums `total_tokens` here; the other three are recorded for parity and future use. The in-flight lane that stops a run mid-turn adds the running session's own live in-memory total to that sum, rather than waiting for the session's own row to land. The `session_metadata` write cadence changed to throttled-incremental during a running session (at most one write per issue per two seconds, on the orchestrator event loop) so the `cost_budget` tool can read in-flight spend before the session's `run_history` row exists.
 
-`tokens_measured` is not mirrored onto `session_metadata`, and does not need to be. The
-throttled in-flight write is gated on a usage-bearing event, so while a session runs its row
-comes into existence exactly when that session has reported a measurement, and the presence of
-a row whose `session_id` matches the live session is itself the measurement signal the
-`cost_budget` tool reads. A running session with no matching row is what makes that tool's
-`used_tokens_complete` false, on the same footing as a completed run with
-`tokens_measured = 0`. The unconditional write at session exit is outside that window: by then
-the run's own measurement state has already been recorded on its `run_history` row.
+`tokens_measured` is not mirrored onto `session_metadata`, and does not need to be. The throttled in-flight write is gated on a usage-bearing event, so while a session runs its row comes into existence exactly when that session has reported a measurement, and the presence of a row whose `session_id` matches the live session is itself the measurement signal the `cost_budget` tool reads. A running session with no matching row is what makes that tool's `used_tokens_complete` false, on the same footing as a completed run with `tokens_measured = 0`. The unconditional write at session exit is outside that window: by then the run's own measurement state has already been recorded on its `run_history` row.
 
-The request count needs a column of its own for the reason the token measurement does not. The
-argument above rests on the in-flight write being gated on a usage-bearing event, so the row's
-existence is itself the token measurement signal. That gate fires for a kind that reports usage
-only when a turn ends too, and such a kind counts turns rather than requests, so the row's
-existence says nothing about whether the request-counting path ran. `api_requests_measured` is
-what says it. A row written before migration 016 reads `0`, because its count was written by the
-unconditional rule that column exists to qualify; the row self-heals on that issue's next
-session.
+The request count needs a column of its own for the reason the token measurement does not. The argument above rests on the in-flight write being gated on a usage-bearing event, so the row's existence is itself the token measurement signal. That gate fires for a kind that reports usage only when a turn ends too, and such a kind counts turns rather than requests, so the row's existence says nothing about whether the request-counting path ran. `api_requests_measured` is what says it. A row written before migration 016 reads `0`, because its count was written by the unconditional rule that column exists to qualify; the row self-heals on that issue's next session.
 
 **`session_metadata`**: last known session metadata per issue (for observability and debug)
 
@@ -152,50 +102,17 @@ session.
 | `dispatched`  | INTEGER | `1` when the action for this fingerprint has been performed   |
 | `updated_at`  | TEXT    | ISO-8601 timestamp                                            |
 
-Primary key: `(issue_id, kind)`. Every reaction kind that deduplicates across restarts owns a row
-here under its own `kind` discriminator, so one issue may hold several rows at once without the
-kinds interfering. Upserts reset `dispatched` to `0` when the fingerprint value changes, which
-re-arms the latch for exactly one further action.
+Primary key: `(issue_id, kind)`. Every reaction kind that deduplicates across restarts owns a row here under its own `kind` discriminator, so one issue may hold several rows at once without the kinds interfering. Upserts reset `dispatched` to `0` when the fingerprint value changes, which re-arms the latch for exactly one further action.
 
-What the fingerprint holds is defined by the owning kind, not by this table: a digest of the
-comment set last acted on, the git ref last checked, a journal high-water mark, or a merge commit
-identifier, whichever value identifies "the same observation" for that kind. The column is opaque
-text and this schema attaches no meaning to it beyond equality.
+What the fingerprint holds is defined by the owning kind, not by this table: a digest of the comment set last acted on, the git ref last checked, a journal high-water mark, or a merge commit identifier, whichever value identifies "the same observation" for that kind. The column is opaque text and this schema attaches no meaning to it beyond equality.
 
-The `ci` row holds the pull request head this process last evaluated, not a ref captured once at
-worker exit; `updated_at` is refreshed on every evaluation, including one that finds the head
-unchanged, so it names the last evaluation rather than a first-seen timestamp for this kind. A
-differing stored head is this kind's head-change detection, and the row is never deleted: neither a
-passing result nor an escalation removes it, because it is the durable half of the feedback epoch
-record (§11A.9).
+The `ci` row holds the pull request head this process last evaluated, not a ref captured once at worker exit; `updated_at` is refreshed on every evaluation, including one that finds the head unchanged, so it names the last evaluation rather than a first-seen timestamp for this kind. A differing stored head is this kind's head-change detection, and the row is never deleted: neither a passing result nor an escalation removes it, because it is the durable half of the feedback epoch record (§11A.9).
 
-`dispatched` likewise means "the action this kind performs has been performed for this
-fingerprint", and the row's lifecycle after that point is the owning kind's to define. Most kinds
-treat the row as spent. The merge-completion kind (§11G.4) instead retains a dispatched row rather
-than deleting it, because deleting it would let the next poll observe the same merge as new.
+`dispatched` likewise means "the action this kind performs has been performed for this fingerprint", and the row's lifecycle after that point is the owning kind's to define. Most kinds treat the row as spent. The merge-completion kind (§11G.4) instead retains a dispatched row rather than deleting it, because deleting it would let the next poll observe the same merge as new.
 
-The internal `merge-completion-missing-sha` observation kind reuses this table without changing the
-normal `merge-completion` fingerprint. Its `fingerprint` is normalized `owner/repo#number`,
-`updated_at` is the first time that PR identity was reported merged without a commit identifier,
-and `dispatched` means the bounded-wait escalation was successfully delivered. Its observation upsert has
-stricter timestamp semantics than an ordinary fingerprint upsert: the same identity preserves
-`updated_at`, while a different identity replaces it and resets `dispatched`. Marking this
-observation dispatched happens only after the configured tracker write succeeds, only if the row
-still carries the same PR identity, and also preserves `updated_at`, so a restart cannot reset or
-obscure the thirty-minute grace-period origin. A failed
-tracker write leaves the expired observation undispatched; the current pending entry remains
-dropped, while a later fresh entry can retry only that delivery.
+The internal `merge-completion-missing-sha` observation kind reuses this table without changing the normal `merge-completion` fingerprint. Its `fingerprint` is normalized `owner/repo#number`, `updated_at` is the first time that PR identity was reported merged without a commit identifier, and `dispatched` means the bounded-wait escalation was successfully delivered. Its observation upsert has stricter timestamp semantics than an ordinary fingerprint upsert: the same identity preserves `updated_at`, while a different identity replaces it and resets `dispatched`. Marking this observation dispatched happens only after the configured tracker write succeeds, only if the row still carries the same PR identity, and also preserves `updated_at`, so a restart cannot reset or obscure the thirty-minute grace-period origin. A failed tracker write leaves the expired observation undispatched; the current pending entry remains dropped, while a later fresh entry can retry only that delivery.
 
-Cleanup is owned by an active merge-completion pass. Such a pass deletes the observation when it
-sees a different pull request identity, a missing pull request, an issue missing from the tracker
-response, an issue outside the handoff state, or a real commit identifier whose normal merge latch
-has completed. Generic terminal-state release deliberately leaves every `reaction_fingerprints`
-row intact. Consequently, after the bounded stop has removed the last pending entry, a later human
-transition by itself is not observed and this internal row may remain indefinitely. The residue is
-inert: the same delivered identity stops, a different identity resets it, and a later fresh entry
-with a real identifier clears it after the normal latch completes. Because `updated_at` is frozen
-at first observation, any future retention job MUST handle this kind explicitly; it MUST NOT infer
-safe expiry from `updated_at` alone or it would re-arm a one-shot escalation.
+Cleanup is owned by an active merge-completion pass. Such a pass deletes the observation when it sees a different pull request identity, a missing pull request, an issue missing from the tracker response, an issue outside the handoff state, or a real commit identifier whose normal merge latch has completed. Generic terminal-state release deliberately leaves every `reaction_fingerprints` row intact. Consequently, after the bounded stop has removed the last pending entry, a later human transition by itself is not observed and this internal row may remain indefinitely. The residue is inert: the same delivered identity stops, a different identity resets it, and a later fresh entry with a real identifier clears it after the normal latch completes. Because `updated_at` is frozen at first observation, any future retention job MUST handle this kind explicitly; it MUST NOT infer safe expiry from `updated_at` alone or it would re-arm a one-shot escalation.
 
 **`handoff_absence_resets`**: end of a consecutive handoff-absence sequence (migration 013)
 
@@ -205,21 +122,9 @@ safe expiry from `updated_at` alone or it would re-arm a one-shot escalation.
 | `reset_run_id` | INTEGER | Highest `run_history.id` for the issue at the reset; `0` when none |
 | `updated_at`   | TEXT    | ISO-8601 timestamp                                                 |
 
-One row per issue, written only when a run's evidence verdict is `work observed`. The
-consecutive-absence count (§14.2) is the number of the issue's absence-marked `run_history` rows
-with an `id` above `reset_run_id`, so the count returns to zero the moment a work-observed run is
-recorded and cannot be restored by a later handoff-write failure. A run outcome that carries no
-verdict never writes here on its own account, which is what keeps a blocked soft stop, a reaction
-run, an undeterminable verdict, or a run under `handoff_evidence: off` from resetting a sequence
-that run says nothing about.
+One row per issue, written only when a run's evidence verdict is `work observed`. The consecutive-absence count (§14.2) is the number of the issue's absence-marked `run_history` rows with an `id` above `reset_run_id`, so the count returns to zero the moment a work-observed run is recorded and cannot be restored by a later handoff-write failure. A run outcome that carries no verdict never writes here on its own account, which is what keeps a blocked soft stop, a reaction run, an undeterminable verdict, or a run under `handoff_evidence: off` from resetting a sequence that run says nothing about.
 
-The reset point is read from `run_history` inside the write, so a work-observed run whose own
-history row could not be persisted still clears the absences recorded before it. This table holds no
-verdict history: it is a per-issue position that is overwritten, and deleting a row only restores
-the issue's full recorded absence sequence. A work-observed run is no longer the table's only
-writer: releasing a parked issue, whatever reason the park carries, also writes a reset here, so the
-loop does not immediately re-derive the exhausted count and park the issue again on the tick that
-released it.
+The reset point is read from `run_history` inside the write, so a work-observed run whose own history row could not be persisted still clears the absences recorded before it. This table holds no verdict history: it is a per-issue position that is overwritten, and deleting a row only restores the issue's full recorded absence sequence. A work-observed run is no longer the table's only writer: releasing a parked issue, whatever reason the park carries, also writes a reset here, so the loop does not immediately re-derive the exhausted count and park the issue again on the tick that released it.
 
 **`parked_issues`**: issues held out of primary dispatch until a human acts (migration 014)
 
@@ -234,16 +139,9 @@ released it.
 | `label_applied` | INTEGER | `1` once the orchestrator has confirmed the label reached the tracker |
 | `parked_at`     | TEXT    | ISO-8601 timestamp                                                  |
 
-One row per parked issue, holding current state rather than history: the row is deleted the
-moment the park is lifted, not retained as a record of a past park. `parked_state` is nullable in
-meaning though not in type: an empty string means no tracker state was observed at park time,
-which only a park taken from the retry lane produces, since that lane parks ahead of its own
-tracker fetch by design (§14.2). `label_applied` has exactly one writer: the orchestrator's
-release-rule observation of the label on a later fetch of the issue, never the outcome of the
-label write itself.
+One row per parked issue, holding current state rather than history: the row is deleted the moment the park is lifted, not retained as a record of a past park. `parked_state` is nullable in meaning though not in type: an empty string means no tracker state was observed at park time, which only a park taken from the retry lane produces, since that lane parks ahead of its own tracker fetch by design (§14.2). `label_applied` has exactly one writer: the orchestrator's release-rule observation of the label on a later fetch of the issue, never the outcome of the label write itself.
 
-**`budget_hold_notices`**: cross-restart dedup for the tracker comment posted on an issue held by a
-per-issue budget ceiling (migration 015)
+**`budget_hold_notices`**: cross-restart dedup for the tracker comment posted on an issue held by a per-issue budget ceiling (migration 015)
 
 | Column       | Type    | Notes                                                       |
 | ------------ | ------- | ------------------------------------------------------------ |
@@ -251,17 +149,10 @@ per-issue budget ceiling (migration 015)
 | `reason`     | TEXT    | `session_budget` or `token_budget`                            |
 | `noticed_at` | TEXT    | ISO-8601 timestamp the posted notice reported                 |
 
-One row per issue whose current budget hold has been announced on the tracker, holding current
-state rather than history: the row is deleted when the hold clears, on the same evidence rule
-that prunes the in-memory announcement latch, or when both budgets are disabled. An issue held by
-a ceiling and then closed, or otherwise never observed as a candidate again, never has its row
-deleted, so the row persists for the rest of the deployment's lifetime. `noticed_at` exists so an
-operator reading the database can align a row with the comment on the issue; no runtime decision
-reads it.
+One row per issue whose current budget hold has been announced on the tracker, holding current state rather than history: the row is deleted when the hold clears, on the same evidence rule that prunes the in-memory announcement latch, or when both budgets are disabled. An issue held by a ceiling and then closed, or otherwise never observed as a candidate again, never has its row deleted, so the row persists for the rest of the deployment's lifetime. `noticed_at` exists so an operator reading the database can align a row with the comment on the issue; no runtime decision reads it.
 
 ### 19.3 Migration Strategy
 
 - Migrations are numbered sequentially and applied in order at startup.
 - Applied migrations are tracked in a `schema_migrations` table.
-- Migrations are additive (new columns/tables) where possible; destructive migrations require
-  explicit versioning.
+- Migrations are additive (new columns/tables) where possible; destructive migrations require explicit versioning.

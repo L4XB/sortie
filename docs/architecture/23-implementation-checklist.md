@@ -19,8 +19,7 @@ Use the same validation profiles as Section 17:
 - Workspace manager with sanitized per-issue workspaces
 - Workspace lifecycle hooks (`after_create`, `before_run`, `after_run`, `before_remove`)
 - Hook timeout config (`hooks.timeout_ms`, default `60000`)
-- Hook environment variables (`SORTIE_ISSUE_ID`, `SORTIE_ISSUE_IDENTIFIER`, `SORTIE_WORKSPACE`,
-  `SORTIE_ATTEMPT`)
+- Hook environment variables (`SORTIE_ISSUE_ID`, `SORTIE_ISSUE_IDENTIFIER`, `SORTIE_WORKSPACE`, `SORTIE_ATTEMPT`)
 - SQLite persistence layer with schema migrations
 - Startup recovery from persisted state (retry timers reconstructed from SQLite `due_at`)
 - Agent launch command config (`agent.command`, adapter-defined default)
@@ -34,27 +33,17 @@ Use the same validation profiles as Section 17:
 
 ### 18.2 Recommended Extensions (Not Required for Conformance)
 
-- HTTP server honors CLI `--port` over `server.port`, uses a safe default bind host, and exposes
-  the baseline endpoints/error semantics in Section 13.7 if shipped.
-- Prometheus `/metrics` endpoint exposes defined gauges, counters, and histograms when the HTTP
-  server is enabled (Section 13.7.3). Backed by `github.com/prometheus/client_golang` with a
-  dedicated registry; no external Prometheus server required.
-- Agent tool subsystem: `ToolRegistry` populated with the built-in tools per Section 10.4
-  (`tracker_api`, `sortie_status`, `workspace_history`, `cost_budget`, `notify_operator`). The
-  runtime execution channel is an MCP stdio sidecar (per ADR-0009).
-- Opt-in age-based workspace retention (`workspace.retention_days`) evaluated by the periodic
-  sweep, with the floor and the recovery-lookback coupling in Section 9.6 preserved.
-- Orchestrator-driven terminal transition on managed pull request merge
-  (`reactions.merge_completion`), latched per merge commit identifier (Section 11G).
-- Make observability settings configurable in workflow front matter without prescribing UI
-  implementation details.
-- First-class tracker write APIs (comments/state transitions) in the orchestrator, supplementing
-  agent tool-based mutations.
+- HTTP server honors CLI `--port` over `server.port`, uses a safe default bind host, and exposes the baseline endpoints/error semantics in Section 13.7 if shipped.
+- Prometheus `/metrics` endpoint exposes defined gauges, counters, and histograms when the HTTP server is enabled (Section 13.7.3). Backed by `github.com/prometheus/client_golang` with a dedicated registry; no external Prometheus server required.
+- Agent tool subsystem: `ToolRegistry` populated with the built-in tools per Section 10.4 (`tracker_api`, `sortie_status`, `workspace_history`, `cost_budget`, `notify_operator`). The runtime execution channel is an MCP stdio sidecar (per ADR-0009).
+- Opt-in age-based workspace retention (`workspace.retention_days`) evaluated by the periodic sweep, with the floor and the recovery-lookback coupling in Section 9.6 preserved.
+- Orchestrator-driven terminal transition on managed pull request merge (`reactions.merge_completion`), latched per merge commit identifier (Section 11G).
+- Make observability settings configurable in workflow front matter without prescribing UI implementation details.
+- First-class tracker write APIs (comments/state transitions) in the orchestrator, supplementing agent tool-based mutations.
 
 ### 18.3 Operational Validation Before Production (Recommended)
 
 - Run the `Real Integration Profile` from Section 17.8 with valid credentials and network access.
 - Verify hook execution and workflow path resolution on the target host OS/shell environment.
-- If the HTTP server is shipped, verify the configured port behavior and loopback/default bind
-  expectations on the target environment.
+- If the HTTP server is shipped, verify the configured port behavior and loopback/default bind expectations on the target environment.
 

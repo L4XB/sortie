@@ -1,79 +1,44 @@
 # Agent2Orchestrator (A2O) Protocol
 
-A specification for out-of-band advisory signaling between autonomous coding agents
-and the Sortie orchestration service via filesystem sentinel files.
+A specification for out-of-band advisory signaling between autonomous coding agents and the Sortie orchestration service via filesystem sentinel files.
 
 **Version:** 1.0 \
 **Status:** Normative \
-**Audience:** Implementers of orchestrator readers, agent adapter writers, workflow authors, and
-coding agent runtimes seeking to participate in Sortie-managed execution.
+**Audience:** Implementers of orchestrator readers, agent adapter writers, workflow authors, and coding agent runtimes seeking to participate in Sortie-managed execution.
 
 ---
 
 ## Abstract
 
-When an orchestration service manages the lifecycle of autonomous coding agent sessions, a
-fundamental information asymmetry arises: the orchestrator controls dispatch, retry, and
-termination, yet it lacks direct visibility into the agent's internal assessment of task
-feasibility. Without an explicit feedback channel, the orchestrator must infer agent progress
-solely from external tracker state, leading to wasteful continuation retry cycles that consume
-compute resources and API quota without advancing the task.
+When an orchestration service manages the lifecycle of autonomous coding agent sessions, a fundamental information asymmetry arises: the orchestrator controls dispatch, retry, and termination, yet it lacks direct visibility into the agent's internal assessment of task feasibility. Without an explicit feedback channel, the orchestrator must infer agent progress solely from external tracker state, leading to wasteful continuation retry cycles that consume compute resources and API quota without advancing the task.
 
-This document specifies a file-based advisory protocol that resolves this asymmetry. The protocol
-enables any coding agent — regardless of runtime, SDK availability, or tool-calling
-capability — to transmit a structured signal to the orchestrator by writing a single
-plain-text file to the workspace filesystem.
+This document specifies a file-based advisory protocol that resolves this asymmetry. The protocol enables any coding agent — regardless of runtime, SDK availability, or tool-calling capability — to transmit a structured signal to the orchestrator by writing a single plain-text file to the workspace filesystem.
 
-The design is informed by analysis of six candidate signaling mechanisms evaluated against the
-constraints of agent-agnostic orchestration in a fragmented ecosystem where five or more major
-coding agent platforms maintain distinct capability profiles and configuration cultures
-[4, 6, 8]. The file-based approach was selected for its universal compatibility, fail-safe
-degradation properties, and alignment with established Unix IPC patterns [11].
+The design is informed by analysis of six candidate signaling mechanisms evaluated against the constraints of agent-agnostic orchestration in a fragmented ecosystem where five or more major coding agent platforms maintain distinct capability profiles and configuration cultures [4, 6, 8]. The file-based approach was selected for its universal compatibility, fail-safe degradation properties, and alignment with established Unix IPC patterns [11].
 
 ## 1. Introduction
 
 ### 1.1 Problem statement
 
-Sortie is a long-running orchestration service that continuously reads work items from an issue
-tracker, creates isolated per-issue workspaces, and executes coding agent sessions within those
-workspaces. After each agent turn completes, the orchestrator must decide whether to continue
-with another turn, schedule a retry, or release the work item. This decision currently relies on
-two signals: the exit status of the agent process and the issue's state in the external tracker.
+Sortie is a long-running orchestration service that continuously reads work items from an issue tracker, creates isolated per-issue workspaces, and executes coding agent sessions within those workspaces. After each agent turn completes, the orchestrator must decide whether to continue with another turn, schedule a retry, or release the work item. This decision currently relies on two signals: the exit status of the agent process and the issue's state in the external tracker.
 
-Neither signal captures the case where an agent has completed its turn normally but has determined
-that further automated work is futile — for example, when required credentials are missing, a
-human architectural decision is needed, or the task specification is ambiguous. In such cases, the
-orchestrator schedules continuation retries that the agent will repeatedly fail, burning tokens and
-API capacity. Hassan et al. [5] identify this as a manifestation of the "speed vs. trust" gap in
-agentic software engineering: agents produce output at high velocity, but a significant fraction
-is not merge-ready, and the orchestration layer lacks the signal fidelity to distinguish
-productive from futile execution.
+Neither signal captures the case where an agent has completed its turn normally but has determined that further automated work is futile — for example, when required credentials are missing, a human architectural decision is needed, or the task specification is ambiguous. In such cases, the orchestrator schedules continuation retries that the agent will repeatedly fail, burning tokens and API capacity. Hassan et al. [5] identify this as a manifestation of the "speed vs. trust" gap in agentic software engineering: agents produce output at high velocity, but a significant fraction is not merge-ready, and the orchestration layer lacks the signal fidelity to distinguish productive from futile execution.
 
 ### 1.2 Requirements
 
-The feedback channel must satisfy the following constraints, derived from Sortie's architectural
-principles (architecture [Section 1](architecture/01-problem-statement.md), [Section 2](architecture/02-goals-and-non-goals.md)):
+The feedback channel must satisfy the following constraints, derived from Sortie's architectural principles (architecture [Section 1](architecture/01-problem-statement.md), [Section 2](architecture/02-goals-and-non-goals.md)):
 
-1. **Agent-agnostic.** The mechanism must not depend on any specific agent runtime's capabilities.
-   Any process capable of writing a file to disk must be able to participate. This rules out
-   mechanisms that require MCP client support, A2A protocol stacks, or tool-calling infrastructure.
+1. **Agent-agnostic.** The mechanism must not depend on any specific agent runtime's capabilities. Any process capable of writing a file to disk must be able to participate. This rules out mechanisms that require MCP client support, A2A protocol stacks, or tool-calling infrastructure.
 
-2. **Fail-safe.** Every failure mode must degrade to normal orchestrator behavior. A missing file,
-   a corrupted file, an unrecognized value, or a read error must all result in the orchestrator
-   proceeding as if no signal were present.
+2. **Fail-safe.** Every failure mode must degrade to normal orchestrator behavior. A missing file, a corrupted file, an unrecognized value, or a read error must all result in the orchestrator proceeding as if no signal were present.
 
-3. **Advisory, not authoritative.** The signal informs the orchestrator's decision but does not
-   control it. The orchestrator retains full authority over dispatch, retry, and termination. An
-   agent cannot commandeer orchestrator control flow by writing to this file.
+3. **Advisory, not authoritative.** The signal informs the orchestrator's decision but does not control it. The orchestrator retains full authority over dispatch, retry, and termination. An agent cannot commandeer orchestrator control flow by writing to this file.
 
-4. **Zero dependencies.** No SDK, no network stack, no runtime library. The protocol must be
-   implementable with a single shell command.
+4. **Zero dependencies.** No SDK, no network stack, no runtime library. The protocol must be implementable with a single shell command.
 
-5. **Forward-compatible.** New signal values may be added in future versions without breaking
-   existing orchestrators. Existing values never change meaning and are never removed.
+5. **Forward-compatible.** New signal values may be added in future versions without breaking existing orchestrators. Existing values never change meaning and are never removed.
 
-6. **Inspectable.** An operator must be able to determine the current signal state with standard
-   Unix tools (`cat`, `ls`).
+6. **Inspectable.** An operator must be able to determine the current signal state with standard Unix tools (`cat`, `ls`).
 
 ### 1.3 Scope
 
@@ -88,40 +53,21 @@ This document specifies:
 
 This document does not specify:
 
-- The internal implementation of the orchestrator's retry or dispatch logic (see architecture
-  Sections [7](architecture/07-orchestration-state-machine.md), [8](architecture/08-polling-scheduling-and-reconciliation.md), and [16](architecture/21-reference-algorithms.md)).
-- The mechanism by which coding agents decide to write a status signal. That is an agent-internal
-  concern.
+- The internal implementation of the orchestrator's retry or dispatch logic (see architecture Sections [7](architecture/07-orchestration-state-machine.md), [8](architecture/08-polling-scheduling-and-reconciliation.md), and [16](architecture/21-reference-algorithms.md)).
+- The mechanism by which coding agents decide to write a status signal. That is an agent-internal concern.
 - Future extensions to the `.sortie/` namespace beyond the `status` file.
 
 ### 1.4 Relationship to existing protocols
 
-The protocol occupies a distinct niche in the 2025–2026 landscape of agent interoperability
-standards. The Model Context Protocol (MCP) standardizes vertical agent-to-tool integration via
-JSON-RPC 2.0, with over 10,000 deployed servers and 97 million monthly SDK downloads as of early
-2026 [1]. The Agent-to-Agent protocol (A2A) addresses horizontal coordination between peer agents,
-with 150+ participating organizations by version 0.3 [2, 3]. The Agent Communication Protocol
-(ACP) from IBM and the Linux Foundation standardizes message formats for cross-platform agent
-communication [9]. The Agent Network Protocol (ANP) focuses on decentralized agent discovery in
-distributed networks [9].
+The protocol occupies a distinct niche in the 2025–2026 landscape of agent interoperability standards. The Model Context Protocol (MCP) standardizes vertical agent-to-tool integration via JSON-RPC 2.0, with over 10,000 deployed servers and 97 million monthly SDK downloads as of early 2026 [1]. The Agent-to-Agent protocol (A2A) addresses horizontal coordination between peer agents, with 150+ participating organizations by version 0.3 [2, 3]. The Agent Communication Protocol (ACP) from IBM and the Linux Foundation standardizes message formats for cross-platform agent communication [9]. The Agent Network Protocol (ANP) focuses on decentralized agent discovery in distributed networks [9].
 
-None of these protocols addresses the specific use case of **out-of-band advisory signaling from
-a managed worker process to its supervising orchestrator**. MCP solves "agent calls tool." A2A
-solves "agent delegates to agent." The Sortie agent protocol solves "subordinate process advises
-supervisor of feasibility assessment through an asynchronous side-channel." The closest analogy in
-classical systems programming is the Unix sentinel file pattern [11] and Kubernetes exec-based
-health probes, both of which use file existence or contents as a polling-compatible signal
-mechanism.
+None of these protocols addresses the specific use case of **out-of-band advisory signaling from a managed worker process to its supervising orchestrator**. MCP solves "agent calls tool." A2A solves "agent delegates to agent." The Sortie agent protocol solves "subordinate process advises supervisor of feasibility assessment through an asynchronous side-channel." The closest analogy in classical systems programming is the Unix sentinel file pattern [11] and Kubernetes exec-based health probes, both of which use file existence or contents as a polling-compatible signal mechanism.
 
 ### 1.5 Notation and conventions
 
-The key words "MUST", "MUST NOT", "SHOULD", "SHOULD NOT", and "MAY" in this document are to be
-interpreted as described in RFC 2119.
+The key words "MUST", "MUST NOT", "SHOULD", "SHOULD NOT", and "MAY" in this document are to be interpreted as described in RFC 2119.
 
-*Orchestrator* refers to the Sortie orchestration service. *Agent* refers to any coding agent
-process executing within a Sortie-managed workspace. *Turn* refers to a single invocation of the
-agent adapter's `RunTurn` operation. *Worker* refers to the orchestrator-side goroutine that
-manages a sequence of turns for one issue.
+*Orchestrator* refers to the Sortie orchestration service. *Agent* refers to any coding agent process executing within a Sortie-managed workspace. *Turn* refers to a single invocation of the agent adapter's `RunTurn` operation. *Worker* refers to the orchestrator-side goroutine that manages a sequence of turns for one issue.
 
 ## 2. Protocol specification
 
@@ -136,15 +82,13 @@ The status file path is:
 Where:
 
 - `<workspace_root>` is the configured `workspace.root` value ([architecture Section 5.3.3](architecture/05-workflow-specification.md#533-workspace-object)).
-- `<sanitized_issue_identifier>` is the issue identifier sanitized to the character class
-  `[A-Za-z0-9._-]` ([architecture Section 9.6](architecture/09-workspace-management-and-safety.md#96-safety-invariants), Invariant 3).
+- `<sanitized_issue_identifier>` is the issue identifier sanitized to the character class `[A-Za-z0-9._-]` ([architecture Section 9.6](architecture/09-workspace-management-and-safety.md#96-safety-invariants), Invariant 3).
 - `.sortie/` is a reserved directory namespace within the per-issue workspace.
 - `status` is the canonical filename.
 
 The `.sortie/` directory is not created by the orchestrator. The agent creates it as needed.
 
-Relative to the agent's working directory (which MUST equal the per-issue workspace path per
-[architecture Section 9.6](architecture/09-workspace-management-and-safety.md#96-safety-invariants), Invariant 1), the file path is:
+Relative to the agent's working directory (which MUST equal the per-issue workspace path per [architecture Section 9.6](architecture/09-workspace-management-and-safety.md#96-safety-invariants), Invariant 1), the file path is:
 
 ```
 .sortie/status
@@ -160,9 +104,7 @@ The status file is a UTF-8 encoded plain-text file. The parsing algorithm is:
 4. Trim leading and trailing ASCII whitespace (`0x09`, `0x0A`, `0x0D`, `0x20`).
 5. The resulting string is the **status token**.
 
-Lines after the first are reserved for future use and MUST be ignored by version 1 readers. This
-reservation establishes an upgrade path to multi-line formats (e.g., structured context) without
-breaking backward compatibility.
+Lines after the first are reserved for future use and MUST be ignored by version 1 readers. This reservation establishes an upgrade path to multi-line formats (e.g., structured context) without breaking backward compatibility.
 
 The status token is case-sensitive. Implementations MUST NOT normalize case.
 
@@ -172,70 +114,26 @@ Version 1 defines three status tokens:
 
 #### 2.3.1 `blocked`
 
-The agent has determined that it cannot make further meaningful progress on the task without
-external intervention. Typical causes include: missing credentials or environment prerequisites,
-ambiguous task specifications requiring human clarification, dependencies on work outside the
-agent's scope, or repeated failures on the same operation.
+The agent has determined that it cannot make further meaningful progress on the task without external intervention. Typical causes include: missing credentials or environment prerequisites, ambiguous task specifications requiring human clarification, dependencies on work outside the agent's scope, or repeated failures on the same operation.
 
-**Orchestrator behavior:** The orchestrator treats this as a **soft stop**. It completes the
-current turn normally, then breaks the turn loop — no further continuation turns execute within
-the current worker run. A value read after a coding turn never admits the run to the self-review
-phase (Section 2.3.2); it remains an immediate exit whether or not self-review is configured. A
-value written during a phase turn instead ends the phase and gives the run this same disposition
-(Section 2.3.5). On worker exit, the
-orchestrator MUST NOT schedule a continuation retry
-([architecture Section 8.4](architecture/08-polling-scheduling-and-reconciliation.md#84-retry-and-backoff)). When the dispatch that produced this run drives issue state, the orchestrator
-releases the claim and parks the issue: it records a durable park, applies the configured parking
-label ([architecture Section 14.2](architecture/19-failure-model-and-recovery-strategy.md#142-recovery-behavior)) to the issue, and holds it out of dispatch. The park is lifted, and normal dispatch
-eligibility resumes, when the orchestrator observes either a change in the issue's tracker state
-or the removal of a parking label it has confirmed reached the tracker.
+**Orchestrator behavior:** The orchestrator treats this as a **soft stop**. It completes the current turn normally, then breaks the turn loop — no further continuation turns execute within the current worker run. A value read after a coding turn never admits the run to the self-review phase (Section 2.3.2); it remains an immediate exit whether or not self-review is configured. A value written during a phase turn instead ends the phase and gives the run this same disposition (Section 2.3.5). On worker exit, the orchestrator MUST NOT schedule a continuation retry ([architecture Section 8.4](architecture/08-polling-scheduling-and-reconciliation.md#84-retry-and-backoff)). When the dispatch that produced this run drives issue state, the orchestrator releases the claim and parks the issue: it records a durable park, applies the configured parking label ([architecture Section 14.2](architecture/19-failure-model-and-recovery-strategy.md#142-recovery-behavior)) to the issue, and holds it out of dispatch. The park is lifted, and normal dispatch eligibility resumes, when the orchestrator observes either a change in the issue's tracker state or the removal of a parking label it has confirmed reached the tracker.
 
 To clarify the two distinct suppression effects:
 
-- **Continuation turns** (turns 2..N within a single worker run): the turn loop breaks
-  immediately after reading the recognized status token. The worker does not proceed to the next
-  turn.
-- **Continuation retries** (new worker runs scheduled after a normal worker exit): the
-  post-exit retry handler skips scheduling. Where the dispatch drives issue state, the park
-  determines when the issue is re-dispatched; where it does not, nothing is parked.
+- **Continuation turns** (turns 2..N within a single worker run): the turn loop breaks immediately after reading the recognized status token. The worker does not proceed to the next turn.
+- **Continuation retries** (new worker runs scheduled after a normal worker exit): the post-exit retry handler skips scheduling. Where the dispatch drives issue state, the park determines when the issue is re-dispatched; where it does not, nothing is parked.
 
 #### 2.3.2 `needs-human-review`
 
-The agent has completed its work and determined that the results require human review before
-further automated action is appropriate. Typical causes include: a pull request is ready for
-review, architectural decisions are embedded in the output that require validation, or the agent
-has low confidence in its solution.
+The agent has completed its work and determined that the results require human review before further automated action is appropriate. Typical causes include: a pull request is ready for review, architectural decisions are embedded in the output that require validation, or the agent has low confidence in its solution.
 
-**Orchestrator behavior:** Like `blocked`, this value triggers a soft stop: the turn loop breaks,
-continuation retries are suppressed, and the issue claim is released. Unlike `blocked`, when
-`tracker.handoff_state` is configured ([architecture Section 5.3.1](architecture/05-workflow-specification.md#531-tracker-object)), the issue is in an active
-tracker state, and the dispatch drives issue state, the orchestrator performs the handoff
-transition before releasing the claim. Where the dispatch does not drive issue state, no transition
-is attempted and the claim is released. If the handoff transition fails (network error, permission
-denied, nil adapter), the orchestrator logs a warning and releases the claim without scheduling a
-retry.
+**Orchestrator behavior:** Like `blocked`, this value triggers a soft stop: the turn loop breaks, continuation retries are suppressed, and the issue claim is released. Unlike `blocked`, when `tracker.handoff_state` is configured ([architecture Section 5.3.1](architecture/05-workflow-specification.md#531-tracker-object)), the issue is in an active tracker state, and the dispatch drives issue state, the orchestrator performs the handoff transition before releasing the claim. Where the dispatch does not drive issue state, no transition is attempted and the claim is released. If the handoff transition fails (network error, permission denied, nil adapter), the orchestrator logs a warning and releases the claim without scheduling a retry.
 
-The transition is additionally subject to the run's `tracker.handoff_evidence` verdict
-([architecture Section 7.3](architecture/07-orchestration-state-machine.md#73-transition-triggers)).
-Where that verdict withholds the transition, the orchestrator re-reads the issue's tracker state
-once before recording the outcome. When that read does not find the issue terminal, no tracker
-write is attempted: the issue keeps its active state and its claim, and the exit takes the
-exponential-backoff failure path instead of releasing the claim. When that read does find the issue
-terminal, the exit releases the claim and records `succeeded` instead, exactly as it would have had
-the issue already been observed terminal.
+The transition is additionally subject to the run's `tracker.handoff_evidence` verdict ([architecture Section 7.3](architecture/07-orchestration-state-machine.md#73-transition-triggers)). Where that verdict withholds the transition, the orchestrator re-reads the issue's tracker state once before recording the outcome. When that read does not find the issue terminal, no tracker write is attempted: the issue keeps its active state and its claim, and the exit takes the exponential-backoff failure path instead of releasing the claim. When that read does find the issue terminal, the exit releases the claim and records `succeeded` instead, exactly as it would have had the issue already been observed terminal.
 
-This distinction reflects the semantic difference between the two values: `blocked` means "I
-cannot proceed" (no completed work to hand off), while `needs-human-review` means "work is
-complete, ready for review" (completed work should be visible in the tracker via handoff).
+This distinction reflects the semantic difference between the two values: `blocked` means "I cannot proceed" (no completed work to hand off), while `needs-human-review` means "work is complete, ready for review" (completed work should be visible in the tracker via handoff).
 
-Where `self_review.enabled` is set and the self-review phase's other gate conditions hold
-(the issue is in an active tracker state, the run's context is not cancelled, and the dispatch
-posture drives issue state), this value does not end the run at the read. It admits the run to
-the self-review phase: the orchestrator runs the configured verification commands and gives the
-agent a review turn, iterating up to `self_review.max_iterations`. The run ends after the phase
-with the same exit kind, soft-stop reason, and disposition it would have taken at the read.
-Where self-review is off, or where any gate condition fails, the value ends the run exactly as
-Section 2.3.3 describes, with no phase entered.
+Where `self_review.enabled` is set and the self-review phase's other gate conditions hold (the issue is in an active tracker state, the run's context is not cancelled, and the dispatch posture drives issue state), this value does not end the run at the read. It admits the run to the self-review phase: the orchestrator runs the configured verification commands and gives the agent a review turn, iterating up to `self_review.max_iterations`. The run ends after the phase with the same exit kind, soft-stop reason, and disposition it would have taken at the read. Where self-review is off, or where any gate condition fails, the value ends the run exactly as Section 2.3.3 describes, with no phase entered.
 
 #### 2.3.3 Common orchestrator response
 
@@ -243,12 +141,7 @@ For all three recognized values, the orchestrator:
 
 1. Completes the current turn normally (does not abort mid-turn).
 2. Breaks the turn loop (no further continuation turns in this worker run).
-3. Where `needs-human-review` or `no-change-needed` admits the run to the self-review phase
-   (Section 2.3.2), runs the phase: verification commands and at least one review turn, with
-   further fix turns as the verdict directs, up to `self_review.max_iterations`. For
-   `no-change-needed`, the phase's outcome also decides whether the declaration stands or is
-   retracted (Section 2.3.6); a retraction removes the value from step 9 onward and the run
-   continues as if it had exhausted its turn budget with no status file written.
+3. Where `needs-human-review` or `no-change-needed` admits the run to the self-review phase (Section 2.3.2), runs the phase: verification commands and at least one review turn, with further fix turns as the verdict directs, up to `self_review.max_iterations`. For `no-change-needed`, the phase's outcome also decides whether the declaration stands or is retracted (Section 2.3.6); a retraction removes the value from step 9 onward and the run continues as if it had exhausted its turn budget with no status file written.
 4. Stops the agent session.
 5. Runs the `after_run` hook.
 6. Exits the worker run with a normal exit status.
@@ -256,164 +149,78 @@ For all three recognized values, the orchestrator:
 8. Releases the issue claim.
 9. Logs the status token value at `info` level with the issue identifier.
 
-Additionally, for `needs-human-review` and a stood `no-change-needed` declaration: when the
-relevant target state is configured (`tracker.handoff_state` for `needs-human-review`;
-`tracker.no_change_state`, or `tracker.handoff_state` where that field is unset, for
-`no-change-needed`) and the issue is in an active tracker state, the orchestrator attempts the
-handoff transition between steps 6 and 8. See Section 2.3.2 for failure handling and Section 2.3.6
-for the declared run's target resolution.
+Additionally, for `needs-human-review` and a stood `no-change-needed` declaration: when the relevant target state is configured (`tracker.handoff_state` for `needs-human-review`; `tracker.no_change_state`, or `tracker.handoff_state` where that field is unset, for `no-change-needed`) and the issue is in an active tracker state, the orchestrator attempts the handoff transition between steps 6 and 8. See Section 2.3.2 for failure handling and Section 2.3.6 for the declared run's target resolution.
 
-Steps 7 and 8 carry one exception, for `needs-human-review` only. Where the run's
-`tracker.handoff_evidence` verdict withholds that transition and the verification read described in
-Section 2.3.2 does not find the issue in a terminal state, the orchestrator keeps the issue claim
-and schedules a retry on the exponential-backoff failure path. That retry is a failure-path retry
-rather than a continuation retry, so step 2 still holds and the run takes no further turns. Where
-that read does find the issue terminal, steps 7 and 8 apply as written. A stood `no-change-needed`
-declaration is always treated as positive evidence (Section 2.3.6), so this exception never applies
-to it; steps 7 and 8 always hold as written for a stood declaration.
+Steps 7 and 8 carry one exception, for `needs-human-review` only. Where the run's `tracker.handoff_evidence` verdict withholds that transition and the verification read described in Section 2.3.2 does not find the issue in a terminal state, the orchestrator keeps the issue claim and schedules a retry on the exponential-backoff failure path. That retry is a failure-path retry rather than a continuation retry, so step 2 still holds and the run takes no further turns. Where that read does find the issue terminal, steps 7 and 8 apply as written. A stood `no-change-needed` declaration is always treated as positive evidence (Section 2.3.6), so this exception never applies to it; steps 7 and 8 always hold as written for a stood declaration.
 
-For `needs-human-review` and a stood `no-change-needed` declaration, after the orchestrator
-releases the claim, the issue becomes eligible for re-dispatch on a subsequent tracker poll if it
-still satisfies normal dispatch rules (active state, not claimed, not budget-exhausted, not
-parked). For `blocked`, where the dispatch drove issue state, the orchestrator parks the issue
-instead (Section 2.3.1): the issue is held out of dispatch until the orchestrator observes a
-tracker state change or the removal of a confirmed parking label, not merely until it satisfies the
-ordinary rules again.
+For `needs-human-review` and a stood `no-change-needed` declaration, after the orchestrator releases the claim, the issue becomes eligible for re-dispatch on a subsequent tracker poll if it still satisfies normal dispatch rules (active state, not claimed, not budget-exhausted, not parked). For `blocked`, where the dispatch drove issue state, the orchestrator parks the issue instead (Section 2.3.1): the issue is held out of dispatch until the orchestrator observes a tracker state change or the removal of a confirmed parking label, not merely until it satisfies the ordinary rules again.
 
 #### 2.3.4 Last-state-wins semantics
 
-The orchestrator reads the status file once, after the turn completes (Section 3.1). The file's
-contents at the moment of that read determine the signal. If the agent writes `blocked` early in
-the turn and later deletes the file or overwrites it with an empty string before the turn ends,
-the orchestrator sees the final state (absent or empty) and proceeds with default behavior.
-Conversely, if the agent writes `blocked` as its last action in the turn, that value is what the
-orchestrator reads.
+The orchestrator reads the status file once, after the turn completes (Section 3.1). The file's contents at the moment of that read determine the signal. If the agent writes `blocked` early in the turn and later deletes the file or overwrites it with an empty string before the turn ends, the orchestrator sees the final state (absent or empty) and proceeds with default behavior. Conversely, if the agent writes `blocked` as its last action in the turn, that value is what the orchestrator reads.
 
 #### 2.3.5 In-phase meaning of the three values
 
-The self-review phase reads `.sortie/status` again after each review turn and each fix turn
-(Section 3.1). Inside the phase the three values diverge from their meaning outside it.
+The self-review phase reads `.sortie/status` again after each review turn and each fix turn (Section 3.1). Inside the phase the three values diverge from their meaning outside it.
 
-`blocked` aborts the phase. The iteration in progress is recorded as aborted, naming the signal,
-and the run proceeds to its exit as if the phase had produced this outcome directly: the run ends
-as a blocked soft stop whichever of the admissions (Section 2.3.2, Section 2.3.6) brought it into
-the phase. It is consumed at the same point and on the same terms as `needs-human-review` and
-`no-change-needed`: the file is removed before the phase acts on the value, so the abort is not
-visible to a later reader of the file.
+`blocked` aborts the phase. The iteration in progress is recorded as aborted, naming the signal, and the run proceeds to its exit as if the phase had produced this outcome directly: the run ends as a blocked soft stop whichever of the admissions (Section 2.3.2, Section 2.3.6) brought it into the phase. It is consumed at the same point and on the same terms as `needs-human-review` and `no-change-needed`: the file is removed before the phase acts on the value, so the abort is not visible to a later reader of the file.
 
-`needs-human-review` does not end the phase. It is consumed on the same terms as the value that
-admitted the run: the file is removed, and the iteration continues exactly as if the file had
-been absent. Written during a review turn, the verdict file, not the status file, decides what
-the iteration does next. Written during a fix turn, the loop proceeds to re-verification, where
-the next verification commands and review turn decide whether the fix holds. An agent that
-restates `needs-human-review` on every fix turn does not extend the phase past
-`self_review.max_iterations`; the cap still bounds it.
+`needs-human-review` does not end the phase. It is consumed on the same terms as the value that admitted the run: the file is removed, and the iteration continues exactly as if the file had been absent. Written during a review turn, the verdict file, not the status file, decides what the iteration does next. Written during a fix turn, the loop proceeds to re-verification, where the next verification commands and review turn decide whether the fix holds. An agent that restates `needs-human-review` on every fix turn does not extend the phase past `self_review.max_iterations`; the cap still bounds it.
 
-`no-change-needed` is consumed and ignored, on the same terms as `needs-human-review`: written
-during a review turn or a fix turn, the file is removed and the iteration continues exactly as if
-the file had been absent. Writing it in-phase does not end the phase, does not become the run's
-soft-stop reason, and does not convert a turn-budget admission into a declared run. Whether the
-declaration made at the coding-turn read stands or is retracted is decided once, after the phase
-returns, by the rule in Section 2.3.6, not by an in-phase read of this value.
+`no-change-needed` is consumed and ignored, on the same terms as `needs-human-review`: written during a review turn or a fix turn, the file is removed and the iteration continues exactly as if the file had been absent. Writing it in-phase does not end the phase, does not become the run's soft-stop reason, and does not convert a turn-budget admission into a declared run. Whether the declaration made at the coding-turn read stands or is retracted is decided once, after the phase returns, by the rule in Section 2.3.6, not by an in-phase read of this value.
 
 #### 2.3.6 `no-change-needed`
 
-The agent has determined that the requested outcome already held before it began work and that it
-made no change to reach that outcome. Typical causes include: the described bug does not reproduce,
-the requested behavior is already present, or a prior run already completed the task.
+The agent has determined that the requested outcome already held before it began work and that it made no change to reach that outcome. Typical causes include: the described bug does not reproduce, the requested behavior is already present, or a prior run already completed the task.
 
-**Orchestrator behavior:** This value is admitted to the self-review phase on the same terms as
-`needs-human-review` (Section 2.3.2): where `self_review.enabled` is set and the phase's other gate
-conditions hold, the value does not end the run at the read but admits it to the phase, and the run
-ends after the phase with the same exit kind and disposition it would have taken at the read. Where
-self-review is off, or where any gate condition fails, the value ends the run exactly as Section
-2.3.3 describes, with no phase entered.
+**Orchestrator behavior:** This value is admitted to the self-review phase on the same terms as `needs-human-review` (Section 2.3.2): where `self_review.enabled` is set and the phase's other gate conditions hold, the value does not end the run at the read but admits it to the phase, and the run ends after the phase with the same exit kind and disposition it would have taken at the read. Where self-review is off, or where any gate condition fails, the value ends the run exactly as Section 2.3.3 describes, with no phase entered.
 
-The self-review phase's verification commands and review turn are what can falsify this
-declaration. The declaration stands only where the phase confirms it: exactly one recorded
-iteration, ending on a `pass` verdict, with no verification result failing. A phase that ran no
-verification command still confirms, because `self_review.verification_commands` is optional and
-an absent check is not a falsification. Any other phase outcome, including a fix turn that produced
-a second iteration, retracts the declaration: the orchestrator clears it to the empty string and
-the run continues on the ordinary path, exactly as if the run had exhausted its turn budget with no
-status file written.
+The self-review phase's verification commands and review turn are what can falsify this declaration. The declaration stands only where the phase confirms it: exactly one recorded iteration, ending on a `pass` verdict, with no verification result failing. A phase that ran no verification command still confirms, because `self_review.verification_commands` is optional and an absent check is not a falsification. Any other phase outcome, including a fix turn that produced a second iteration, retracts the declaration: the orchestrator clears it to the empty string and the run continues on the ordinary path, exactly as if the run had exhausted its turn budget with no status file written.
 
-Where the declaration stands, it is treated as positive evidence under `tracker.handoff_evidence`: no
-absence verdict is computed, the run is recorded as `succeeded`, no session-failure comment is
-written, no continuation retry is scheduled, the consecutive-absence count is not advanced, that
-count is reset, and a park held for consecutive absences is released. The transition target is
-`tracker.no_change_state` where that field is configured, and `tracker.handoff_state` otherwise;
-where no handoff path applies (Section 3.6), the declaration changes no issue state. A terminal
-tracker state observed at exit keeps its own meaning and is not affected by this value (Section
-2.3.2).
+Where the declaration stands, it is treated as positive evidence under `tracker.handoff_evidence`: no absence verdict is computed, the run is recorded as `succeeded`, no session-failure comment is written, no continuation retry is scheduled, the consecutive-absence count is not advanced, that count is reset, and a park held for consecutive absences is released. The transition target is `tracker.no_change_state` where that field is configured, and `tracker.handoff_state` otherwise; where no handoff path applies (Section 3.6), the declaration changes no issue state. A terminal tracker state observed at exit keeps its own meaning and is not affected by this value (Section 2.3.2).
 
 ### 2.4 Absent file
 
-If the `.sortie/status` file does not exist, the orchestrator proceeds with its default behavior:
-continuation retries are scheduled according to the standard algorithm ([architecture Section 8.4](architecture/08-polling-scheduling-and-reconciliation.md#84-retry-and-backoff)).
+If the `.sortie/status` file does not exist, the orchestrator proceeds with its default behavior: continuation retries are scheduled according to the standard algorithm ([architecture Section 8.4](architecture/08-polling-scheduling-and-reconciliation.md#84-retry-and-backoff)).
 
-File absence is the expected state during normal productive execution. The protocol follows the
-Kubernetes health probe principle: absence of a failure signal is treated as healthy [see
-Section 3.3].
+File absence is the expected state during normal productive execution. The protocol follows the Kubernetes health probe principle: absence of a failure signal is treated as healthy [see Section 3.3].
 
 ### 2.5 Unrecognized values
 
-If the status token is present but does not match any value defined in Section 2.3, the
-orchestrator MUST ignore it and proceed as if the file were absent. A warning-level log entry
-SHOULD be emitted with the unrecognized value and issue identifier.
+If the status token is present but does not match any value defined in Section 2.3, the orchestrator MUST ignore it and proceed as if the file were absent. A warning-level log entry SHOULD be emitted with the unrecognized value and issue identifier.
 
-This rule is the foundation of the protocol's forward compatibility. Newer agents may write
-values that older orchestrators do not understand; the safe default is to ignore the unknown
-and continue.
+This rule is the foundation of the protocol's forward compatibility. Newer agents may write values that older orchestrators do not understand; the safe default is to ignore the unknown and continue.
 
 ### 2.6 Read errors
 
-If the orchestrator encounters any error while reading the status file (permission denied,
-I/O error), it MUST:
+If the orchestrator encounters any error while reading the status file (permission denied, I/O error), it MUST:
 
 1. Log a warning with the error details and issue identifier.
 2. Treat the file as absent (proceed with default behavior).
 
-Read errors MUST NOT cause the worker run to fail. The protocol is advisory; its unavailability
-does not affect core orchestration correctness.
+Read errors MUST NOT cause the worker run to fail. The protocol is advisory; its unavailability does not affect core orchestration correctness.
 
-Non-UTF-8 or binary content is not a read error. The parsing algorithm (Section 2.2) operates on
-raw bytes and does not validate encoding. Binary content that survives the first-line split
-produces a token that will not match any recognized value and is handled as an unrecognized token
-(Section 2.5).
+Non-UTF-8 or binary content is not a read error. The parsing algorithm (Section 2.2) operates on raw bytes and does not validate encoding. Binary content that survives the first-line split produces a token that will not match any recognized value and is handled as an unrecognized token (Section 2.5).
 
 ## 3. Operational semantics
 
 ### 3.1 Read timing
 
-The orchestrator reads the status file **after each completed turn**, before making the
-continuation-turn or retry decision. The read occurs in the worker goroutine, within the turn
-loop described in [architecture Section 16.5](architecture/21-reference-algorithms.md#165-worker-attempt-workspace--prompt--agent).
+The orchestrator reads the status file **after each completed turn**, before making the continuation-turn or retry decision. The read occurs in the worker goroutine, within the turn loop described in [architecture Section 16.5](architecture/21-reference-algorithms.md#165-worker-attempt-workspace--prompt--agent).
 
-The read also happens after each review turn and each fix turn inside the self-review phase
-(Section 2.3.5), on the same terms: after the turn completes, before the phase decides whether
-to continue.
+The read also happens after each review turn and each fix turn inside the self-review phase (Section 2.3.5), on the same terms: after the turn completes, before the phase decides whether to continue.
 
-The read-after-turn timing eliminates race conditions between agent writes and orchestrator
-reads: the agent's turn has completed and the agent process is no longer writing before the
-orchestrator reads the file.
+The read-after-turn timing eliminates race conditions between agent writes and orchestrator reads: the agent's turn has completed and the agent process is no longer writing before the orchestrator reads the file.
 
 #### 3.1.1 Placement relative to tracker state refresh
 
 The status file read is placed **before** the tracker state refresh. This ordering is deliberate:
 
-1. The status file represents the agent's self-assessment: "I cannot make progress." This signal
-   is available immediately after the turn completes, with no network call.
-2. The tracker state refresh requires a network round-trip to the issue tracker API. Performing
-   the status file check first avoids a wasted API call when the agent has already signaled that
-   further work is futile.
-3. If the agent writes `blocked` and the issue is simultaneously in a terminal tracker state,
-   the soft-stop path (no continuation retry, release claim) is the correct outcome for both
-   conditions. No information is lost by short-circuiting before the tracker refresh.
+1. The status file represents the agent's self-assessment: "I cannot make progress." This signal is available immediately after the turn completes, with no network call.
+2. The tracker state refresh requires a network round-trip to the issue tracker API. Performing the status file check first avoids a wasted API call when the agent has already signaled that further work is futile.
+3. If the agent writes `blocked` and the issue is simultaneously in a terminal tracker state, the soft-stop path (no continuation retry, release claim) is the correct outcome for both conditions. No information is lost by short-circuiting before the tracker refresh.
 
-The tracker state refresh remains authoritative for detecting external state changes (e.g., a
-human moved the issue to "Done" while the agent was running). That check executes on every turn
-where the status file does not trigger a soft stop.
+The tracker state refresh remains authoritative for detecting external state changes (e.g., a human moved the issue to "Done" while the agent was running). That check executes on every turn where the status file does not trigger a soft stop.
 
 Pseudo-code placement within the worker turn loop (extending [architecture Section 16.5](architecture/21-reference-algorithms.md#165-worker-attempt-workspace--prompt--agent)):
 
@@ -449,24 +256,15 @@ exit_normal(pending_reason)    // exit handler differentiates (Section 3.6)
 
 The **agent** is the sole writer of the `.sortie/status` file.
 
-The **orchestrator** MUST NOT write to or modify the `.sortie/status` file during a worker run.
-The orchestrator's file-system operations on this path are: the pre-dispatch cleanup
-(Section 3.4); the post-turn read after a coding turn (Section 3.1), which removes nothing; the
-admission removal, when a pending reason admits the run to the self-review phase (Section 3.4);
-and the two in-phase removals, after a review turn and after a fix turn (Section 3.4). Inside the
-self-review phase the file therefore states what the agent has said since the phase last acted on
-it. On a run that never enters the phase, the file states the value the run ended on, since
-nothing removes it between the coding-turn read and teardown.
+The **orchestrator** MUST NOT write to or modify the `.sortie/status` file during a worker run. The orchestrator's file-system operations on this path are: the pre-dispatch cleanup (Section 3.4); the post-turn read after a coding turn (Section 3.1), which removes nothing; the admission removal, when a pending reason admits the run to the self-review phase (Section 3.4); and the two in-phase removals, after a review turn and after a fix turn (Section 3.4). Inside the self-review phase the file therefore states what the agent has said since the phase last acted on it. On a run that never enters the phase, the file states the value the run ended on, since nothing removes it between the coding-turn read and teardown.
 
-The agent creates the `.sortie/` directory and status file as needed. The write is a simple
-file creation or overwrite:
+The agent creates the `.sortie/` directory and status file as needed. The write is a simple file creation or overwrite:
 
 ```sh
 mkdir -p .sortie && echo "blocked" > .sortie/status
 ```
 
-This single shell command is the complete agent-side protocol implementation. No SDK, library,
-or special tooling is required.
+This single shell command is the complete agent-side protocol implementation. No SDK, library, or special tooling is required.
 
 ### 3.3 Safe default semantics
 
@@ -482,22 +280,13 @@ The protocol is designed so that every failure mode degrades to normal orchestra
 | File contains binary/non-UTF-8 data | Normal (first-line parse yields unrecognized token) |
 | `.sortie/` directory does not exist | Normal (file does not exist) |
 
-This exhaustive fail-safe property is a deliberate design choice. In a system managing autonomous
-agents whose behavior is not fully predictable, every advisory channel must degrade gracefully.
-The file-based sentinel is the only mechanism among the six alternatives evaluated (Section 5)
-where all failure modes are unconditionally safe.
+This exhaustive fail-safe property is a deliberate design choice. In a system managing autonomous agents whose behavior is not fully predictable, every advisory channel must degrade gracefully. The file-based sentinel is the only mechanism among the six alternatives evaluated (Section 5) where all failure modes are unconditionally safe.
 
 ### 3.4 Workspace cleanup
 
-The orchestrator MUST delete the `.sortie/status` file, if it exists, **before each new
-dispatch** to a workspace. This prevents stale status signals from a previous run from affecting
-the new dispatch.
+The orchestrator MUST delete the `.sortie/status` file, if it exists, **before each new dispatch** to a workspace. This prevents stale status signals from a previous run from affecting the new dispatch.
 
-The deletion occurs during the worker run initialization, **before** the `before_run` hook
-executes and before the first agent turn begins. This ordering ensures that `before_run` hook
-scripts may write to `.sortie/status` as a pre-condition gate (e.g., a CI readiness check) without
-their output being erased. The cleanup targets only the `status` file; the `.sortie/` directory
-itself is left intact.
+The deletion occurs during the worker run initialization, **before** the `before_run` hook executes and before the first agent turn begins. This ordering ensures that `before_run` hook scripts may write to `.sortie/status` as a pre-condition gate (e.g., a CI readiness check) without their output being erased. The cleanup targets only the `status` file; the `.sortie/` directory itself is left intact.
 
 In the worker lifecycle ([architecture Section 16.5](architecture/21-reference-algorithms.md#165-worker-attempt-workspace--prompt--agent)), the cleanup slot is:
 
@@ -507,13 +296,9 @@ In the worker lifecycle ([architecture Section 16.5](architecture/21-reference-a
 4. Agent session start.
 5. First turn.
 
-The cleanup operation MUST apply the same symlink rejection as the read path (Section 7.2):
-before deleting, verify via `Lstat` that neither `.sortie/` nor `status` is a symbolic link. If
-a symlink is detected, log a warning and skip the deletion — do not follow the link.
+The cleanup operation MUST apply the same symlink rejection as the read path (Section 7.2): before deleting, verify via `Lstat` that neither `.sortie/` nor `status` is a symbolic link. If a symlink is detected, log a warning and skip the deletion — do not follow the link.
 
-A deletion that fails because the file is already absent, or because the `.sortie/` directory
-does not exist, is ignored without a log entry. Any other removal error is logged at warn level
-and ignored.
+A deletion that fails because the file is already absent, or because the `.sortie/` directory does not exist, is ignored without a log entry. Any other removal error is logged at warn level and ignored.
 
 ```
 function pre_dispatch_cleanup(workspace_path):
@@ -526,18 +311,9 @@ function pre_dispatch_cleanup(workspace_path):
         log_warn("status file cleanup failed", workspace_path, err)
 ```
 
-The orchestrator applies this same removal at three further points during a run. On admission to
-the self-review phase (Section 2.3.2), the file is removed for the recognized status value that
-admitted the run, immediately before the phase's first review turn, so the phase's own first read
-does not observe the value that admitted it. Inside the phase, the file is removed again after
-each review turn and after each fix turn, whenever the value read there is recognized (Section
-2.3.5). Every one of these removals applies the same `Lstat` symlink rejection and the same
-tolerance of failure as the pre-dispatch removal; a failed removal does not prevent the phase from
-running and does not change the run's exit.
+The orchestrator applies this same removal at three further points during a run. On admission to the self-review phase (Section 2.3.2), the file is removed for the recognized status value that admitted the run, immediately before the phase's first review turn, so the phase's own first read does not observe the value that admitted it. Inside the phase, the file is removed again after each review turn and after each fix turn, whenever the value read there is recognized (Section 2.3.5). Every one of these removals applies the same `Lstat` symlink rejection and the same tolerance of failure as the pre-dispatch removal; a failed removal does not prevent the phase from running and does not change the run's exit.
 
-The table below states, for each point at which the orchestrator reads or removes the file,
-whether it removes the file for each of the three recognized values and for the unrecognized-or-
-absent case:
+The table below states, for each point at which the orchestrator reads or removes the file, whether it removes the file for each of the three recognized values and for the unrecognized-or-absent case:
 
 | Point | `blocked` | `needs-human-review` | `no-change-needed` | Unrecognized or absent |
 |---|---|---|---|---|
@@ -547,63 +323,31 @@ absent case:
 | Read after a review turn | Removed | Removed | Removed | Not removed |
 | Read after a fix turn | Removed | Removed | Removed | Not removed |
 
-The rule behind this table is a property of the point, not of the value read: whether a point
-removes the file MUST NOT depend on which recognized value was read there, only on whether the
-value is recognized at all. The self-review phase's two reads consume because the point reads
-again: a recognized value read after a review turn or a fix turn is, in the general case, followed
-by a further read inside the same phase, and that later read must not re-observe a value the phase
-has already acted on. This reasoning holds for the in-phase `blocked` case too, even though the
-branch that handles `blocked` ends the phase and reads nothing further; the point still consumes,
-because the answer belongs to the point and not to the value the branch happened to receive. The
-read after a coding turn has no later read behind it, except through the admission to the
-self-review phase, and that case is already covered by the admission removal. The pre-dispatch
-cleanup stands outside this reasoning: it precedes every read of the run and exists to stop one
-run's value from reaching the next, rather than to protect a later read within the same run. The
-difference between the phase's reads and the coding-turn read is therefore a deliberate boundary
-stated here, not an artifact of where a removal call happens to appear in the code.
+The rule behind this table is a property of the point, not of the value read: whether a point removes the file MUST NOT depend on which recognized value was read there, only on whether the value is recognized at all. The self-review phase's two reads consume because the point reads again: a recognized value read after a review turn or a fix turn is, in the general case, followed by a further read inside the same phase, and that later read must not re-observe a value the phase has already acted on. This reasoning holds for the in-phase `blocked` case too, even though the branch that handles `blocked` ends the phase and reads nothing further; the point still consumes, because the answer belongs to the point and not to the value the branch happened to receive. The read after a coding turn has no later read behind it, except through the admission to the self-review phase, and that case is already covered by the admission removal. The pre-dispatch cleanup stands outside this reasoning: it precedes every read of the run and exists to stop one run's value from reaching the next, rather than to protect a later read within the same run. The difference between the phase's reads and the coding-turn read is therefore a deliberate boundary stated here, not an artifact of where a removal call happens to appear in the code.
 
-Because the rule is stated over the five points above and over whether a value is recognized,
-rather than over the values `blocked`, `needs-human-review`, and `no-change-needed` themselves, a
-status value a later protocol version adds inherits each point's answer with no further edit to
-this section:
-consumed at the two in-phase reads, and left in place at the read after a coding turn. What the
-self-review phase does with such a value once it has consumed it is a separate question, settled
-by whichever section defines the value.
+Because the rule is stated over the five points above and over whether a value is recognized, rather than over the values `blocked`, `needs-human-review`, and `no-change-needed` themselves, a status value a later protocol version adds inherits each point's answer with no further edit to this section: consumed at the two in-phase reads, and left in place at the read after a coding turn. What the self-review phase does with such a value once it has consumed it is a separate question, settled by whichever section defines the value.
 
 ### 3.5 Idempotency
 
 The re-dispatch and re-block cycle is an expected operational pattern:
 
 1. Agent writes `blocked` to `.sortie/status`.
-2. Orchestrator reads the signal, exits normally, releases claim, records a park, and applies
-   the parking label.
-3. A human acts on the issue: either moves it to a different tracker state, or removes the
-   parking label the orchestrator has confirmed reached the tracker.
-4. The next poll tick observes the state change or the confirmed label's removal and lifts the
-   park.
+2. Orchestrator reads the signal, exits normally, releases claim, records a park, and applies the parking label.
+3. A human acts on the issue: either moves it to a different tracker state, or removes the parking label the orchestrator has confirmed reached the tracker.
+4. The next poll tick observes the state change or the confirmed label's removal and lifts the park.
 5. If the issue is now active and eligible, the orchestrator dispatches a new worker run for it.
 6. Pre-dispatch cleanup (Section 3.4) removes the stale `.sortie/status` file.
 7. Agent begins fresh work. If still blocked, it writes `blocked` again.
 
-An update to the issue that is neither a state change nor a removal of the confirmed parking
-label, for example adding a comment while leaving both the state and the label untouched, does
-not lift the park.
+An update to the issue that is neither a state change nor a removal of the confirmed parking label, for example adding a comment while leaving both the state and the label untouched, does not lift the park.
 
-Where `tracker.query_filter` excludes the parking label, the label removal in step 3 releases
-nothing. The orchestrator observes labels only on the issues the candidate query returns, so it
-never confirms the label reached the tracker, and an unconfirmed label's absence does not lift
-the park. Such an issue is released by moving it to a different tracker state: the orchestrator
-reads the state of every parked issue the candidate query omits through a separate, filter-free
-tracker call.
+Where `tracker.query_filter` excludes the parking label, the label removal in step 3 releases nothing. The orchestrator observes labels only on the issues the candidate query returns, so it never confirms the label reached the tracker, and an unconfirmed label's absence does not lift the park. Such an issue is released by moving it to a different tracker state: the orchestrator reads the state of every parked issue the candidate query omits through a separate, filter-free tracker call.
 
-The polling interval provides natural rate limiting for this cycle. No additional idempotency
-mechanism is required.
+The polling interval provides natural rate limiting for this cycle. No additional idempotency mechanism is required.
 
 ### 3.6 Interaction with tracker handoff state
 
-The `.sortie/status` file protocol and the `tracker.handoff_state` configuration
-([architecture Section 5.3.1](architecture/05-workflow-specification.md#531-tracker-object)) are **complementary mechanisms** that interact during the worker
-exit phase. The status file value determines whether the handoff transition fires:
+The `.sortie/status` file protocol and the `tracker.handoff_state` configuration ([architecture Section 5.3.1](architecture/05-workflow-specification.md#531-tracker-object)) are **complementary mechanisms** that interact during the worker exit phase. The status file value determines whether the handoff transition fires:
 
 | `.sortie/status` value | Worker exit | Handoff transition | Continuation retry |
 |---|---|---|---|
@@ -613,79 +357,41 @@ exit phase. The status file value determines whether the handoff transition fire
 | absent or unrecognized | Normal | Performed (if configured, issue is active, and the dispatch drives issue state) | Depends on handoff result |
 | (any) | Error | Skipped | Standard error retry |
 
-The parking label the orchestrator applies on a `blocked` park is a non-state write: it marks the
-issue without transitioning it, the same way the handoff transition moves the issue's state
-without touching any label.
+The parking label the orchestrator applies on a `blocked` park is a non-state write: it marks the issue without transitioning it, the same way the handoff transition moves the issue's state without touching any label.
 
-The `needs-human-review` row is additionally subject to the run's `tracker.handoff_evidence`
-verdict
-([architecture Section 7.3](architecture/07-orchestration-state-machine.md#73-transition-triggers)).
-Where the verdict withholds the transition, the orchestrator re-reads the issue's tracker state
-once before recording the outcome. When that read does not find the issue terminal, the issue
-keeps its active state and its claim, the run is recorded as failed with the verdict as its
-reason, and the exit takes the exponential-backoff failure path rather than the row's stated
-retry outcome. When that read does find the issue terminal, the exit releases the claim and
-records `succeeded` instead. A stood `no-change-needed` declaration is tested first and always
-resolves that verdict to work observed (Section 2.3.6), so its row never takes this withheld
-path under any policy value.
+The `needs-human-review` row is additionally subject to the run's `tracker.handoff_evidence` verdict ([architecture Section 7.3](architecture/07-orchestration-state-machine.md#73-transition-triggers)). Where the verdict withholds the transition, the orchestrator re-reads the issue's tracker state once before recording the outcome. When that read does not find the issue terminal, the issue keeps its active state and its claim, the run is recorded as failed with the verdict as its reason, and the exit takes the exponential-backoff failure path rather than the row's stated retry outcome. When that read does find the issue terminal, the exit releases the claim and records `succeeded` instead. A stood `no-change-needed` declaration is tested first and always resolves that verdict to work observed (Section 2.3.6), so its row never takes this withheld path under any policy value.
 
-The semantic distinction drives the difference: `blocked` means the agent cannot proceed, so
-there is no completed work to hand off. `needs-human-review` means the agent completed its work
-and the issue should move to a review state in the tracker. `no-change-needed` means the requested
-outcome already held and the agent changed nothing, so the issue moves to whichever state the
-operator configured for that conclusion.
+The semantic distinction drives the difference: `blocked` means the agent cannot proceed, so there is no completed work to hand off. `needs-human-review` means the agent completed its work and the issue should move to a review state in the tracker. `no-change-needed` means the requested outcome already held and the agent changed nothing, so the issue moves to whichever state the operator configured for that conclusion.
 
 All three values suppress continuation retries and release the issue claim.
 
-When a `handoff_state` is configured and the agent writes `blocked`, the orchestrator skips the
-handoff transition entirely. The issue remains in its current tracker state. This is correct:
-blocked work should not advance in the tracker.
+When a `handoff_state` is configured and the agent writes `blocked`, the orchestrator skips the handoff transition entirely. The issue remains in its current tracker state. This is correct: blocked work should not advance in the tracker.
 
-When a `handoff_state` is configured and the agent writes `needs-human-review`, the orchestrator
-attempts the handoff transition. On success, the issue moves to the configured handoff state. On
-failure (network error, permission denied, nil adapter), the orchestrator logs a warning and
-releases the claim without scheduling a retry.
+When a `handoff_state` is configured and the agent writes `needs-human-review`, the orchestrator attempts the handoff transition. On success, the issue moves to the configured handoff state. On failure (network error, permission denied, nil adapter), the orchestrator logs a warning and releases the claim without scheduling a retry.
 
-When a `handoff_state` is configured and a `no-change-needed` declaration stands, the orchestrator
-attempts the handoff transition to `tracker.no_change_state`, or to `tracker.handoff_state` where
-that field is unset. Failure handling is identical to `needs-human-review`'s. Where no
-`handoff_state` is configured, the declaration changes no issue state, whether or not
-`tracker.no_change_state` is set.
+When a `handoff_state` is configured and a `no-change-needed` declaration stands, the orchestrator attempts the handoff transition to `tracker.no_change_state`, or to `tracker.handoff_state` where that field is unset. Failure handling is identical to `needs-human-review`'s. Where no `handoff_state` is configured, the declaration changes no issue state, whether or not `tracker.no_change_state` is set.
 
-Where the self-review phase runs (Section 2.3.2, Section 2.3.6), it runs before this disposition
-is computed: the phase does not change which row a run takes, but for `needs-human-review` and
-`no-change-needed` on an enabled deployment the phase's verification commands and review turn
-complete first, and an in-phase `blocked` replaces the row the run takes with the `blocked` row.
-For `no-change-needed`, the phase's outcome also decides whether the run keeps that row at all: a
-retraction (Section 2.3.6) moves the run to whichever row an undeclared run with the same
-workspace evidence would take.
+Where the self-review phase runs (Section 2.3.2, Section 2.3.6), it runs before this disposition is computed: the phase does not change which row a run takes, but for `needs-human-review` and `no-change-needed` on an enabled deployment the phase's verification commands and review turn complete first, and an in-phase `blocked` replaces the row the run takes with the `blocked` row. For `no-change-needed`, the phase's outcome also decides whether the run keeps that row at all: a retraction (Section 2.3.6) moves the run to whichever row an undeclared run with the same workspace evidence would take.
 
 ## 4. Prompt integration
 
 ### 4.1 Auto-injection of protocol instructions
 
-The orchestrator SHOULD inject a brief protocol description into the agent's prompt so that the
-agent is aware of the signaling mechanism. This injection:
+The orchestrator SHOULD inject a brief protocol description into the agent's prompt so that the agent is aware of the signaling mechanism. This injection:
 
 - Applies to the **first turn only** of each worker run.
-- Is appended **after** the workflow template has been rendered and **after** any other
-  first-turn suffixes (e.g., tool advertisement). The status protocol instructions appear last
-  in the composed prompt.
-- Is not applied to continuation turns (the instruction is already in the agent's conversation
-  history from turn 1).
+- Is appended **after** the workflow template has been rendered and **after** any other first-turn suffixes (e.g., tool advertisement). The status protocol instructions appear last in the composed prompt.
+- Is not applied to continuation turns (the instruction is already in the agent's conversation history from turn 1).
 
 The ordering of first-turn suffixes is:
 
 1. Rendered workflow template.
-2. Tool advertisement (appears when the session's agent kind and launch mode deliver a
-   tool execution channel and the tool registry is non-empty; omitted otherwise).
+2. Tool advertisement (appears when the session's agent kind and launch mode deliver a tool execution channel and the tool registry is non-empty; omitted otherwise).
 3. Status protocol instructions (this section).
 
-This ordering places the protocol instructions at the end, closest to the agent's point of
-attention, and avoids interleaving with tool documentation.
+This ordering places the protocol instructions at the end, closest to the agent's point of attention, and avoids interleaving with tool documentation.
 
-The injected text SHOULD be concise and imperative. It tells the agent what the file is, when to
-write it, and the exact command to use. It does not explain the orchestrator's internal logic.
+The injected text SHOULD be concise and imperative. It tells the agent what the file is, when to write it, and the exact command to use. It does not explain the orchestrator's internal logic.
 
 Example injection text:
 
@@ -707,54 +413,27 @@ productive work.
 
 ### 4.2 Prompt injection safety
 
-The auto-injected text is a fixed string controlled by the orchestrator, not derived from
-untrusted input (issue descriptions, comments, or labels). It therefore does not introduce
-prompt injection risk beyond what already exists in the workflow template.
+The auto-injected text is a fixed string controlled by the orchestrator, not derived from untrusted input (issue descriptions, comments, or labels). It therefore does not introduce prompt injection risk beyond what already exists in the workflow template.
 
-Workflow authors MAY include their own `.sortie/status` instructions in the workflow template.
-If both the workflow template and the auto-injection contain protocol instructions, the
-auto-injected text appears after the template text. Duplicate instructions are harmless; they
-reinforce the signal.
+Workflow authors MAY include their own `.sortie/status` instructions in the workflow template. If both the workflow template and the auto-injection contain protocol instructions, the auto-injected text appears after the template text. Duplicate instructions are harmless; they reinforce the signal.
 
 ## 5. Design rationale
 
-This section summarizes the architectural alternatives evaluated during the design of this
-protocol and the reasoning behind the selected approach.
+This section summarizes the architectural alternatives evaluated during the design of this protocol and the reasoning behind the selected approach.
 
 ### 5.1 Alternatives considered
 
 Six signaling mechanisms were evaluated against the requirements in Section 1.2:
 
-**Alternative 1: Tracker-mediated signaling.** The agent uses tracker API tools to transition
-the issue to a handoff state; the orchestrator detects the change on the next poll cycle. This
-is the approach used by Symphony (OpenAI) with Linear [15] and GitHub Copilot Agent Mode with the
-GitHub API. It was rejected because it requires tool-calling capability in the agent runtime,
-couples the signaling mechanism to a specific tracker, and conflates the advisory signal ("I am
-blocked") with an authoritative state transition in the tracker.
+**Alternative 1: Tracker-mediated signaling.** The agent uses tracker API tools to transition the issue to a handoff state; the orchestrator detects the change on the next poll cycle. This is the approach used by Symphony (OpenAI) with Linear [15] and GitHub Copilot Agent Mode with the GitHub API. It was rejected because it requires tool-calling capability in the agent runtime, couples the signaling mechanism to a specific tracker, and conflates the advisory signal ("I am blocked") with an authoritative state transition in the tracker.
 
-**Alternative 2: MCP server side-channel.** The orchestrator hosts an MCP server exposing a
-`set_status` tool; the agent calls it via JSON-RPC. Adoption analysis suggests that advanced MCP
-mechanisms beyond basic tool calls remain "shallowly adopted," with 1–2 artifacts per repository
-in a study of 2,926 GitHub projects [4]. This alternative was rejected because it requires MCP
-client support in the agent runtime, violates the agent-agnostic constraint, and introduces MCP
-server lifecycle management complexity.
+**Alternative 2: MCP server side-channel.** The orchestrator hosts an MCP server exposing a `set_status` tool; the agent calls it via JSON-RPC. Adoption analysis suggests that advanced MCP mechanisms beyond basic tool calls remain "shallowly adopted," with 1–2 artifacts per repository in a study of 2,926 GitHub projects [4]. This alternative was rejected because it requires MCP client support in the agent runtime, violates the agent-agnostic constraint, and introduces MCP server lifecycle management complexity.
 
-**Alternative 3: A2A protocol integration.** The orchestrator implements a Google A2A server;
-the agent sends task status updates via A2A. While the protocol has reached 150+ participating
-organizations [2, 3], it was designed for inter-agent peer communication, not for worker-to-
-supervisor advisory signaling. Current coding agent runtimes (Claude Code, Codex CLI, Copilot
-CLI) are not A2A clients. The implementation cost (HTTP server, JSON-RPC stack, SSE streaming)
-constitutes massive overengineering for a single-token advisory signal.
+**Alternative 3: A2A protocol integration.** The orchestrator implements a Google A2A server; the agent sends task status updates via A2A. While the protocol has reached 150+ participating organizations [2, 3], it was designed for inter-agent peer communication, not for worker-to-supervisor advisory signaling. Current coding agent runtimes (Claude Code, Codex CLI, Copilot CLI) are not A2A clients. The implementation cost (HTTP server, JSON-RPC stack, SSE streaming) constitutes massive overengineering for a single-token advisory signal.
 
-**Alternative 4: Unix domain socket / named pipe.** The orchestrator opens a socket in the
-workspace; the agent writes a message to it. Rejected due to platform dependence (UDS on
-Linux/macOS, named pipes on Windows), lack of persistence (data lost if the orchestrator is not
-listening), and the requirement for agents to connect to a socket rather than merely write a file.
+**Alternative 4: Unix domain socket / named pipe.** The orchestrator opens a socket in the workspace; the agent writes a message to it. Rejected due to platform dependence (UDS on Linux/macOS, named pipes on Windows), lack of persistence (data lost if the orchestrator is not listening), and the requirement for agents to connect to a socket rather than merely write a file.
 
-**Alternative 5: Environment variable / return code.** The agent sets an exit code or environment
-variable. Rejected because LLM-based agents cannot control process exit codes, environment
-variables do not cross process boundaries (child cannot set parent's environment), and the
-mechanism offers no persistence.
+**Alternative 5: Environment variable / return code.** The agent sets an exit code or environment variable. Rejected because LLM-based agents cannot control process exit codes, environment variables do not cross process boundaries (child cannot set parent's environment), and the mechanism offers no persistence.
 
 ### 5.2 Decision matrix
 
@@ -768,92 +447,59 @@ mechanism offers no persistence.
 | Forward compatible | Tracker-dep. | Schema ver. | **Ignore-unknown** | Spec ver. | Protocol-dep. | Fixed |
 | Implementation cost | Low | Medium | **Low** | High | Medium | Low |
 
-The file-based sentinel is the only mechanism that satisfies all six requirements from
-Section 1.2 simultaneously.
+The file-based sentinel is the only mechanism that satisfies all six requirements from Section 1.2 simultaneously.
 
 ### 5.3 Precedent in systems engineering
 
 The file-based sentinel pattern has extensive precedent in production systems:
 
-- **Unix PID files.** Programs write their process identifier to a well-known path (typically
-  `/var/run/<name>.pid`) so that other processes can discover and signal them. Raymond [11]
-  describes this as a standard filesystem-based IPC pattern.
+- **Unix PID files.** Programs write their process identifier to a well-known path (typically `/var/run/<name>.pid`) so that other processes can discover and signal them. Raymond [11] describes this as a standard filesystem-based IPC pattern.
 
-- **Makefile sentinel targets.** Build systems use empty marker files to track completion of
-  multi-step build phases, avoiding redundant work on subsequent invocations.
+- **Makefile sentinel targets.** Build systems use empty marker files to track completion of multi-step build phases, avoiding redundant work on subsequent invocations.
 
-- **Kubernetes exec probes.** The `kubelet` determines container health by executing a command
-  that checks for the existence of a file (e.g., `/tmp/healthy`). The probe model is polling-
-  based, fail-safe on absence, and requires zero infrastructure beyond the filesystem.
+- **Kubernetes exec probes.** The `kubelet` determines container health by executing a command that checks for the existence of a file (e.g., `/tmp/healthy`). The probe model is polling-based, fail-safe on absence, and requires zero infrastructure beyond the filesystem.
 
-- **Agent orchestration systems.** OpenCode uses `.orchestra/tasks/{id}.done` and
-  `.orchestra/tasks/{id}.error` as per-task sentinel files for agent-to-orchestrator signaling.
+- **Agent orchestration systems.** OpenCode uses `.orchestra/tasks/{id}.done` and `.orchestra/tasks/{id}.error` as per-task sentinel files for agent-to-orchestrator signaling.
 
 ### 5.4 Theoretical grounding
 
-The protocol's design aligns with several principles from the distributed systems and agent
-orchestration literature:
+The protocol's design aligns with several principles from the distributed systems and agent orchestration literature:
 
-**Loose coupling.** Galster et al. [4] find that in a study of 2,926 GitHub repositories,
-context files (Markdown documents) dominate as the primary configuration mechanism for agentic
-coding tools, while "advanced mechanisms such as Skills and Subagents are only shallowly adopted."
-This confirms that the lowest-common-denominator approach (plain-text files) achieves maximum
-adoption in a fragmented ecosystem.
+**Loose coupling.** Galster et al. [4] find that in a study of 2,926 GitHub repositories, context files (Markdown documents) dominate as the primary configuration mechanism for agentic coding tools, while "advanced mechanisms such as Skills and Subagents are only shallowly adopted." This confirms that the lowest-common-denominator approach (plain-text files) achieves maximum adoption in a fragmented ecosystem.
 
-**Observable signaling.** The "Codified Context" framework [7] describes a three-tier
-infrastructure for AI agents in complex codebases, where routing between tiers occurs through
-observable signals. The `.sortie/status` file serves as an observable signal at the orchestration
-tier, consistent with this architectural pattern.
+**Observable signaling.** The "Codified Context" framework [7] describes a three-tier infrastructure for AI agents in complex codebases, where routing between tiers occurs through observable signals. The `.sortie/status` file serves as an observable signal at the orchestration tier, consistent with this architectural pattern.
 
-**Minimal orchestration complexity.** Google's agent white paper (2025) argues that orchestration
-should begin with a perception-reasoning-action loop of minimal complexity. The protocol adheres
-to this principle: one file, one token, read-after-turn.
+**Minimal orchestration complexity.** Google's agent white paper (2025) argues that orchestration should begin with a perception-reasoning-action loop of minimal complexity. The protocol adheres to this principle: one file, one token, read-after-turn.
 
-**Traceability.** Wang et al.'s work on OpenHands demonstrates that explicit event-stream
-mechanisms provide full traceability of agent actions. The status file is a minimal instance
-of the same principle: an explicit, logged, inspectable signal that becomes part of the run
-history.
+**Traceability.** Wang et al.'s work on OpenHands demonstrates that explicit event-stream mechanisms provide full traceability of agent actions. The status file is a minimal instance of the same principle: an explicit, logged, inspectable signal that becomes part of the run history.
 
 ## 6. Versioning and extensibility
 
 ### 6.1 Version identification
 
-This document specifies version 1 of the protocol. The protocol version is implicit in the set
-of recognized status tokens. There is no explicit version field in the file format.
+This document specifies version 1 of the protocol. The protocol version is implicit in the set of recognized status tokens. There is no explicit version field in the file format.
 
 ### 6.2 Evolution rules
 
 The following rules govern protocol evolution:
 
-1. **New values MAY be added** in future versions. Each new value must be accompanied by a
-   specification of the orchestrator's behavioral response.
+1. **New values MAY be added** in future versions. Each new value must be accompanied by a specification of the orchestrator's behavioral response.
 
-2. **Existing values MUST NOT change meaning.** The semantics of `blocked`, `needs-human-review`,
-   and `no-change-needed` as defined in Section 2.3 are permanent. This permanence covers what each
-   value states about the agent's assessment of the work; it does not fix the orchestrator's
-   scheduling response to a value, which Section 2.3.2 and Section 2.3.6 document as
-   configuration-dependent.
+2. **Existing values MUST NOT change meaning.** The semantics of `blocked`, `needs-human-review`, and `no-change-needed` as defined in Section 2.3 are permanent. This permanence covers what each value states about the agent's assessment of the work; it does not fix the orchestrator's scheduling response to a value, which Section 2.3.2 and Section 2.3.6 document as configuration-dependent.
 
-3. **Values MUST NOT be removed.** An orchestrator must recognize all values from all previous
-   protocol versions.
+3. **Values MUST NOT be removed.** An orchestrator must recognize all values from all previous protocol versions.
 
-4. **Unrecognized values are always ignored.** This is the core forward-compatibility mechanism.
-   A version-1 orchestrator encountering a version-2 token degrades gracefully to default
-   behavior.
+4. **Unrecognized values are always ignored.** This is the core forward-compatibility mechanism. A version-1 orchestrator encountering a version-2 token degrades gracefully to default behavior.
 
-5. **The file format (Section 2.2) is fixed.** Future versions may assign semantics to lines
-   beyond the first, but the first-line parsing algorithm does not change.
+5. **The file format (Section 2.2) is fixed.** Future versions may assign semantics to lines beyond the first, but the first-line parsing algorithm does not change.
 
 ### 6.3 Reserved namespace
 
-The `.sortie/` directory within the workspace is reserved for orchestrator-agent communication
-files. Future extensions may define additional files in this namespace (e.g., `.sortie/metrics`,
-`.sortie/log`). Each new file requires its own specification addendum.
+The `.sortie/` directory within the workspace is reserved for orchestrator-agent communication files. Future extensions may define additional files in this namespace (e.g., `.sortie/metrics`, `.sortie/log`). Each new file requires its own specification addendum.
 
 ### 6.4 Multi-line extension path
 
-Version 1 ignores all lines after the first. A future version may define a structured format
-for additional lines:
+Version 1 ignores all lines after the first. A future version may define a structured format for additional lines:
 
 ```
 blocked
@@ -861,54 +507,31 @@ reason: missing API key STRIPE_SECRET_KEY
 context: checked env, checked .env, checked vault
 ```
 
-Version 1 orchestrators encountering this file will correctly parse the first line as `blocked`
-and ignore the remaining lines. This provides a non-breaking upgrade path to richer signaling
-without changing the wire format.
+Version 1 orchestrators encountering this file will correctly parse the first line as `blocked` and ignore the remaining lines. This provides a non-breaking upgrade path to richer signaling without changing the wire format.
 
 ## 7. Security considerations
 
 ### 7.1 Agent control boundary
 
-The protocol is advisory by design. An agent cannot force the orchestrator to take any specific
-action by writing to `.sortie/status`. The orchestrator's behavioral response to recognized
-values (suppress continuation retries) is a deliberate choice by the orchestrator, not a command
-from the agent.
+The protocol is advisory by design. An agent cannot force the orchestrator to take any specific action by writing to `.sortie/status`. The orchestrator's behavioral response to recognized values (suppress continuation retries) is a deliberate choice by the orchestrator, not a command from the agent.
 
-A malicious or malfunctioning agent that writes `blocked` to every workspace will cause the
-orchestrator to stop retrying those issues. This is the correct behavior: an agent that claims
-to be blocked should not be retried. The operational remedy is the same as for any malfunctioning
-agent: investigate via logs and observability, fix the agent configuration, and re-dispatch
-manually.
+A malicious or malfunctioning agent that writes `blocked` to every workspace will cause the orchestrator to stop retrying those issues. This is the correct behavior: an agent that claims to be blocked should not be retried. The operational remedy is the same as for any malfunctioning agent: investigate via logs and observability, fix the agent configuration, and re-dispatch manually.
 
 ### 7.2 Path containment
 
-The `.sortie/status` file resides within the per-issue workspace directory, which is itself
-contained under `workspace.root` ([architecture Section 9.6](architecture/09-workspace-management-and-safety.md#96-safety-invariants)). The orchestrator reads only this
-specific path. No user-controlled input influences the path construction beyond the issue
-identifier, which is sanitized to `[A-Za-z0-9._-]`.
+The `.sortie/status` file resides within the per-issue workspace directory, which is itself contained under `workspace.root` ([architecture Section 9.6](architecture/09-workspace-management-and-safety.md#96-safety-invariants)). The orchestrator reads only this specific path. No user-controlled input influences the path construction beyond the issue identifier, which is sanitized to `[A-Za-z0-9._-]`.
 
-The orchestrator MUST NOT follow symbolic links when reading the status file. A symlink at the
-status file path, the `.sortie/` directory, or any intermediate component MUST be treated as a
-read error (Section 2.6): log a warning, treat as absent.
+The orchestrator MUST NOT follow symbolic links when reading the status file. A symlink at the status file path, the `.sortie/` directory, or any intermediate component MUST be treated as a read error (Section 2.6): log a warning, treat as absent.
 
-This requirement extends the workspace safety model ([architecture Section 9.6](architecture/09-workspace-management-and-safety.md#96-safety-invariants)) into the
-`.sortie/` namespace. Existing workspace path validation covers the workspace root and per-issue
-directory; the symlink check here adds coverage for files created by the agent inside the
-workspace. Implementation requires `Lstat` checks on the path components leading to the status
-file.
+This requirement extends the workspace safety model ([architecture Section 9.6](architecture/09-workspace-management-and-safety.md#96-safety-invariants)) into the `.sortie/` namespace. Existing workspace path validation covers the workspace root and per-issue directory; the symlink check here adds coverage for files created by the agent inside the workspace. Implementation requires `Lstat` checks on the path components leading to the status file.
 
 ### 7.3 Denial of service
 
-An agent that rapidly creates and overwrites the status file cannot degrade orchestrator
-performance because the orchestrator reads the file at most once per turn, and turn frequency
-is bounded by `agent.turn_timeout_ms`. No filesystem watch or event-driven mechanism is employed;
-the read is strictly poll-based at the turn boundary.
+An agent that rapidly creates and overwrites the status file cannot degrade orchestrator performance because the orchestrator reads the file at most once per turn, and turn frequency is bounded by `agent.turn_timeout_ms`. No filesystem watch or event-driven mechanism is employed; the read is strictly poll-based at the turn boundary.
 
 ### 7.4 Information leakage
 
-The status file contains a single token from a fixed vocabulary. It does not carry secrets,
-credentials, or sensitive data. The token is logged by the orchestrator; this logging does not
-create an information leakage vector.
+The status file contains a single token from a fixed vocabulary. It does not carry secrets, credentials, or sensitive data. The token is logged by the orchestrator; this logging does not create an information leakage vector.
 
 ## 8. Implementation guidance
 
@@ -930,9 +553,7 @@ Any agent runtime that wishes to participate in the protocol MUST:
 
 1. Create the `.sortie/` directory if it does not exist.
 2. Write the status token followed by a newline to `.sortie/status`.
-3. Use atomic write semantics where available (write to temporary file, rename). This is
-   recommended but not required, because the orchestrator reads only after the turn completes,
-   at which point the agent is no longer writing.
+3. Use atomic write semantics where available (write to temporary file, rename). This is recommended but not required, because the orchestrator reads only after the turn completes, at which point the agent is no longer writing.
 
 Minimal implementation:
 
@@ -948,91 +569,59 @@ Operators can inspect the current status signal for any workspace:
 cat /path/to/workspace/.sortie/status
 ```
 
-A missing file or empty output means one of two things: the agent has written nothing since the
-file was last removed, or the orchestrator has already consumed a recognized value the agent
-wrote (Section 3.4). The presence of `blocked`, `needs-human-review`, or `no-change-needed`
-indicates the agent's last assessment, not yet acted on by the orchestrator.
+A missing file or empty output means one of two things: the agent has written nothing since the file was last removed, or the orchestrator has already consumed a recognized value the agent wrote (Section 3.4). The presence of `blocked`, `needs-human-review`, or `no-change-needed` indicates the agent's last assessment, not yet acted on by the orchestrator.
 
 ## 9. Conformance
 
 An implementation conforms to this specification if it satisfies all of the following:
 
-1. The orchestrator reads `.sortie/status` after each completed turn, before the retry decision,
-   and again after each review turn and each fix turn inside the self-review phase per
-   Section 2.3.5.
-2. The orchestrator recognizes `blocked`, `needs-human-review`, and `no-change-needed` per
-   Section 2.3.
+1. The orchestrator reads `.sortie/status` after each completed turn, before the retry decision, and again after each review turn and each fix turn inside the self-review phase per Section 2.3.5.
+2. The orchestrator recognizes `blocked`, `needs-human-review`, and `no-change-needed` per Section 2.3.
 3. The orchestrator ignores unrecognized values per Section 2.5.
 4. The orchestrator handles read errors per Section 2.6.
-5. The orchestrator deletes `.sortie/status` at four points: before each new dispatch; at the
-   moment it acts on a recognized value that admits the run to the self-review phase; after each
-   review turn inside the phase, when the value read is recognized; and after each fix turn
-   inside the phase, when the value read is recognized. All four are per Section 3.4.
-6. The orchestrator never writes to `.sortie/status`, and its only removals of the file are the
-   four named in item 5. In particular: the read after a coding turn removes nothing, for any
-   recognized value, on any deployment (Section 3.2, Section 3.4); and a recognized value read at
-   that point, when the run is not admitted to the self-review phase, remains in the file at
-   teardown (Section 8.3).
+5. The orchestrator deletes `.sortie/status` at four points: before each new dispatch; at the moment it acts on a recognized value that admits the run to the self-review phase; after each review turn inside the phase, when the value read is recognized; and after each fix turn inside the phase, when the value read is recognized. All four are per Section 3.4.
+6. The orchestrator never writes to `.sortie/status`, and its only removals of the file are the four named in item 5. In particular: the read after a coding turn removes nothing, for any recognized value, on any deployment (Section 3.2, Section 3.4); and a recognized value read at that point, when the run is not admitted to the self-review phase, remains in the file at teardown (Section 8.3).
 7. The status file does not trigger tracker state transitions per Section 3.6.
 8. Symbolic links at any path component are treated as read errors per Section 7.2.
-9. Every removal named in item 5, not the pre-dispatch cleanup alone, applies the same `Lstat`
-   symlink rejection, and every one tolerates a failed removal without changing the run's control
-   flow, per Section 3.4.
-10. The orchestrator parks the issue on `blocked` where the dispatch drives issue state, and
-    holds it out of dispatch until it observes a release per Section 2.3.1 and Section 3.5.
+9. Every removal named in item 5, not the pre-dispatch cleanup alone, applies the same `Lstat` symlink rejection, and every one tolerates a failed removal without changing the run's control flow, per Section 3.4.
+10. The orchestrator parks the issue on `blocked` where the dispatch drives issue state, and holds it out of dispatch until it observes a release per Section 2.3.1 and Section 3.5.
 
 ## References
 
-[1] Bridging Protocol and Production: Design Patterns for Deploying AI Agents with MCP.
-    arXiv:2603.13417, 2026.
+[1] Bridging Protocol and Production: Design Patterns for Deploying AI Agents with MCP. arXiv:2603.13417, 2026.
 
 [2] Agent2Agent Protocol Specification. a2a-protocol.org, v0.2.5–v0.3, 2025.
 
 [3] Google Cloud Blog. "Agent2Agent protocol is getting an upgrade." July 2025.
 
-[4] Galster, M. et al. "Configuring Agentic AI Coding Tools: An Exploratory Study."
-    arXiv:2602.14690, 2026.
+[4] Galster, M. et al. "Configuring Agentic AI Coding Tools: An Exploratory Study." arXiv:2602.14690, 2026.
 
-[5] Hassan, A. E. et al. "Agentic Software Engineering: Foundational Pillars and a
-    Research Roadmap." arXiv:2509.06216, 2025.
+[5] Hassan, A. E. et al. "Agentic Software Engineering: Foundational Pillars and a Research Roadmap." arXiv:2509.06216, 2025.
 
-[6] Santos, E. et al. "Decoding the Configuration of AI Coding Agents: Insights from
-    Claude Code Projects." arXiv:2511.09268, 2025.
+[6] Santos, E. et al. "Decoding the Configuration of AI Coding Agents: Insights from Claude Code Projects." arXiv:2511.09268, 2025.
 
-[7] "Codified Context: Infrastructure for AI Agents in a Complex Codebase."
-    arXiv:2602.20478, 2026.
+[7] "Codified Context: Infrastructure for AI Agents in a Complex Codebase." arXiv:2602.20478, 2026.
 
-[8] Chatlatanagulchai, W. et al. "On the Use of Agentic Coding Manifests: An Empirical
-    Study of Claude Code." arXiv:2509.14744, 2025.
+[8] Chatlatanagulchai, W. et al. "On the Use of Agentic Coding Manifests: An Empirical Study of Claude Code." arXiv:2509.14744, 2025.
 
-[9] Ehtesham, A. et al. "A Survey of Agent Interoperability Protocols: MCP, ACP, A2A,
-    and ANP." arXiv, 2025.
+[9] Ehtesham, A. et al. "A Survey of Agent Interoperability Protocols: MCP, ACP, A2A, and ANP." arXiv, 2025.
 
-[10] Anbiaee, S. et al. "Security Threat Modeling for Emerging AI-Agent Protocols."
-     arXiv:2602.11327, 2026.
+[10] Anbiaee, S. et al. "Security Threat Modeling for Emerging AI-Agent Protocols." arXiv:2602.11327, 2026.
 
-[11] Raymond, E. S. *The Art of Unix Programming.* Ch. 7: Multiprogramming, Taxonomy of
-     Unix IPC Methods. 2003.
+[11] Raymond, E. S. *The Art of Unix Programming.* Ch. 7: Multiprogramming, Taxonomy of Unix IPC Methods. 2003.
 
-[12] "Four Design Patterns for Event-Driven Multi-Agent Systems." Confluent / InfoWorld,
-     January 2025.
+[12] "Four Design Patterns for Event-Driven Multi-Agent Systems." Confluent / InfoWorld, January 2025.
 
-[13] Orogat, L. et al. "MAFBench: A Unified Benchmark for Multi-Agent Frameworks."
-     arXiv, 2026.
+[13] Orogat, L. et al. "MAFBench: A Unified Benchmark for Multi-Agent Frameworks." arXiv, 2026.
 
-[14] "A Comprehensive Empirical Evaluation of Agent Frameworks on Code-centric Software
-     Engineering Tasks." arXiv:2511.00872, 2025.
+[14] "A Comprehensive Empirical Evaluation of Agent Frameworks on Code-centric Software Engineering Tasks." arXiv:2511.00872, 2025.
 
-[15] Osmani, A. "Conductors to Orchestrators: The Future of Agentic Coding."
-     O'Reilly Radar / addyosmani.com, 2025–2026.
+[15] Osmani, A. "Conductors to Orchestrators: The Future of Agentic Coding." O'Reilly Radar / addyosmani.com, 2025–2026.
 
-[16] "A Practical Guide for Designing, Developing, and Deploying Production-Grade
-     Agentic AI Workflows." arXiv:2512.08769, 2025.
+[16] "A Practical Guide for Designing, Developing, and Deploying Production-Grade Agentic AI Workflows." arXiv:2512.08769, 2025.
 
 [17] Anthropic. "2026 Agentic Coding Trends Report." resources.anthropic.com, 2026.
 
 ## Acknowledgments
 
-The protocol design was informed by operational experience with Symphony (OpenAI), analysis of
-the MCP and A2A protocol ecosystems, and the empirical studies of agentic coding tool
-configuration by Galster et al. [4], Santos et al. [6], and Chatlatanagulchai et al. [8].
+The protocol design was informed by operational experience with Symphony (OpenAI), analysis of the MCP and A2A protocol ecosystems, and the empirical studies of agentic coding tool configuration by Galster et al. [4], Santos et al. [6], and Chatlatanagulchai et al. [8].

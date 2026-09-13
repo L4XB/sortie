@@ -1,23 +1,12 @@
 ## 11E. Merge Conflict Reaction Contract
 
-The `auto-merge` contract in §11C defers indefinitely when `Mergeability == dirty` (§11C.5); it
-does not act on the conflict. This section defines the complementary contract: the `merge-conflict`
-reaction kind detects that a managed open PR has merge conflicts, dispatches a single rebase-and-resolve
-continuation turn per no-conflict-to-conflict transition, and escalates under an independent episodic
-budget. Like §11B and §11D it is a read-only integration; it never calls `MergePR` or modifies the
-SCM platform state directly.
+The `auto-merge` contract in §11C defers indefinitely when `Mergeability == dirty` (§11C.5); it does not act on the conflict. This section defines the complementary contract: the `merge-conflict` reaction kind detects that a managed open PR has merge conflicts, dispatches a single rebase-and-resolve continuation turn per no-conflict-to-conflict transition, and escalates under an independent episodic budget. Like §11B and §11D it is a read-only integration; it never calls `MergePR` or modifies the SCM platform state directly.
 
-The two kinds coexist on the same PR without interference. Each owns a distinct `pending_reactions`
-entry, `reaction_fingerprints` row, and `reaction_attempts` counter, because every key is composed
-via `ReactionKey(issue_id, kind)` and the fingerprint table primary key is `(issue_id, kind)`.
-There is the same YAML-versus-runtime asymmetry §11C.4 documents for auto-merge: the operator sets
-`reactions.merge_conflicts` in `WORKFLOW.md`, while the runtime and persisted kind discriminator is
-`merge-conflict`.
+The two kinds coexist on the same PR without interference. Each owns a distinct `pending_reactions` entry, `reaction_fingerprints` row, and `reaction_attempts` counter, because every key is composed via `ReactionKey(issue_id, kind)` and the fingerprint table primary key is `(issue_id, kind)`. There is the same YAML-versus-runtime asymmetry §11C.4 documents for auto-merge: the operator sets `reactions.merge_conflicts` in `WORKFLOW.md`, while the runtime and persisted kind discriminator is `merge-conflict`.
 
 ### 11E.1 SCMAdapter interface
 
-Conflict detection reuses the existing `GetMergeability` read. No new method is added to the
-`SCMAdapter` interface. The interface's `PRMergeStatus` return type carries these additive fields:
+Conflict detection reuses the existing `GetMergeability` read. No new method is added to the `SCMAdapter` interface. The interface's `PRMergeStatus` return type carries these additive fields:
 
 ```go
 // PRMergeStatus additions:
@@ -25,112 +14,63 @@ BaseBranch string
 Closed     bool
 ```
 
-`BaseBranch` carries the PR target (base) branch name, for example `"main"` or `"develop"`. Every
-wired adapter populates it from the same pull-request object `GetMergeability` already fetches, at
-no additional request cost: the GitHub and Gitea adapters from that object's base ref, the GitLab
-adapter from the merge request's target branch. Other callers of `GetMergeability` (the auto-merge
-reconcile pass) ignore the new field. Platform-specific field names do not leave the adapter
-package; the orchestrator reads only the domain field.
+`BaseBranch` carries the PR target (base) branch name, for example `"main"` or `"develop"`. Every wired adapter populates it from the same pull-request object `GetMergeability` already fetches, at no additional request cost: the GitHub and Gitea adapters from that object's base ref, the GitLab adapter from the merge request's target branch. Other callers of `GetMergeability` (the auto-merge reconcile pass) ignore the new field. Platform-specific field names do not leave the adapter package; the orchestrator reads only the domain field.
 
-`Closed` reports whether the provider considers the pull request no longer open, populated from the
-same pull-request object at no additional request cost. A provider whose closed state subsumes
-merging reports both, so a caller that wants the closed-without-merge condition tests
-`Closed && !Merged` rather than `Closed` alone. The CI reaction (§11A.9) is the primary reader.
+`Closed` reports whether the provider considers the pull request no longer open, populated from the same pull-request object at no additional request cost. A provider whose closed state subsumes merging reports both, so a caller that wants the closed-without-merge condition tests `Closed && !Merged` rather than `Closed` alone. The CI reaction (§11A.9) is the primary reader.
 
 ### 11E.2 Detection rule
 
-A PR is conflicted when `status.Mergeability == MergeabilityDirty`. `MergeabilityUnknown` is a
-deferral condition (the provider is still computing), not a conflict. The two values MUST NOT be
-conflated: `MergeabilityUnknown` defers at the poll interval without touching the fingerprint or
-the attempt counter, exactly as auto-merge handles it (§11C.5).
+A PR is conflicted when `status.Mergeability == MergeabilityDirty`. `MergeabilityUnknown` is a deferral condition (the provider is still computing), not a conflict. The two values MUST NOT be conflated: `MergeabilityUnknown` defers at the poll interval without touching the fingerprint or the attempt counter, exactly as auto-merge handles it (§11C.5).
 
-Not every adapter can satisfy the rule. The Gitea adapter's single `mergeable` boolean cannot
-separate a conflict from an in-progress recheck, so it maps a conflicted pull request to
-`MergeabilityUnknown` and never to `MergeabilityDirty` (§11C.5). This reaction therefore never arms
-on that provider: its entry takes the U1 deferral on every tick until its age passes the
-configured watch window, which escalates nothing and leaves no tracker-visible signal. A
-deployment that sets the window to `0` leaves such an entry polling until the tracker issue
-reaches a terminal state. Configuration shape is still valid, so neither the offline validator nor
-construction rejects the pairing.
+Not every adapter can satisfy the rule. The Gitea adapter's single `mergeable` boolean cannot separate a conflict from an in-progress recheck, so it maps a conflicted pull request to `MergeabilityUnknown` and never to `MergeabilityDirty` (§11C.5). This reaction therefore never arms on that provider: its entry takes the U1 deferral on every tick until its age passes the configured watch window, which escalates nothing and leaves no tracker-visible signal. A deployment that sets the window to `0` leaves such an entry polling until the tracker issue reaches a terminal state. Configuration shape is still valid, so neither the offline validator nor construction rejects the pairing.
 
 ### 11E.3 Reconcile loop integration
 
-The merge-conflict reconcile pass runs after `reconcileBotReviewComments` and before
-`reconcileAutoMerge` in each poll tick. It is skipped entirely when no `SCMAdapter` is constructed
-or when merge-conflict is not configured.
+The merge-conflict reconcile pass runs after `reconcileBotReviewComments` and before `reconcileAutoMerge` in each poll tick. It is skipped entirely when no `SCMAdapter` is constructed or when merge-conflict is not configured.
 
-The state machine mirrors `reconcileCIStatus` (§11A), not the bot-review or auto-merge loops. The
-defining property: there is no retry-budget check before the `GetMergeability` read. The read runs
-on every due tick so the not-dirty branch (N1, which resets the per-episode attempt counter) is
-always reachable. The budget check and the attempt increment live inside the dirty branch (D1), after
-the precondition guards and the head-SHA dedup. The comparison is strict over-limit
-(`attempts > MaxRetries`), matching `handleCIFailure`.
+The state machine mirrors `reconcileCIStatus` (§11A), not the bot-review or auto-merge loops. The defining property: there is no retry-budget check before the `GetMergeability` read. The read runs on every due tick so the not-dirty branch (N1, which resets the per-episode attempt counter) is always reachable. The budget check and the attempt increment live inside the dirty branch (D1), after the precondition guards and the head-SHA dedup. The comparison is strict over-limit (`attempts > MaxRetries`), matching `handleCIFailure`.
 
 Loop body per `ReactionKindMergeConflict` entry in `state.PendingReactions`:
 
 1. Delete the entry from the map (prevents reprocessing within the same tick).
 2. Type-assert `KindData` to `*MergeConflictReactionData`; on mismatch, log and skip.
-3. Drop the entry when its age, measured from the entry's creation rather than from the last
-   recorded head, exceeds the configured `reactions.merge_conflicts.watch_window_ms` (default
-   `1800000`, thirty minutes; `0` removes the bound).
+3. Drop the entry when its age, measured from the entry's creation rather than from the last recorded head, exceeds the configured `reactions.merge_conflicts.watch_window_ms` (default `1800000`, thirty minutes; `0` removes the bound).
 4. Respect the `PendingRetryAt` poll throttle: if `now < PendingRetryAt`, re-enqueue and continue.
 5. If the entry holds a triage run that has not finished (Section 5.3.9), re-enqueue it ready for the next tick and continue. `GetMergeability` is not called and the pending-backoff counter is untouched.
-6. Call `GetMergeability`. On error, increment the pending-backoff counter, set `PendingRetryAt`,
-   re-enqueue, count `sortie_merge_conflict_checks_total{result="error"}`, and continue.
+6. Call `GetMergeability`. On error, increment the pending-backoff counter, set `PendingRetryAt`, re-enqueue, count `sortie_merge_conflict_checks_total{result="error"}`, and continue.
 7. Switch on `status.Mergeability`:
-   - `MergeabilityUnknown` (U1): re-enqueue at `now + poll_interval`; count `"unknown"`; do not
-     touch the fingerprint or the attempt counter.
+   - `MergeabilityUnknown` (U1): re-enqueue at `now + poll_interval`; count `"unknown"`; do not touch the fingerprint or the attempt counter.
    - `MergeabilityDirty` (D1): apply the dirty-branch logic described in §11E.4 and §11E.5.
-   - All other values (`clean`, `unstable`, `blocked`) (N1): cancel any in-flight triage run, whose fingerprint this branch is about to erase; delete the fingerprint row; delete the
-     per-episode attempt counter (`delete(state.ReactionAttempts, rkey)`); re-enqueue at
-     `now + poll_interval`; count `"clear"`. This closes the episode.
+   - All other values (`clean`, `unstable`, `blocked`) (N1): cancel any in-flight triage run, whose fingerprint this branch is about to erase; delete the fingerprint row; delete the per-episode attempt counter (`delete(state.ReactionAttempts, rkey)`); re-enqueue at `now + poll_interval`; count `"clear"`. This closes the episode.
 
 ### 11E.4 Fingerprint and deduplication
 
-Before any dispatch, the dirty branch applies three precondition guards, in order. All three run
-before any counter increment, so a deferral never burns an attempt:
+Before any dispatch, the dirty branch applies three precondition guards, in order. All three run before any counter increment, so a deferral never burns an attempt:
 
-- **Retry-slot guard**: consult the retry slot (Section 7.5) first, ahead of every other guard. A
-  non-nil incumbent means the branch defers as a whole, re-enqueuing the pending entry unchanged
-  except for a refreshed `CreatedAt` and returning without touching the fingerprint, the counter,
-  or `sortie_merge_conflict_checks_total`.
+- **Retry-slot guard**: consult the retry slot (Section 7.5) first, ahead of every other guard. A non-nil incumbent means the branch defers as a whole, re-enqueuing the pending entry unchanged except for a refreshed `CreatedAt` and returning without touching the fingerprint, the counter, or `sortie_merge_conflict_checks_total`.
 - **D1a**: if `status.HeadSHA == ""`, defer at poll interval (no rebase anchor).
-- **D1b**: if `status.BaseBranch == ""`, defer at poll interval (no rebase target). This is
-  defense-in-depth: every wired adapter always populates `BaseBranch` (§11E.1), so D1b is a safety
-  net rather than a normal-operation path on any of them.
+- **D1b**: if `status.BaseBranch == ""`, defer at poll interval (no rebase target). This is defense-in-depth: every wired adapter always populates `BaseBranch` (§11E.1), so D1b is a safety net rather than a normal-operation path on any of them.
 
-After all three guards pass, the fingerprint is computed as `sha256(headSHA)` and upserted into
-`reaction_fingerprints` with `kind = "merge-conflict"`. The reaction reuses the existing table;
-no migration is required. The fingerprint key `(issue_id, "merge-conflict")` is independent of
-the `"merge"` fingerprint the auto-merge reaction maintains.
+After all three guards pass, the fingerprint is computed as `sha256(headSHA)` and upserted into `reaction_fingerprints` with `kind = "merge-conflict"`. The reaction reuses the existing table; no migration is required. The fingerprint key `(issue_id, "merge-conflict")` is independent of the `"merge"` fingerprint the auto-merge reaction maintains.
 
-When the stored fingerprint matches the computed value and is marked dispatched, the entry is
-re-enqueued at `now + poll_interval` with no increment and no dispatch. This dedup prevents a
-persistent same-head observation from firing multiple continuations while the rebase is in flight.
+When the stored fingerprint matches the computed value and is marked dispatched, the entry is re-enqueued at `now + poll_interval` with no increment and no dispatch. This dedup prevents a persistent same-head observation from firing multiple continuations while the rebase is in flight.
 
-The fingerprint churns on each new push: a new head SHA produces a new fingerprint with
-`dispatched = 0`, so a conflict that persists across a rebase re-arms a new attempt. The N1 branch
-deletes the row entirely when the PR is not dirty, so the first subsequent dirty observation always
-finds `dispatched = 0` and dispatches.
+The fingerprint churns on each new push: a new head SHA produces a new fingerprint with `dispatched = 0`, so a conflict that persists across a rebase re-arms a new attempt. The N1 branch deletes the row entirely when the PR is not dirty, so the first subsequent dirty observation always finds `dispatched = 0` and dispatches.
 
 ### 11E.5 Escalation and episode exits
 
 When the fingerprint dedup passes and `reactions.merge_conflicts.triage` is configured, the triage gate runs before the head-change block, so that block runs once per conflicting head rather than once per pass: replaying it would narrow the attribution window. The first pass to reach the gate with a new head starts the run and re-enqueues the entry at `now + poll_interval`, touching neither the counter nor the attribution boundary. A later pass reading `dispatch-agent`, which is also the fallback for every failure mode, continues to the sequence below. A later pass reading `handled` marks the fingerprint dispatched and re-enqueues at `now + poll_interval`, leaving the per-episode counter untouched and dispatching nothing. A later pass reading `escalate` marks the fingerprint dispatched and invokes `escalateMergeConflictFailure` with the un-incremented counter, which is the previous episode's count when the head is new. The outcome is retained on the entry, so repeated passes over the same head re-apply the stored answer rather than starting a second run, and a memoized `escalate` re-applies as `handled` so no second escalation is posted. A new head discards the retained handle, cancelling the run when it is still in flight, and starts a fresh one.
 
-When the gate proceeds, or when no `triage` block is configured, the per-episode counter increments and the strict over-limit cap
-is checked:
+When the gate proceeds, or when no `triage` block is configured, the per-episode counter increments and the strict over-limit cap is checked:
 
 - `state.ReactionAttempts[rkey]++`; `attempts = state.ReactionAttempts[rkey]`
 - If `attempts > MaxRetries` (default 1): invoke `escalateMergeConflictFailure`.
 - Otherwise: invoke `dispatchMergeConflictContinuation`.
 
-`escalateMergeConflictFailure` applies the configured escalation action (label or comment) in a
-detached `TrackerOpsWg` goroutine with a 30-second timeout, then performs the episode-exit cleanup. Its action, metric label, and cleanup are the same whether the budget or a triage command reached it; only the log message and, on the `comment` action, the posted text differ, and a triage escalation states that the command asked for a person rather than claiming a budget was exhausted.
+`escalateMergeConflictFailure` applies the configured escalation action (label or comment) in a detached `TrackerOpsWg` goroutine with a 30-second timeout, then performs the episode-exit cleanup. Its action, metric label, and cleanup are the same whether the budget or a triage command reached it; only the log message and, on the `comment` action, the posted text differ, and a triage escalation states that the command asked for a person rather than claiming a budget was exhausted.
 
-- `escalation: label` (default): add `escalation_label` (default `needs-human`) to the tracker
-  issue via `TrackerAdapter.AddLabel`.
-- `escalation: comment`: post a plain-text comment naming the PR number and the number of attempts,
-  via `TrackerAdapter.CommentIssue`.
+- `escalation: label` (default): add `escalation_label` (default `needs-human`) to the tracker issue via `TrackerAdapter.AddLabel`.
+- `escalation: comment`: post a plain-text comment naming the PR number and the number of attempts, via `TrackerAdapter.CommentIssue`.
 
 Episode-exit cleanup is identical for both escalation postures. After the action:
 
@@ -140,27 +80,15 @@ DeleteReactionFingerprint(issueID, "merge-conflict")
 delete(state.ReactionAttempts,    ReactionKey(issueID, "merge-conflict"))
 ```
 
-The counter reset is scoped to this kind's own slot, not an issue-wide clear. This makes both
-episode exits symmetric: the N1 branch and the escalation exit each leave the counter deleted, so a
-later independent conflict always opens a fresh episode at `attempts = 1` regardless of which exit
-closed the prior episode.
+The counter reset is scoped to this kind's own slot, not an issue-wide clear. This makes both episode exits symmetric: the N1 branch and the escalation exit each leave the counter deleted, so a later independent conflict always opens a fresh episode at `attempts = 1` regardless of which exit closed the prior episode.
 
-Cross-kind isolation: `escalateMergeConflictFailure` MUST scope all deletions to the `merge-conflict`
-kind only. It MUST NOT call `CancelRetry` or `DeleteRetryEntry`, MUST NOT clear any sibling kind's
-slot, and MUST NOT `delete state.Claimed[issue_id]`. A failed merge-conflict resolution MUST NOT
-invalidate parallel `ci`, `review`, `bot-review`, or `merge` reactions on the same issue. Escalation
-tracker-call failures are logged and counted
-(`sortie_merge_conflict_escalations_total{action="error"}`) but do not block the slot-scoped cleanup.
+Cross-kind isolation: `escalateMergeConflictFailure` MUST scope all deletions to the `merge-conflict` kind only. It MUST NOT call `CancelRetry` or `DeleteRetryEntry`, MUST NOT clear any sibling kind's slot, and MUST NOT `delete state.Claimed[issue_id]`. A failed merge-conflict resolution MUST NOT invalidate parallel `ci`, `review`, `bot-review`, or `merge` reactions on the same issue. Escalation tracker-call failures are logged and counted (`sortie_merge_conflict_escalations_total{action="error"}`) but do not block the slot-scoped cleanup.
 
 ### 11E.6 Continuation data
 
-The retry-slot guard in Section 11E.4 is unaffected by anything in this section: a deferral
-returns before `dispatchMergeConflictContinuation` is ever called, so the `MarkReactionDispatched`
-timing this section describes only ever runs on a tick that actually dispatches.
+The retry-slot guard in Section 11E.4 is unaffected by anything in this section: a deferral returns before `dispatchMergeConflictContinuation` is ever called, so the `MarkReactionDispatched` timing this section describes only ever runs on a tick that actually dispatches.
 
-`dispatchMergeConflictContinuation` schedules a continuation turn via `ScheduleRetry` with the
-prompt key `merge_conflict`, admitted into the slot the guard above already confirmed is free. The
-continuation map contains:
+`dispatchMergeConflictContinuation` schedules a continuation turn via `ScheduleRetry` with the prompt key `merge_conflict`, admitted into the slot the guard above already confirmed is free. The continuation map contains:
 
 | Key | Value |
 |-----|-------|
@@ -169,34 +97,19 @@ continuation map contains:
 | `head_sha` | `status.HeadSHA` at dispatch time |
 | `base` | `status.BaseBranch`, the PR's real target branch, read live from `GetMergeability` on this tick |
 
-`base` is always the PR object's actual base ref, not an assumed default branch. The orchestrator
-already holds the PR object and cannot diverge from the platform's view; the agent does not
-re-derive the base independently. `MarkReactionDispatched` is called on the same tick the
-continuation is scheduled; this is the marker the D1 dedup branch reads in subsequent ticks.
+`base` is always the PR object's actual base ref, not an assumed default branch. The orchestrator already holds the PR object and cannot diverge from the platform's view; the agent does not re-derive the base independently. `MarkReactionDispatched` is called on the same tick the continuation is scheduled; this is the marker the D1 dedup branch reads in subsequent ticks.
 
-The `merge_conflict` key MUST be registered in `prompt.continuationKeys` and seeded to nil in the
-template data map so `Option("missingkey=error")` does not reject templates that reference the
-field when no conflict continuation is active.
+The `merge_conflict` key MUST be registered in `prompt.continuationKeys` and seeded to nil in the template data map so `Option("missingkey=error")` does not reject templates that reference the field when no conflict continuation is active.
 
 ### 11E.7 Seeding and recovery
 
-Worker-exit seeding applies the same metadata predicate `review` and `bot-review` use: an entry is
-created only when `SCMMetadata` reports `pr_number > 0` and non-empty `owner`, `repo`, and
-`branch`. The seeding block runs in the `WorkerExitNormal` branch of `HandleWorkerExit`, after the
-existing auto-merge enqueue block, guarded on `params.SCMAdapter != nil &&
-params.MergeConflictReactionConfigured`. A "create only if absent" guard preserves an in-progress
-pending entry across re-exits, matching the review, bot-review, and auto-merge kinds.
+Worker-exit seeding applies the same metadata predicate `review` and `bot-review` use: an entry is created only when `SCMMetadata` reports `pr_number > 0` and non-empty `owner`, `repo`, and `branch`. The seeding block runs in the `WorkerExitNormal` branch of `HandleWorkerExit`, after the existing auto-merge enqueue block, guarded on `params.SCMAdapter != nil && params.MergeConflictReactionConfigured`. A "create only if absent" guard preserves an in-progress pending entry across re-exits, matching the review, bot-review, and auto-merge kinds.
 
-Startup recovery re-seeds a `merge-conflict` pending entry for recent handoff-stage issues when
-`SCMMetadata` passes the same predicate. The recovered count is surfaced in the startup recovery
-log. Recovery is gated on the configured flag, so a configured-but-providerless setup recovers no
-entries, matching the §11D.6 pattern for bot-review.
+Startup recovery re-seeds a `merge-conflict` pending entry for recent handoff-stage issues when `SCMMetadata` passes the same predicate. The recovered count is surfaced in the startup recovery log. Recovery is gated on the configured flag, so a configured-but-providerless setup recovers no entries, matching the §11D.6 pattern for bot-review.
 
 ### 11E.8 Config and observability
 
-Activation requires `reactions.merge_conflicts.provider` to be non-empty in `WORKFLOW.md`,
-mirroring the `reactions.auto_merge.provider` activation pattern documented in §11C.4. The operator
-omits the block to disable the reaction entirely.
+Activation requires `reactions.merge_conflicts.provider` to be non-empty in `WORKFLOW.md`, mirroring the `reactions.auto_merge.provider` activation pattern documented in §11C.4. The operator omits the block to disable the reaction entirely.
 
 Configuration fields:
 
@@ -208,17 +121,12 @@ Configuration fields:
 | `poll_interval_ms` | `60000` | `>= 30000` |
 | `watch_window_ms` | `1800000` | non-negative and at most `9223372036854`; `0` removes the bound |
 
-The `max_retries` default of 1 is lower than other reaction kinds (which default to 2) because
-merge-conflict resolution by a coding agent is less likely to succeed on a second attempt.
+The `max_retries` default of 1 is lower than other reaction kinds (which default to 2) because merge-conflict resolution by a coding agent is less likely to succeed on a second attempt.
 
 Two metrics counters:
 
-- `sortie_merge_conflict_checks_total{result}`: incremented once per counted reconcile-loop outcome
-  for a due entry. Label values: `dispatched`, `error`, `unknown`, `clear`. Dirty-branch deferrals
-  (empty head SHA, empty base branch, or the same-head dedup early-return) and the escalation path do
-  not increment this counter.
-- `sortie_merge_conflict_escalations_total{action}`: incremented inside the escalation goroutine.
-  Label values: `label`, `comment`, `error`.
+- `sortie_merge_conflict_checks_total{result}`: incremented once per counted reconcile-loop outcome for a due entry. Label values: `dispatched`, `error`, `unknown`, `clear`. Dirty-branch deferrals (empty head SHA, empty base branch, or the same-head dedup early-return) and the escalation path do not increment this counter.
+- `sortie_merge_conflict_escalations_total{action}`: incremented inside the escalation goroutine. Label values: `label`, `comment`, `error`.
 
 ### 11E.9 State machine
 

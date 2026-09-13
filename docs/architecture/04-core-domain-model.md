@@ -26,30 +26,19 @@ Fields:
 - `assignee` (string or null)
   - Assignee identity as provided by the tracker. Used for prompt rendering and observability.
 - `issue_type` (string or null)
-  - Tracker-defined type (for example Bug, Story, Task, Epic). Used for prompt rendering and
-    per-type concurrency limits.
+  - Tracker-defined type (for example Bug, Story, Task, Epic). Used for prompt rendering and per-type concurrency limits.
 - `parent` (object or null)
-  - Parent issue reference for sub-tasks. Relevant for blocking/dependency logic and prompt
-    context.
+  - Parent issue reference for sub-tasks. Relevant for blocking/dependency logic and prompt context.
 - `comments` (list or null)
-  - Comment records containing human feedback, review notes, and prior agent workpad entries.
-    Needed for continuation runs where the agent must understand prior communication.
+  - Comment records containing human feedback, review notes, and prior agent workpad entries. Needed for continuation runs where the agent must understand prior communication.
 - `blocked_by` (list of blocker refs, or null)
-  - Authoritative unless the issue is marked `blockers_unresolved`, in which case the list is
-    whatever its producer last held and is not to be trusted; the dispatch gate treats an
-    unresolved list as blocking, the same conservative rule an unknown blocker state already
-    carries one level down.
-  - Each blocker ref contains four string fields, and an unavailable value is the empty
-    string rather than null. Null is reserved for the `blocked_by` list itself, which is how
-    an unresolved list is distinguished from one that is known to be empty:
+  - Authoritative unless the issue is marked `blockers_unresolved`, in which case the list is whatever its producer last held and is not to be trusted; the dispatch gate treats an unresolved list as blocking, the same conservative rule an unknown blocker state already carries one level down.
+  - Each blocker ref contains four string fields, and an unavailable value is the empty string rather than null. Null is reserved for the `blocked_by` list itself, which is how an unresolved list is distinguished from one that is known to be empty:
     - `id` (string)
     - `identifier` (string)
     - `state` (string)
     - `display_id` (string)
-      - Qualified form of `identifier`, by the same rule the issue's own `display_id` follows.
-        Empty means `identifier` is already display-ready. A blocker ref's identifier
-        fields follow the same rule the issue's own do on every adapter: an adapter that qualifies
-        its issues qualifies its blockers the same way.
+      - Qualified form of `identifier`, by the same rule the issue's own `display_id` follows. Empty means `identifier` is already display-ready. A blocker ref's identifier fields follow the same rule the issue's own do on every adapter: an adapter that qualifies its issues qualifies its blockers the same way.
   - If `blocker.state` is null or unknown, treat it as non-terminal (conservative).
 - `created_at` (timestamp or null)
 - `updated_at` (timestamp or null)
@@ -82,8 +71,7 @@ Filesystem workspace assigned to one issue identifier.
 
 Fields (logical):
 
-- `path` (workspace path; current runtime typically uses absolute paths, but relative roots are
-  possible if configured without path separators)
+- `path` (workspace path; current runtime typically uses absolute paths, but relative roots are possible if configured without path separators)
 - `workspace_key` (sanitized issue identifier)
 - `created_now` (boolean, used to gate `after_create` hook)
 
@@ -102,8 +90,7 @@ Fields (logical):
   - Populated when the attempt finishes. Used for run duration calculation and persistent history.
 - `status`
 - `agent_adapter` (string)
-  - Which agent adapter was used for this attempt. Relevant when multiple agent types are
-    configured.
+  - Which agent adapter was used for this attempt. Relevant when multiple agent types are configured.
 - `error` (optional)
 
 #### 4.1.6 Live Session (Agent Session Metadata)
@@ -113,8 +100,7 @@ State tracked while a coding-agent subprocess is running.
 Fields:
 
 - `session_id` (string)
-  - Opaque string assigned by the agent adapter. For adapters that expose thread/turn concepts,
-    the composition rule (e.g., `<thread_id>-<turn_id>`) is adapter-specific, not universal.
+  - Opaque string assigned by the agent adapter. For adapters that expose thread/turn concepts, the composition rule (e.g., `<thread_id>-<turn_id>`) is adapter-specific, not universal.
 - `thread_id` (string)
 - `turn_id` (string)
 - `agent_pid` (string or null)
@@ -143,14 +129,11 @@ Fields:
 - `timer_handle` (runtime-specific timer reference; runtime-only, not persisted to SQLite)
 - `error` (string or null)
 
-Note: `timer_handle` is a runtime-only field and is not persisted. On restart, pending retries
-are reconstructed from the persisted `due_at` timestamps stored in SQLite.
+Note: `timer_handle` is a runtime-only field and is not persisted. On restart, pending retries are reconstructed from the persisted `due_at` timestamps stored in SQLite.
 
 #### 4.1.8 Orchestrator Runtime State
 
-Single authoritative state owned by the orchestrator. The running map and active timers are
-in-memory for performance; retry_attempts, completed set, and agent_totals are backed by SQLite
-and survive restarts.
+Single authoritative state owned by the orchestrator. The running map and active timers are in-memory for performance; retry_attempts, completed set, and agent_totals are backed by SQLite and survive restarts.
 
 Fields:
 
@@ -162,20 +145,10 @@ Fields:
 - `completed` (set of issue IDs; bookkeeping only, not dispatch gating)
 - `agent_totals` (aggregate tokens + runtime seconds)
 - `agent_rate_limits` (latest rate-limit snapshot from agent events)
-- `reaction_attempts` (map `issue_id:kind -> integer`; number of reaction-fix continuations
-  dispatched per issue and reaction kind; reset when the issue leaves the running/retry maps;
-  runtime-only, not persisted)
-- `pending_reactions` (map `issue_id:kind -> PendingReaction`; populated by worker exit on normal
-  exits with SCM metadata when a CI status provider or SCM adapter is configured, and reconstructed
-  at startup by `RecoverPendingReactions` for eligible handoff-stage runs, including `merge`-kind
-  entries; consumed by per-kind reconcile functions during the reconcile tick: `reconcile_ci_status`
-  for kind `ci`, `reconcile_review_comments` for kind `review`, `reconcile_auto_merge` for kind
-  `merge`; runtime-only, not persisted)
-- `auto_merge_preflight_failed` (boolean): sticky after a startup auth-class preflight failure;
-  cleared only by a successful one-shot transport-class retry or by an orchestrator restart.
-- `auto_merge_preflight_retry_due_at` (timestamp): non-zero only when the startup preflight failed
-  with a transport-class error and scheduled a single bounded retry; cleared by the reconcile tick
-  that consumes the retry.
+- `reaction_attempts` (map `issue_id:kind -> integer`; number of reaction-fix continuations dispatched per issue and reaction kind; reset when the issue leaves the running/retry maps; runtime-only, not persisted)
+- `pending_reactions` (map `issue_id:kind -> PendingReaction`; populated by worker exit on normal exits with SCM metadata when a CI status provider or SCM adapter is configured, and reconstructed at startup by `RecoverPendingReactions` for eligible handoff-stage runs, including `merge`-kind entries; consumed by per-kind reconcile functions during the reconcile tick: `reconcile_ci_status` for kind `ci`, `reconcile_review_comments` for kind `review`, `reconcile_auto_merge` for kind `merge`; runtime-only, not persisted)
+- `auto_merge_preflight_failed` (boolean): sticky after a startup auth-class preflight failure; cleared only by a successful one-shot transport-class retry or by an orchestrator restart.
+- `auto_merge_preflight_retry_due_at` (timestamp): non-zero only when the startup preflight failed with a transport-class error and scheduled a single bounded retry; cleared by the reconcile tick that consumes the retry.
 
 ### 4.2 Stable Identifiers and Normalization Rules
 

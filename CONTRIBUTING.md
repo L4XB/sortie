@@ -1,31 +1,21 @@
 # Contributing to Sortie
 
-Sortie turns issue tracker tickets into autonomous coding agent sessions - a single Go
-binary that orchestrates workspaces, retries, and state reconciliation for AI coding
-agents. The full picture is in the [README](README.md).
+Sortie turns issue tracker tickets into autonomous coding agent sessions - a single Go binary that orchestrates workspaces, retries, and state reconciliation for AI coding agents. The full picture is in the [README](README.md).
 
-The project follows a spec-first model: [docs/architecture.md](docs/architecture.md)
-defines every entity, state machine, and validation rule. The implementation conforms to
-it. This matters because if you are fixing a bug in the orchestrator, the architecture
-doc tells you what the correct behavior *is*. You do not need to reverse-engineer intent
-from the code.
+The project follows a spec-first model: [docs/architecture.md](docs/architecture.md) defines every entity, state machine, and validation rule. The implementation conforms to it. This matters because if you are fixing a bug in the orchestrator, the architecture doc tells you what the correct behavior *is*. You do not need to reverse-engineer intent from the code.
 
 ## Finding something to work on
 
-Browse [open issues](https://github.com/sortie-ai/sortie/issues) and look for the
-labels `good first issue` and `help wanted`. These are curated for newcomers and do not
-require deep familiarity with the codebase.
+Browse [open issues](https://github.com/sortie-ai/sortie/issues) and look for the labels `good first issue` and `help wanted`. These are curated for newcomers and do not require deep familiarity with the codebase.
 
-If nothing catches your eye, test coverage and documentation fixes are always useful and
-require no prior discussion:
+If nothing catches your eye, test coverage and documentation fixes are always useful and require no prior discussion:
 
 ```bash
 # Find packages with low coverage
 make test-coverage | grep -v '100.0%' | sort -k3 -n
 ```
 
-For larger work - new features, new adapters, architectural changes - open an issue
-first to discuss the approach.
+For larger work - new features, new adapters, architectural changes - open an issue first to discuss the approach.
 
 ## Setup
 
@@ -40,11 +30,9 @@ make lint    # golangci-lint
 make fmt     # gofmt + goimports
 ```
 
-All commands go through the Makefile. If `make test` passes, the change is safe to
-submit.
+All commands go through the Makefile. If `make test` passes, the change is safe to submit.
 
-The SQLite dependency is [modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite) -
-a pure-Go driver. No C compiler needed.
+The SQLite dependency is [modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite) -a pure-Go driver. No C compiler needed.
 
 ### Integration tests
 
@@ -61,46 +49,27 @@ SORTIE_CLAUDE_TEST=1 ANTHROPIC_API_KEY="sk-..." \
   make test PKG=./internal/agent/claude/...
 ```
 
-GitHub integration tests also accept an optional `SORTIE_GITHUB_ISSUE_ID` variable
-(a valid issue number in the configured repo) to enable `FetchIssueByID` and
-`FetchIssueStatesByIDs` test cases.
+GitHub integration tests also accept an optional `SORTIE_GITHUB_ISSUE_ID` variable (a valid issue number in the configured repo) to enable `FetchIssueByID` and `FetchIssueStatesByIDs` test cases.
 
-You do not need access to Jira, GitHub, or Claude to contribute. The unit test suite covers the
-vast majority of the codebase.
+You do not need access to Jira, GitHub, or Claude to contribute. The unit test suite covers the vast majority of the codebase.
 
 ## Making a change
 
-**Small changes** (docs, typos, test coverage, bug fixes in a single package): fork,
-fix, test, submit a PR. No ceremony needed.
+**Small changes** (docs, typos, test coverage, bug fixes in a single package): fork, fix, test, submit a PR. No ceremony needed.
 
-**Medium changes** (multi-file bug fixes, new test scenarios, adapter improvements):
-read the relevant section of [docs/architecture.md](docs/architecture.md) before
-implementing. The spec defines what correct behavior looks like, so reading it first
-prevents wasted effort.
+**Medium changes** (multi-file bug fixes, new test scenarios, adapter improvements): read the relevant section of [docs/architecture.md](docs/architecture.md) before implementing. The spec defines what correct behavior looks like, so reading it first prevents wasted effort.
 
-**Large changes** (new features, new adapters, orchestrator changes): open an issue to
-discuss the design before writing code. The architecture doc is the source of truth -
-changes that contradict it will not be merged. If you believe the spec itself should
-change, that is a valid conversation to have in an issue.
+**Large changes** (new features, new adapters, orchestrator changes): open an issue to discuss the design before writing code. The architecture doc is the source of truth -changes that contradict it will not be merged. If you believe the spec itself should change, that is a valid conversation to have in an issue.
 
 ## Code conventions
 
-The linter config in [.golangci.yml](.golangci.yml) catches most issues. Beyond what the
-linter enforces:
+The linter config in [.golangci.yml](.golangci.yml) catches most issues. Beyond what the linter enforces:
 
-- **Naming:** core packages use generic names (`agent_*`, `tracker_*`, `session_*`).
-  Adapter-specific names (`jira_*`, `claude_*`) belong only inside their adapter package.
-- **Errors:** wrap with context (`fmt.Errorf("operation: %w", err)`), no capitals, no
-  trailing punctuation. Use the error categories in `internal/domain/errors.go`.
-- **Logging:** `log/slog` with typed `slog.Attr` constructors. Derive loggers via
-  `logging.WithIssue` and `logging.WithSession`.
-- **Templates:** `Option("missingkey=error")` on every `text/template` - strict mode is
-  mandatory.
-- **Shared adapter helpers:** don't re-implement a helper already extracted to a shared
-  package (`internal/httpkit`, `internal/typeutil`, `internal/issuekit`, or an
-  adapter-family package like `internal/scm/scmcore`). A contract test in
-  `internal/adaptertest` fails `make test` if a tracker, SCM, agent, or notifier package
-  re-declares one of these under a local name.
+- **Naming:** core packages use generic names (`agent_*`, `tracker_*`, `session_*`). Adapter-specific names (`jira_*`, `claude_*`) belong only inside their adapter package.
+- **Errors:** wrap with context (`fmt.Errorf("operation: %w", err)`), no capitals, no trailing punctuation. Use the error categories in `internal/domain/errors.go`.
+- **Logging:** `log/slog` with typed `slog.Attr` constructors. Derive loggers via `logging.WithIssue` and `logging.WithSession`.
+- **Templates:** `Option("missingkey=error")` on every `text/template` - strict mode is mandatory.
+- **Shared adapter helpers:** don't re-implement a helper already extracted to a shared package (`internal/httpkit`, `internal/typeutil`, `internal/issuekit`, or an adapter-family package like `internal/scm/scmcore`). A contract test in `internal/adaptertest` fails `make test` if a tracker, SCM, agent, or notifier package re-declares one of these under a local name.
 
 ## Testing conventions
 
@@ -122,42 +91,27 @@ fix(workspace): reject symlinks escaping workspace root
 test(tracker): cover pagination edge cases in Jira adapter
 ```
 
-PRs use the [template](.github/pull_request_template.md). One logical change per PR.
-CI lints, tests (including on Windows), and builds the binary - all must pass.
+PRs use the [template](.github/pull_request_template.md). One logical change per PR. CI lints, tests (including on Windows), and builds the binary - all must pass.
 
 ## What will not be merged
 
 - CGo or any dependency requiring a C compiler.
 - Adapter-specific logic in core packages (`internal/orchestrator/`, `internal/domain/`).
-- Weakened workspace path containment or input sanitization - these are security
-  boundaries.
+- Weakened workspace path containment or input sanitization - these are security boundaries.
 - Behavior that contradicts [docs/architecture.md](docs/architecture.md).
 - Changes the author cannot explain or justify under review ([see below](#ai-assisted-contributions)).
 
-If you are unsure whether a change fits, open an issue. A five-minute conversation saves
-hours of work.
+If you are unsure whether a change fits, open an issue. A five-minute conversation saves hours of work.
 
 ## AI-assisted contributions
 
-Sortie is primarily developed with AI coding agents. Contributions using AI tools are
-welcome under the same quality bar: the code must be correct, spec-conformant, tested,
-and reviewed by you before submitting. `make test` and `make lint` must pass - not just
-"the agent said it works".
+Sortie is primarily developed with AI coding agents. Contributions using AI tools are welcome under the same quality bar: the code must be correct, spec-conformant, tested, and reviewed by you before submitting. `make test` and `make lint` must pass - not just "the agent said it works".
 
-Whoever opens the pull request owns it. You are accountable for every line you submit
-and for its conformance to the conventions, spec, and tests described here, regardless
-of how the change was produced: by hand, by a teammate, by a contractor, or by an AI
-agent. We have no preference among those. What we do not accept is "the agent decided"
-as the explanation for why a change is the way it is. If you cannot explain a change
-under review, it is not ready to merge. The verification gate is identical for everyone:
-`make lint` and `make test` pass because you ran them and read the output, not because a
-tool reported success.
+Whoever opens the pull request owns it. You are accountable for every line you submit and for its conformance to the conventions, spec, and tests described here, regardless of how the change was produced: by hand, by a teammate, by a contractor, or by an AI agent. We have no preference among those. What we do not accept is "the agent decided" as the explanation for why a change is the way it is. If you cannot explain a change under review, it is not ready to merge. The verification gate is identical for everyone: `make lint` and `make test` pass because you ran them and read the output, not because a tool reported success.
 
 ## Security
 
-Workspace path containment and input sanitization are security boundaries, not
-convenience features. Changes to `internal/workspace/` receive additional scrutiny. If
-you find a vulnerability, report it privately rather than opening a public issue.
+Workspace path containment and input sanitization are security boundaries, not convenience features. Changes to `internal/workspace/` receive additional scrutiny. If you find a vulnerability, report it privately rather than opening a public issue.
 
 ## License
 

@@ -20,119 +20,39 @@ Message formatting requirements:
 
 Handoff-evidence records are part of the required operator surface:
 
-- A withheld verdict whose verification read (§11.5, §14.2) does not find the issue terminal emits
-  a `Warn` record naming the verdict and carrying `turns_completed` plus the resulting
-  `consecutive_absences` count. The standard issue context fields identify the affected issue.
-- A withheld verdict whose verification read does find the issue terminal emits an `Info` record at
-  the read site naming the discarded verdict, its reason, `state_source="verified"`, and
-  `turns_completed`, instead of the `Warn` record above. The terminal disposition's own `Info`
-  record then follows, carrying the verified state and the same `state_source="verified"` value.
-- An `evidence not determinable` verdict emits an `Info` record under both `observed` and `strict`,
-  carrying the policy and `turns_completed`. Under `strict`, the separate withheld warning is also
-  emitted because that policy converts the verdict into the absence disposition, unless the
-  verification read above finds the issue terminal.
+- A withheld verdict whose verification read (§11.5, §14.2) does not find the issue terminal emits a `Warn` record naming the verdict and carrying `turns_completed` plus the resulting `consecutive_absences` count. The standard issue context fields identify the affected issue.
+- A withheld verdict whose verification read does find the issue terminal emits an `Info` record at the read site naming the discarded verdict, its reason, `state_source="verified"`, and `turns_completed`, instead of the `Warn` record above. The terminal disposition's own `Info` record then follows, carrying the verified state and the same `state_source="verified"` value.
+- An `evidence not determinable` verdict emits an `Info` record under both `observed` and `strict`, carrying the policy and `turns_completed`. Under `strict`, the separate withheld warning is also emitted because that policy converts the verdict into the absence disposition, unless the verification read above finds the issue terminal.
 - A run frozen to `tracker.handoff_evidence: off` emits none of these evidence records.
 
-Parking an issue, whichever trigger produced it, emits exactly one `Warn` record, message
-`"issue parked"`, carrying `reason` (`agent_blocked` or `handoff_absence`), `parked_state`
-(the tracker state recorded, empty when unobserved), and `label` (the parking label applied).
-The consecutive-absence ceiling's park additionally carries `consecutive_absences`,
-`absence_ceiling`, and `ceiling_setting` (the dotted configuration path that produced the
-ceiling); a `blocked` park carries none of the three. A failed label write is recorded separately,
-message `"park label write failed"`, at `Warn`, and does not suppress the parking record. Lifting
-a park emits one `Info` record, message `"issue unparked"`, carrying `trigger`
-(`state_changed`, `label_removed`, or `evidence_observed`) and `reason`.
+Parking an issue, whichever trigger produced it, emits exactly one `Warn` record, message `"issue parked"`, carrying `reason` (`agent_blocked` or `handoff_absence`), `parked_state` (the tracker state recorded, empty when unobserved), and `label` (the parking label applied). The consecutive-absence ceiling's park additionally carries `consecutive_absences`, `absence_ceiling`, and `ceiling_setting` (the dotted configuration path that produced the ceiling); a `blocked` park carries none of the three. A failed label write is recorded separately, message `"park label write failed"`, at `Warn`, and does not suppress the parking record. Lifting a park emits one `Info` record, message `"issue unparked"`, carrying `trigger` (`state_changed`, `label_removed`, or `evidence_observed`) and `reason`.
 
-An issue entering the per-issue budget-exhausted set, on either the poll tick's rebuild or the
-retry lane, emits exactly one `Warn` record, message `"candidate held by budget ceiling"`, carrying
-the standard issue context fields plus `reason` (`token_budget` or `session_budget`),
-`used_sessions`, `budget_sessions`, and, when the token ceiling was evaluated for that issue,
-`used_tokens` and `budget_tokens`. It also carries `ceiling_setting`, the dotted configuration
-path of the setting that governs the fired ceiling, when `reason` maps to a known setting; a
-reason with no known governing setting emits no `ceiling_setting` attribute rather than an empty
-or invented one. The record fires once per hold: a tick that re-observes an
-already-announced hold under the same reason emits nothing further, and whichever lane discovers a
-hold is the only one that announces it.
+An issue entering the per-issue budget-exhausted set, on either the poll tick's rebuild or the retry lane, emits exactly one `Warn` record, message `"candidate held by budget ceiling"`, carrying the standard issue context fields plus `reason` (`token_budget` or `session_budget`), `used_sessions`, `budget_sessions`, and, when the token ceiling was evaluated for that issue, `used_tokens` and `budget_tokens`. It also carries `ceiling_setting`, the dotted configuration path of the setting that governs the fired ceiling, when `reason` maps to a known setting; a reason with no known governing setting emits no `ceiling_setting` attribute rather than an empty or invented one. The record fires once per hold: a tick that re-observes an already-announced hold under the same reason emits nothing further, and whichever lane discovers a hold is the only one that announces it.
 
-The in-flight token ceiling adds four records of its own, beyond the hold record above, so
-budget observability covers a run already in flight and not only a re-dispatch that never
-starts. A dispatch emits at most one of the two
-freeze records, never both. A dispatch whose resolved usage arrival reports no figure at all
-emits one `Warn` record, message `"token ceiling cannot bound this run"`, carrying `agent_kind`,
-`usage_arrival`, and `budget_tokens`, and also `error` when the baseline read failed on the same
-dispatch. A dispatch whose arrival does report figures but whose baseline read fails emits one
-`Warn` record instead, message `"prior token spend unknown, token ceiling bounds this session
-only"`, carrying `error` and `budget_tokens`. A run the arrival cannot bound never gets the
-second record, because the ceiling does not bound that session either and saying so would
-contradict the first. A confirming read that fails while a running
-session is over the pre-filter, and whose session has not reached the ceiling on its own spend,
-emits one `Warn` record, message `"in-flight token ceiling check failed, run continues"`,
-carrying `error` and `budget_tokens`, at most once per run regardless of how many failing reads
-follow. A running session the ceiling stops emits one `Warn` record, message `"run stopped by
-token ceiling"`, carrying `reason`, `used_tokens`, `budget_tokens`, `issue_tokens_completed`,
-`session_tokens`, `sum_source`, and `ceiling_setting`, once per run. `sum_source` is
-`confirmed_read` when a read established the completed sum and `session_spend_alone` when the
-session's own spend reached the ceiling and no read was needed; `unmeasured_sessions` joins the
-record only in the first case, because only a read supplies that count.
+The in-flight token ceiling adds four records of its own, beyond the hold record above, so budget observability covers a run already in flight and not only a re-dispatch that never starts. A dispatch emits at most one of the two freeze records, never both. A dispatch whose resolved usage arrival reports no figure at all emits one `Warn` record, message `"token ceiling cannot bound this run"`, carrying `agent_kind`, `usage_arrival`, and `budget_tokens`, and also `error` when the baseline read failed on the same dispatch. A dispatch whose arrival does report figures but whose baseline read fails emits one `Warn` record instead, message `"prior token spend unknown, token ceiling bounds this session only"`, carrying `error` and `budget_tokens`. A run the arrival cannot bound never gets the second record, because the ceiling does not bound that session either and saying so would contradict the first. A confirming read that fails while a running session is over the pre-filter, and whose session has not reached the ceiling on its own spend, emits one `Warn` record, message `"in-flight token ceiling check failed, run continues"`, carrying `error` and `budget_tokens`, at most once per run regardless of how many failing reads follow. A running session the ceiling stops emits one `Warn` record, message `"run stopped by token ceiling"`, carrying `reason`, `used_tokens`, `budget_tokens`, `issue_tokens_completed`, `session_tokens`, `sum_source`, and `ceiling_setting`, once per run. `sum_source` is `confirmed_read` when a read established the completed sum and `session_spend_alone` when the session's own spend reached the ceiling and no read was needed; `unmeasured_sessions` joins the record only in the first case, because only a read supplies that count.
 
-The tracker comment this same hold posts is recorded separately, at the write site rather than
-alongside the log record above. A successful write emits one `Info` record, message
-`"budget hold notice posted"`, carrying the standard issue context fields. A failed write emits
-one `Warn` record, message `"budget hold notice failed"`, carrying the standard issue context
-fields and `error`, and does not suppress the log record above.
+The tracker comment this same hold posts is recorded separately, at the write site rather than alongside the log record above. A successful write emits one `Info` record, message `"budget hold notice posted"`, carrying the standard issue context fields. A failed write emits one `Warn` record, message `"budget hold notice failed"`, carrying the standard issue context fields and `error`, and does not suppress the log record above.
 
-The periodic workspace sweep emits exactly one summary record per pass, at `Info` level, message
-`"sweep: pass complete"`, on every pass that produced a candidate set, including a pass over zero
-keys, a pass whose tracker read failed, and a pass that removed nothing. This is deliberate: a
-sweep that finds nothing to remove and says nothing is indistinguishable from a sweep that is not
-running at all, which is the failure mode this record exists to close. The record carries thirteen
-attributes:
+The periodic workspace sweep emits exactly one summary record per pass, at `Info` level, message `"sweep: pass complete"`, on every pass that produced a candidate set, including a pass over zero keys, a pass whose tracker read failed, and a pass that removed nothing. This is deliberate: a sweep that finds nothing to remove and says nothing is indistinguishable from a sweep that is not running at all, which is the failure mode this record exists to close. The record carries thirteen attributes:
 
-- `candidates`, `excluded_running`, `excluded_retry`, `excluded_reaction`, `removed_terminal`,
-  `removed_age`, `retained_in_window`, `retained_no_activity`, `retained_not_evaluated`, and
-  `failed` are integer counts. The nine counters after `candidates` partition the candidate set, so
-  `candidates` equals their sum on every pass; `retained_not_evaluated` is what makes that identity
-  hold on a pass where the age bound did not evaluate anything.
-- `retention_days` is the configured `workspace.retention_days` value for that pass; `0` means the
-  bound is off.
-- `age_pass` is `"on"` when the age bound evaluated its candidates that pass, `"off"` when
-  `retention_days` is `0` or below the floor (`WorkspaceRetentionMinDays`), and `"unavailable"`
-  when the persistence read is not configured or its query failed.
+- `candidates`, `excluded_running`, `excluded_retry`, `excluded_reaction`, `removed_terminal`, `removed_age`, `retained_in_window`, `retained_no_activity`, `retained_not_evaluated`, and `failed` are integer counts. The nine counters after `candidates` partition the candidate set, so `candidates` equals their sum on every pass; `retained_not_evaluated` is what makes that identity hold on a pass where the age bound did not evaluate anything.
+- `retention_days` is the configured `workspace.retention_days` value for that pass; `0` means the bound is off.
+- `age_pass` is `"on"` when the age bound evaluated its candidates that pass, `"off"` when `retention_days` is `0` or below the floor (`WorkspaceRetentionMinDays`), and `"unavailable"` when the persistence read is not configured or its query failed.
 - `tracker_read` is `"ok"` or `"failed"`.
 
-Each workspace removed by the age bound also emits its own `Info` record, message `"sweep:
-removed expired workspace"`, carrying `workspace_key`, `last_activity` (RFC3339), and `age_days`.
+Each workspace removed by the age bound also emits its own `Info` record, message `"sweep: removed expired workspace"`, carrying `workspace_key`, `last_activity` (RFC3339), and `age_days`.
 
-The `"tick completed"` `Info` record carries four integer attributes for the blocker gate in
-addition to its existing ones: `held_by_blockers`, `blockers_unresolved`, `blockers_not_read`, and
-`blockers_incomplete`, each counting the candidates the tick held for that reason. It also carries
-`budget_exhausted`, the number of this tick's candidates in the per-issue budget-exhausted set
-after the rebuild.
+The `"tick completed"` `Info` record carries four integer attributes for the blocker gate in addition to its existing ones: `held_by_blockers`, `blockers_unresolved`, `blockers_not_read`, and `blockers_incomplete`, each counting the candidates the tick held for that reason. It also carries `budget_exhausted`, the number of this tick's candidates in the per-issue budget-exhausted set after the rebuild.
 
-A candidate the dispatch gate holds for a blocker reason produces exactly one of five per-issue
-records, and a pass whose reads were refused by the forge produces exactly one pass-level record in
-addition:
+A candidate the dispatch gate holds for a blocker reason produces exactly one of five per-issue records, and a pass whose reads were refused by the forge produces exactly one pass-level record in addition:
 
-- Held by a non-terminal blocker: one `Debug` record, message `"candidate held by blocker"`,
-  carrying the issue context fields plus `blocker_identifier` and `blocker_state` for the first
-  non-terminal blocker.
-- Held because its own blocker read was attempted and failed: one `Warn` record, message
-  `"candidate blockers unresolved, holding issue"`, carrying the issue context fields and `error`.
-- Held because the pass had already halted on another candidate's failure: one `Debug` record,
-  message `"candidate blockers not read this tick, pass halted"`, carrying `error_kind` and no
-  `error`, because nothing failed on this candidate.
-- Held because its producer declared the list incomplete, with no read attempted: one `Debug`
-  record, message `"candidate blocker list incomplete, holding issue"`, carrying the issue context
-  fields and no `error`.
-- Held because the pass had already spent its read budget: one `Debug` record, message `"candidate
-  blockers not read this tick, holding issue"`, carrying `reads_spent` and no `error`.
+- Held by a non-terminal blocker: one `Debug` record, message `"candidate held by blocker"`, carrying the issue context fields plus `blocker_identifier` and `blocker_state` for the first non-terminal blocker.
+- Held because its own blocker read was attempted and failed: one `Warn` record, message `"candidate blockers unresolved, holding issue"`, carrying the issue context fields and `error`.
+- Held because the pass had already halted on another candidate's failure: one `Debug` record, message `"candidate blockers not read this tick, pass halted"`, carrying `error_kind` and no `error`, because nothing failed on this candidate.
+- Held because its producer declared the list incomplete, with no read attempted: one `Debug` record, message `"candidate blocker list incomplete, holding issue"`, carrying the issue context fields and no `error`.
+- Held because the pass had already spent its read budget: one `Debug` record, message `"candidate blockers not read this tick, holding issue"`, carrying `reads_spent` and no `error`.
 
-A pass whose reads halted emits exactly one `Error` record, message `"blocker reads halted for this
-tick"`, carrying `error_kind`, `http_status` (`0` when the failure carried none), `operation`
-(`"fetch_blockers"`), and `held_unread`. A tick that dispatches nothing because every blocker read
-it attempted failed transiently, and that did not already emit the pass-level `Error` above, emits
-one additional `Warn` record, message `"tick dispatched nothing: every attempted candidate blocker
-read failed"`, carrying `reads_failed`, the count of reads the pass attempted and lost.
+A pass whose reads halted emits exactly one `Error` record, message `"blocker reads halted for this tick"`, carrying `error_kind`, `http_status` (`0` when the failure carried none), `operation` (`"fetch_blockers"`), and `held_unread`. A tick that dispatches nothing because every blocker read it attempted failed transiently, and that did not already emit the pass-level `Error` above, emits one additional `Warn` record, message `"tick dispatched nothing: every attempted candidate blocker read failed"`, carrying `reads_failed`, the count of reads the pass attempted and lost.
 
 ### 13.2 Logging Outputs and Sinks
 
@@ -142,25 +62,18 @@ Requirements:
 
 - Operators must be able to see startup/validation/dispatch failures without attaching a debugger.
 - Sortie may write to one or more sinks.
-- If a configured log sink fails, Sortie continues running when possible and emits an
-  operator-visible warning through any remaining sink.
+- If a configured log sink fails, Sortie continues running when possible and emits an operator-visible warning through any remaining sink.
 
 ### 13.3 Runtime Snapshot / Monitoring Interface
 
-If the implementation exposes a synchronous runtime snapshot (for dashboards or monitoring), it
-should return:
+If the implementation exposes a synchronous runtime snapshot (for dashboards or monitoring), it should return:
 
 - `running` (list of running session rows)
 - each running row should include `turn_count`
-- each running row should include `tokens_measured`, meaning at least one usage measurement has
-  been reported so far in that session
-- each running row should include `usage_arrival` and `usage_attribution`, the usage-reporting
-  disposition resolved for that session's kind, passthrough, and launch mode, frozen at dispatch
-- each running row should include `tokens_pending`, true only when the frozen arrival settles at
-  most one figure per turn, the session is measured, and the turn that figure would settle for is
-  still in flight
-- each running row should include `api_requests_measured`, true when the row's
-  `api_request_count` is a count of model API requests the session measured
+- each running row should include `tokens_measured`, meaning at least one usage measurement has been reported so far in that session
+- each running row should include `usage_arrival` and `usage_attribution`, the usage-reporting disposition resolved for that session's kind, passthrough, and launch mode, frozen at dispatch
+- each running row should include `tokens_pending`, true only when the frozen arrival settles at most one figure per turn, the session is measured, and the turn that figure would settle for is still in flight
+- each running row should include `api_requests_measured`, true when the row's `api_request_count` is a count of model API requests the session measured
 - `retrying` (list of retry queue rows)
 - `agent_totals`
   - `input_tokens`
@@ -170,16 +83,10 @@ should return:
   - `seconds_running` (aggregate runtime seconds as of snapshot time, including active sessions)
 - `rate_limits` (latest coding-agent rate limit payload, if available)
 - `budget_exhausted_count` (number of issues currently blocked by a re-dispatch budget; always present)
-- `budget_exhausted` (list of blocked-issue records, sorted by identifier; always present, empty
-  when the set is empty). Each record carries the issue's ID and identifier, the reason
-  (`token_budget` or `session_budget`; `token_budget` takes precedence over `session_budget` when
-  one issue reaches both gates), the used and budgeted session and token counts, and the time the
-  hold began. The set is rebuilt per tick from those two gates (Section 8.4) and also updated by
-  the retry lane when it discovers a hold between ticks.
+- `budget_exhausted` (list of blocked-issue records, sorted by identifier; always present, empty when the set is empty). Each record carries the issue's ID and identifier, the reason (`token_budget` or `session_budget`; `token_budget` takes precedence over `session_budget` when one issue reaches both gates), the used and budgeted session and token counts, and the time the hold began. The set is rebuilt per tick from those two gates (Section 8.4) and also updated by the retry lane when it discovers a hold between ticks.
 - `parked_count` (number of issues currently held out of primary dispatch; always present)
 - `parked` (sorted list of parked issue IDs; omitted when the set is empty)
-- `parked_reason` (map from parked issue ID to the park's reason, `agent_blocked` or
-  `handoff_absence`; omitted when the set is empty)
+- `parked_reason` (map from parked issue ID to the park's reason, `agent_blocked` or `handoff_absence`; omitted when the set is empty)
 
 Recommended snapshot error modes:
 
@@ -188,94 +95,40 @@ Recommended snapshot error modes:
 
 ### 13.4 Optional Human-Readable Status Surface
 
-A human-readable status surface is optional and implementation-defined. When the HTTP server is
-enabled (Section 13.7), the HTML dashboard served at `/` (Section 13.7.1) is the concrete
-realization of this surface.
+A human-readable status surface is optional and implementation-defined. When the HTTP server is enabled (Section 13.7), the HTML dashboard served at `/` (Section 13.7.1) is the concrete realization of this surface.
 
-If present, it should draw from orchestrator state/metrics only and must not be required for
-correctness.
+If present, it should draw from orchestrator state/metrics only and must not be required for correctness.
 
-Live status answers what is happening now. A second, offline reporting surface answers what
-happened over a past window: it reads persisted run history without contacting the tracker, the
-coding agent, or a running orchestrator, and summarizes outcomes, durations, turn counts, and token
-spend, optionally grouped by the recorded run attributes and bounded by a time range. It prices
-token spend from the operator-supplied rates in workflow configuration; with no rates configured it
-reports the countable figures and omits cost rather than guessing at one. Because it reads only
-what earlier runs already recorded, a database written by an older schema yields a reduced set of
-figures, and the surface reports which figures it could not derive instead of presenting a zero.
-This surface performs no state mutation and is never required for orchestrator correctness.
+Live status answers what is happening now. A second, offline reporting surface answers what happened over a past window: it reads persisted run history without contacting the tracker, the coding agent, or a running orchestrator, and summarizes outcomes, durations, turn counts, and token spend, optionally grouped by the recorded run attributes and bounded by a time range. It prices token spend from the operator-supplied rates in workflow configuration; with no rates configured it reports the countable figures and omits cost rather than guessing at one. Because it reads only what earlier runs already recorded, a database written by an older schema yields a reduced set of figures, and the surface reports which figures it could not derive instead of presenting a zero. This surface performs no state mutation and is never required for orchestrator correctness.
 
-A figure can be missing for two distinct reasons: the database predates the schema that records
-it, or nothing measured it because the coding agent behind the run reported no token usage. The
-schema tier alone no longer separates the two: a full-tier report can still carry a null `tokens`
-summary or breakdown row when every run in range is unmeasured. `tokens_unmeasured_runs` is the
-field that distinguishes a figure missing for want of a schema from one missing for want of a
-measurement. This supersedes the clause in ADR-0019
-(`docs/decisions/0019-keep-usage-data-on-the-host.md`) stating that `schema_tier` alone tells a
-consumer whether token and cost figures were available at all.
+A figure can be missing for two distinct reasons: the database predates the schema that records it, or nothing measured it because the coding agent behind the run reported no token usage. The schema tier alone no longer separates the two: a full-tier report can still carry a null `tokens` summary or breakdown row when every run in range is unmeasured. `tokens_unmeasured_runs` is the field that distinguishes a figure missing for want of a schema from one missing for want of a measurement. This supersedes the clause in ADR-0019 (`docs/decisions/0019-keep-usage-data-on-the-host.md`) stating that `schema_tier` alone tells a consumer whether token and cost figures were available at all.
 
 ### 13.5 Session Metrics and Token Accounting
 
-A run is measured when the runtime reported at least one usage figure for the session and the
-adapter carried it into the recorded counters, or when the worker never entered an agent turn,
-because a run that launched no agent spent exactly zero. A run is unmeasured when an agent turn
-began and no usage figure ever arrived; its recorded token figures are zero and that zero carries
-no information. A measurement of zero is a measured run whose reported figures are zero, which is
-a legitimate statement recorded as measured.
+A run is measured when the runtime reported at least one usage figure for the session and the adapter carried it into the recorded counters, or when the worker never entered an agent turn, because a run that launched no agent spent exactly zero. A run is unmeasured when an agent turn began and no usage figure ever arrived; its recorded token figures are zero and that zero carries no information. A measurement of zero is a measured run whose reported figures are zero, which is a legitimate statement recorded as measured.
 
-The run record carries this distinction alongside the four token counters. An unmeasured run
-contributes nothing to any token counter and is excluded from cost pricing. It advances no
-Prometheus token counter and creates no series, the same as a run that never emitted a usage
-event.
+The run record carries this distinction alongside the four token counters. An unmeasured run contributes nothing to any token counter and is excluded from cost pricing. It advances no Prometheus token counter and creates no series, the same as a run that never emitted a usage event.
 
 Token accounting rules:
 
-- Agent adapters normalize token counts before emitting events. The orchestrator receives
-  `{input_tokens, output_tokens, total_tokens, cache_read_tokens}` directly.
-- For absolute totals, track deltas relative to last reported totals to avoid double-counting.
-  The `cache_read_tokens` field follows the same cumulative-delta accounting as
-  `input_tokens` / `output_tokens`. Deltas are accumulated from any event carrying a non-zero
-  usage payload, not only `token_usage` events, so an adapter can attach the authoritative
-  run-cumulative snapshot to a turn-finalization event without losing it.
-- `api_request_count` is incremented monotonically, and only, per `token_usage` event; a
-  usage-bearing terminal event does not count as an additional request. The count is a
-  measurement of API requests only when the session's resolved `usage_arrival` is `incremental`
-  and either a figure has arrived or no turn has begun. A kind resolving `turn_end` settles the
-  count at most once per turn and never measures requests, and a session whose runtime stopped
-  delivering per-request figures reports the count as unmeasured rather than as zero, so a
-  consumer never reads a fabricated zero where the declaration alone promised a request count.
-- `tokens_pending` distinguishes a settled figure from one still in flight: it is true only when
-  the resolved `usage_arrival` is `turn_end`, the session is measured, and the turn that figure
-  would settle for has not yet reached a terminal event. A consumer presenting the current token
-  total alongside this flag can tell an operator the figure excludes the turn in progress, rather
-  than presenting a stale total as final.
+- Agent adapters normalize token counts before emitting events. The orchestrator receives `{input_tokens, output_tokens, total_tokens, cache_read_tokens}` directly.
+- For absolute totals, track deltas relative to last reported totals to avoid double-counting. The `cache_read_tokens` field follows the same cumulative-delta accounting as `input_tokens` / `output_tokens`. Deltas are accumulated from any event carrying a non-zero usage payload, not only `token_usage` events, so an adapter can attach the authoritative run-cumulative snapshot to a turn-finalization event without losing it.
+- `api_request_count` is incremented monotonically, and only, per `token_usage` event; a usage-bearing terminal event does not count as an additional request. The count is a measurement of API requests only when the session's resolved `usage_arrival` is `incremental` and either a figure has arrived or no turn has begun. A kind resolving `turn_end` settles the count at most once per turn and never measures requests, and a session whose runtime stopped delivering per-request figures reports the count as unmeasured rather than as zero, so a consumer never reads a fabricated zero where the declaration alone promised a request count.
+- `tokens_pending` distinguishes a settled figure from one still in flight: it is true only when the resolved `usage_arrival` is `turn_end`, the session is measured, and the turn that figure would settle for has not yet reached a terminal event. A consumer presenting the current token total alongside this flag can tell an operator the figure excludes the turn in progress, rather than presenting a stale total as final.
 - Accumulate aggregate totals in orchestrator state (`agent_totals`).
-- At session exit, the session's token totals are written to the `run_history` row alongside
-  the aggregate update. The run's final usage is reconciled from the worker result before that
-  row is written, so a dropped or late event cannot lower the recorded total. The per-issue
-  token budget (`agent.max_tokens`) sums `run_history` `total_tokens` per issue; the in-flight
-  lane adds the running session's live in-memory total, which is not the same figure the
-  `cost_budget` tool reads. The tool adds the running session's recorded `session_metadata`
-  total instead, written at most once per throttled write interval, so its advisory reading
-  trails the in-flight lane's enforced figure by up to that interval.
+- At session exit, the session's token totals are written to the `run_history` row alongside the aggregate update. The run's final usage is reconciled from the worker result before that row is written, so a dropped or late event cannot lower the recorded total. The per-issue token budget (`agent.max_tokens`) sums `run_history` `total_tokens` per issue; the in-flight lane adds the running session's live in-memory total, which is not the same figure the `cost_budget` tool reads. The tool adds the running session's recorded `session_metadata` total instead, written at most once per throttled write interval, so its advisory reading trails the in-flight lane's enforced figure by up to that interval.
 
 Timing accounting rules:
 
-- `api_time_ms` is the cumulative LLM API wait time in milliseconds for the session.
-  Accumulated from `api_duration_ms` fields on any agent event that carries timing data.
-- `tool_time_ms` is the cumulative tool execution time in milliseconds.
-  Accumulated from `tool_result` events that carry `duration_ms`.
-- `tool_time_percent` and `api_time_percent` are computed at render time as
-  `(cumulative_ms / session_elapsed_ms) * 100`. Displayed as null/"N/A" when no timing
-  data has been received.
+- `api_time_ms` is the cumulative LLM API wait time in milliseconds for the session. Accumulated from `api_duration_ms` fields on any agent event that carries timing data.
+- `tool_time_ms` is the cumulative tool execution time in milliseconds. Accumulated from `tool_result` events that carry `duration_ms`.
+- `tool_time_percent` and `api_time_percent` are computed at render time as `(cumulative_ms / session_elapsed_ms) * 100`. Displayed as null/"N/A" when no timing data has been received.
 
 Runtime accounting:
 
 - Runtime should be reported as a live aggregate at snapshot/render time.
-- Sortie maintains a cumulative counter for ended sessions and adds active-session elapsed time
-  derived from `running` entries (for example `started_at`) when producing a snapshot/status view.
-- Add run duration seconds to the cumulative ended-session runtime when a session ends (normal exit
-  or cancellation/termination).
+- Sortie maintains a cumulative counter for ended sessions and adds active-session elapsed time derived from `running` entries (for example `started_at`) when producing a snapshot/status view.
+- Add run duration seconds to the cumulative ended-session runtime when a session ends (normal exit or cancellation/termination).
 - Continuous background ticking of runtime totals is not required.
 
 Rate-limit tracking:
@@ -294,37 +147,25 @@ If implemented:
 
 ### 13.7 HTTP Server
 
-Sortie includes an embedded HTTP server for observability and operational control. The
-server starts unconditionally on port **7678** unless explicitly disabled. It is not
-required for orchestrator correctness, but its absence silently removes health probes,
-Prometheus metrics, and the dashboard.
+Sortie includes an embedded HTTP server for observability and operational control. The server starts unconditionally on port **7678** unless explicitly disabled. It is not required for orchestrator correctness, but its absence silently removes health probes, Prometheus metrics, and the dashboard.
 
 Enablement and configuration:
 
 - The HTTP server starts by default on `127.0.0.1:7678` with no flags required.
 - `--port N` overrides the listening port. Port `0` disables the server entirely.
-- `--host ADDR` overrides the bind address. `ADDR` must be a parseable IP address.
-  Default: `127.0.0.1`. Container deployments use `0.0.0.0`.
-- `server.port` and `server.host` extension keys provide the same overrides via workflow
-  front matter. CLI flags take precedence over extension keys.
+- `--host ADDR` overrides the bind address. `ADDR` must be a parseable IP address. Default: `127.0.0.1`. Container deployments use `0.0.0.0`.
+- `server.port` and `server.host` extension keys provide the same overrides via workflow front matter. CLI flags take precedence over extension keys.
 - `server.port` must be an integer in the range 1–65535, or `0` to disable.
 - `server.host` must be a parseable IP address string. DNS hostnames are not accepted.
-- When the default port (7678) is occupied and the operator did not explicitly request a
-  port (`--port` absent, `server.port` extension absent), Sortie logs a warning and starts
-  without the HTTP server; the orchestrator continues normally. When the operator explicitly
-  requested a port (via `--port` or `server.port`) and it is already in use, Sortie exits
-  with code 1 and a descriptive error. No automatic port selection occurs.
+- When the default port (7678) is occupied and the operator did not explicitly request a port (`--port` absent, `server.port` extension absent), Sortie logs a warning and starts without the HTTP server; the orchestrator continues normally. When the operator explicitly requested a port (via `--port` or `server.port`) and it is already in use, Sortie exits with code 1 and a descriptive error. No automatic port selection occurs.
 - The `--dry-run` flag suppresses server startup regardless of port or host settings.
 - Changes to HTTP listener settings require restart (hot-rebind is not supported).
 
 #### 13.7.1 Human-Readable Dashboard (`/`)
 
 - Host a human-readable dashboard at `/`.
-- The returned document should depict the current state of the system (for example active sessions,
-  retry delays, token consumption, runtime totals, recent events, health/error indicators, and run
-  history from SQLite).
-- It is up to the implementation whether this is server-generated HTML or a client-side app that
-  consumes the JSON API below.
+- The returned document should depict the current state of the system (for example active sessions, retry delays, token consumption, runtime totals, recent events, health/error indicators, and run history from SQLite).
+- It is up to the implementation whether this is server-generated HTML or a client-side app that consumes the JSON API below.
 
 #### 13.7.2 JSON REST API (`/api/v1/*`)
 
@@ -333,8 +174,7 @@ Provide a JSON REST API under `/api/v1/*` for current runtime state and operatio
 Minimum endpoints:
 
 - `GET /api/v1/state`
-  - Returns a summary view of the current system state (running sessions, retry queue/delays,
-    aggregate token/runtime totals, latest rate limits, and any additional tracked summary fields).
+  - Returns a summary view of the current system state (running sessions, retry queue/delays, aggregate token/runtime totals, latest rate limits, and any additional tracked summary fields).
   - Suggested response shape:
 
     ```json
@@ -408,8 +248,7 @@ Minimum endpoints:
     ```
 
 - `GET /api/v1/<issue_identifier>`
-  - Returns issue-specific runtime/debug details for the identified issue, including any information
-    tracked that is useful for debugging.
+  - Returns issue-specific runtime/debug details for the identified issue, including any information tracked that is useful for debugging.
   - Suggested response shape:
 
     ```json
@@ -468,17 +307,11 @@ Minimum endpoints:
     }
     ```
 
-  - `status` is `"running"` when the issue has a running session, otherwise `"retrying"` when it has
-    a pending retry, otherwise `"budget_exhausted"` when it is held out of dispatch by a per-issue
-    budget ceiling; `budget_exhausted` in the response body carries the same record shape as the
-    `budget_exhausted` array on `GET /api/v1/state` and is `null` when the issue is not in that set.
-  - If the issue is unknown to the current in-memory state, return `404` with an error response
-    (for example `{"error":{"code":"issue_not_found","message":"..."}}`); an issue held by a budget
-    ceiling is not unknown to it, so this case is distinct from that one.
+  - `status` is `"running"` when the issue has a running session, otherwise `"retrying"` when it has a pending retry, otherwise `"budget_exhausted"` when it is held out of dispatch by a per-issue budget ceiling; `budget_exhausted` in the response body carries the same record shape as the `budget_exhausted` array on `GET /api/v1/state` and is `null` when the issue is not in that set.
+  - If the issue is unknown to the current in-memory state, return `404` with an error response (for example `{"error":{"code":"issue_not_found","message":"..."}}`); an issue held by a budget ceiling is not unknown to it, so this case is distinct from that one.
 
 - `POST /api/v1/refresh`
-  - Queues an immediate tracker poll + reconciliation cycle (best-effort trigger; implementations
-    may coalesce repeated requests).
+  - Queues an immediate tracker poll + reconciliation cycle (best-effort trigger; implementations may coalesce repeated requests).
   - Suggested request body: empty body or `{}`.
   - Suggested response (`202 Accepted`) shape:
 
@@ -495,37 +328,22 @@ API design notes:
 
 - The JSON shapes above are the recommended baseline for interoperability and debugging ergonomics.
 - Implementations may add fields, but should avoid breaking existing fields within a version.
-- On a running row, `api_request_count` is `null` exactly when `api_requests_measured` is false,
-  the four members of `tokens` are `null` exactly when `tokens_measured` is false, and
-  `requests_by_model` is absent on the first condition and when the attribution names no model.
-- Sortie deviates from the field-stability note above for those five figures, narrowing each from
-  an integer to a nullable one, because a consumer reading a number cannot tell a measured zero
-  from an unmeasured one. A typed consumer is forced to handle the null; an untyped one, in a
-  language where `null` coerces to `0` in arithmetic, is no worse off than it was.
+- On a running row, `api_request_count` is `null` exactly when `api_requests_measured` is false, the four members of `tokens` are `null` exactly when `tokens_measured` is false, and `requests_by_model` is absent on the first condition and when the attribution names no model.
+- Sortie deviates from the field-stability note above for those five figures, narrowing each from an integer to a nullable one, because a consumer reading a number cannot tell a measured zero from an unmeasured one. A typed consumer is forced to handle the null; an untyped one, in a language where `null` coerces to `0` in arithmetic, is no worse off than it was.
 - Endpoints should be read-only except for operational triggers like `/refresh`.
 - Unsupported methods on defined routes should return `405 Method Not Allowed`.
 - API errors should use a JSON envelope such as `{"error":{"code":"...","message":"..."}}`.
-- If the dashboard is a client-side app, it should consume this API rather than duplicating state
-  logic.
+- If the dashboard is a client-side app, it should consume this API rather than duplicating state logic.
 
 #### 13.7.3 Prometheus Metrics Endpoint (`/metrics`)
 
-When the HTTP server is enabled, Sortie exposes a Prometheus exposition-format scrape endpoint at
-`/metrics`, backed by a dedicated registry so the process exports only its own series and none of
-the runtime's defaults. See ADR-0008. The endpoint is co-located with the JSON
-API and HTML dashboard on the same address and port; no separate configuration is required.
+When the HTTP server is enabled, Sortie exposes a Prometheus exposition-format scrape endpoint at `/metrics`, backed by a dedicated registry so the process exports only its own series and none of the runtime's defaults. See ADR-0008. The endpoint is co-located with the JSON API and HTML dashboard on the same address and port; no separate configuration is required.
 
 Implementation requirements:
 
-- Use a dedicated `prometheus.Registry` (not the global default) to prevent pollution from
-  unrelated collectors and to enable isolated test assertions.
-- Register the handler via `promhttp.InstrumentMetricHandler(registry, promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))`.
-  `InstrumentMetricHandler` wraps `HandlerFor` and registers `promhttp_metric_handler_*` counters
-  on the same dedicated registry automatically, ensuring scrape self-instrumentation appears in
-  scrape output rather than landing silently on the global default.
-- Register standard Go runtime and process collectors (`collectors.NewGoCollector`,
-  `collectors.NewProcessCollector`) on the dedicated registry so that `go_*` and `process_*`
-  metrics appear in scrape output alongside Sortie's own metrics.
+- Use a dedicated `prometheus.Registry` (not the global default) to prevent pollution from unrelated collectors and to enable isolated test assertions.
+- Register the handler via `promhttp.InstrumentMetricHandler(registry, promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))`. `InstrumentMetricHandler` wraps `HandlerFor` and registers `promhttp_metric_handler_*` counters on the same dedicated registry automatically, ensuring scrape self-instrumentation appears in scrape output rather than landing silently on the global default.
+- Register standard Go runtime and process collectors (`collectors.NewGoCollector`, `collectors.NewProcessCollector`) on the dedicated registry so that `go_*` and `process_*` metrics appear in scrape output alongside Sortie's own metrics.
 
 Defined metrics (label sets and buckets are specified here; see ADR-0008 for historical rationale):
 
@@ -569,15 +387,6 @@ Defined metrics (label sets and buckets are specified here; see ADR-0008 for his
 
 ### 13.8 Self-Review Observability on an Admitting Status Signal
 
-A run that ends on the `needs-human-review` status signal, or on a `no-change-needed` declaration,
-and passes through the self-review phase records review metadata on `run_history` exactly as a run
-that reached the phase by exhausting the turn budget does: the JSON document under
-`review_metadata`, described in Section 19, carries a value rather than null for this population.
+A run that ends on the `needs-human-review` status signal, or on a `no-change-needed` declaration, and passes through the self-review phase records review metadata on `run_history` exactly as a run that reached the phase by exhausting the turn budget does: the JSON document under `review_metadata`, described in Section 19, carries a value rather than null for this population.
 
-The `after_run` hook on that path receives the run's real `SORTIE_SELF_REVIEW_STATUS` value
-(`passed`, `cap_reached`, or `error`) instead of the `disabled` value it receives when self-review
-is not configured or the run did not reach the phase. `SORTIE_SELF_REVIEW_SUMMARY_PATH` is
-populated on the same terms as on any other path that ran the phase. A declared run supplies both
-values on these same terms whether the phase confirms the declaration or retracts it: the
-retraction is a separate outcome recorded in the run's own log, not a change to what this section
-populates.
+The `after_run` hook on that path receives the run's real `SORTIE_SELF_REVIEW_STATUS` value (`passed`, `cap_reached`, or `error`) instead of the `disabled` value it receives when self-review is not configured or the run did not reach the phase. `SORTIE_SELF_REVIEW_SUMMARY_PATH` is populated on the same terms as on any other path that ran the phase. A declared run supplies both values on these same terms whether the phase confirms the declaration or retracts it: the retraction is a separate outcome recorded in the run's own log, not a change to what this section populates.

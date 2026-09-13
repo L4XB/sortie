@@ -264,10 +264,7 @@ function dispatch_issue(issue, state, attempt):
   return state
 ```
 
-The `resolve_rule` call evaluates `dispatch.rules` in order and returns the first match; see
-§5.3.10 for match semantics and the `ResolveRule` function for the full algorithm. The resolved
-triple is frozen on `RunningEntry` so retries and reaction-driven continuations reuse the same
-selection without re-evaluating rules.
+The `resolve_rule` call evaluates `dispatch.rules` in order and returns the first match; see §5.3.10 for match semantics and the `ResolveRule` function for the full algorithm. The resolved triple is frozen on `RunningEntry` so retries and reaction-driven continuations reuse the same selection without re-evaluating rules.
 
 ### 16.5 Worker Attempt (Workspace + Prompt + Agent)
 

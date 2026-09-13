@@ -1,7 +1,6 @@
 # WORKFLOW.md Syntax Reference
 
-> **Authoritative user-facing reference for workflow authors.**
-> Derived from the Sortie Architecture Specification — Sections 5, 6, 9.4, and 10.
+> **Authoritative user-facing reference for workflow authors.** Derived from the Sortie Architecture Specification — Sections 5, 6, 9.4, and 10.
 >
 > A reviewer can write a valid `WORKFLOW.md` using only this document.
 
@@ -74,17 +73,14 @@
 
 ### 1.1 Overview
 
-`WORKFLOW.md` is a Markdown file with optional YAML front matter. It encodes two payloads in
-a single document:
+`WORKFLOW.md` is a Markdown file with optional YAML front matter. It encodes two payloads in a single document:
 
 | Payload             | Location                            | Purpose                                           |
 | ------------------- | ----------------------------------- | ------------------------------------------------- |
 | **Configuration**   | YAML front matter (between `---`)   | Tracker, polling, workspace, hooks, agent         |
 | **Prompt template** | Markdown body (after closing `---`) | Per-issue prompt rendered with Go `text/template` |
 
-The file is repository-owned and version-controlled. It is self-contained enough to describe
-a complete workflow — prompt, runtime settings, hooks, and tracker selection — without
-requiring out-of-band service-specific configuration.
+The file is repository-owned and version-controlled. It is self-contained enough to describe a complete workflow — prompt, runtime settings, hooks, and tracker selection — without requiring out-of-band service-specific configuration.
 
 **File discovery precedence:**
 
@@ -97,17 +93,10 @@ The parser applies the following steps in order:
 
 1. **BOM stripping.** Remove a leading UTF-8 byte order mark (`\xef\xbb\xbf`) if present.
 2. **Line ending normalization.** Replace all `\r\n` with `\n`.
-3. **Opening delimiter detection.** If the first line is exactly `---` followed by a
-   newline (with optional trailing whitespace), enter front matter mode. A file whose
-   entire content is `---` with no trailing newline is treated as having no front matter.
-4. **Front matter extraction.** Scan lines until a line that is exactly `---` (with
-   optional trailing whitespace). Bytes between the delimiters are the YAML front matter.
-   If no closing delimiter is found, the entire content after the opening delimiter is
-   treated as front matter and the prompt body is empty (this is not an error).
-5. **YAML decoding.** Decode front matter bytes to a map. Non-map YAML (scalar, list) is
-   a parse error. Empty or comment-only YAML between delimiters produces an empty map.
-6. **Prompt body extraction.** All remaining bytes after the closing delimiter become the
-   prompt template, trimmed of leading and trailing whitespace.
+3. **Opening delimiter detection.** If the first line is exactly `---` followed by a newline (with optional trailing whitespace), enter front matter mode. A file whose entire content is `---` with no trailing newline is treated as having no front matter.
+4. **Front matter extraction.** Scan lines until a line that is exactly `---` (with optional trailing whitespace). Bytes between the delimiters are the YAML front matter. If no closing delimiter is found, the entire content after the opening delimiter is treated as front matter and the prompt body is empty (this is not an error).
+5. **YAML decoding.** Decode front matter bytes to a map. Non-map YAML (scalar, list) is a parse error. Empty or comment-only YAML between delimiters produces an empty map.
+6. **Prompt body extraction.** All remaining bytes after the closing delimiter become the prompt template, trimmed of leading and trailing whitespace.
 
 **When front matter is absent** (file does not start with `---`):
 
@@ -159,9 +148,7 @@ dispatch: # Rule-based dispatch routing
 notifications: # Operator notification backends (notify_operator tool)
 ```
 
-**Unknown top-level keys are ignored** by the core schema for forward compatibility. They
-are collected into an `Extensions` map and made available to consumers (e.g., `server`,
-`worker`, adapter-specific blocks like `claude-code`).
+**Unknown top-level keys are ignored** by the core schema for forward compatibility. They are collected into an `Extensions` map and made available to consumers (e.g., `server`, `worker`, adapter-specific blocks like `claude-code`).
 
 ---
 
@@ -207,176 +194,78 @@ tracker:
 
 **`active_states` / `terminal_states` validation rules:**
 
-- Both default to empty. At startup, if **both** lists are empty,
-  validation fails with an error — at least one of the two must be configured.
-- An issue is dispatch-eligible only if its tracker state appears in `active_states`.
-  With an empty `active_states` list no issues will be dispatched even if other configuration
-  is valid.
+- Both default to empty. At startup, if **both** lists are empty, validation fails with an error — at least one of the two must be configured.
+- An issue is dispatch-eligible only if its tracker state appears in `active_states`. With an empty `active_states` list no issues will be dispatched even if other configuration is valid.
 
 **`handoff_state` validation rules:**
 
 - Supports `$VAR` environment indirection.
-- When set, must be a non-empty string after `$VAR` resolution. Empty resolution is a
-  configuration error.
+- When set, must be a non-empty string after `$VAR` resolution. Empty resolution is a configuration error.
 - Must **not** appear in `active_states` (would cause immediate re-dispatch after handoff).
-- Must **not** appear in `terminal_states` (handoff is not terminal — the issue may return
-  to active for further work).
-- Both list checks compare against the effective lists. When `active_states` or
-  `terminal_states` is empty, the effective list is the tracker adapter's own fallback list, and
-  the dispatch preflight reports the collision under check `tracker.handoff_state`.
-- Requires **write permissions** on the tracker API token. For Jira: `write:jira-work`
-  (classic) or `write:issue:jira` (granular).
+- Must **not** appear in `terminal_states` (handoff is not terminal — the issue may return to active for further work).
+- Both list checks compare against the effective lists. When `active_states` or `terminal_states` is empty, the effective list is the tracker adapter's own fallback list, and the dispatch preflight reports the collision under check `tracker.handoff_state`.
+- Requires **write permissions** on the tracker API token. For Jira: `write:jira-work` (classic) or `write:issue:jira` (granular).
 
 **`handoff_state` runtime behavior:**
 
-- The handoff transition is suppressed when the issue has already reached a state in
-  `terminal_states`. Overwriting a terminal state with the handoff state would undo an
-  operator action such as cancelling the issue mid-turn.
-- The orchestrator resolves the freshest tracker observation available at worker exit, in
-  order: reconciliation's observation, then the worker's own per-turn state refresh, then
-  the dispatch-time snapshot. A terminal result suppresses the handoff transition, the
-  continuation retry, and every pending reaction enqueue for that exit.
-- When the resolved observation is not terminal, one verification read runs immediately
-  before the handoff write, so a state change that landed after the last observation is
-  still caught. The verification read is skipped when `terminal_states` is empty, because
-  no value can classify as terminal there. A failed verification read is logged and the
-  handoff proceeds.
-- A transition suppressed by a terminal state, or by the issue not being in an active state at
-  worker exit, increments `sortie_handoff_transitions_total` with `result="skipped"`. A run withheld
-  by the evidence verdict increments the same counter with `result="withheld"` instead, but only
-  when its own verification read below does not find the issue terminal; when that read does find
-  the issue terminal, the run increments `result="skipped"` instead
-  (see [Section 4.1](#41-http-server-serverport-serverhost)).
+- The handoff transition is suppressed when the issue has already reached a state in `terminal_states`. Overwriting a terminal state with the handoff state would undo an operator action such as cancelling the issue mid-turn.
+- The orchestrator resolves the freshest tracker observation available at worker exit, in order: reconciliation's observation, then the worker's own per-turn state refresh, then the dispatch-time snapshot. A terminal result suppresses the handoff transition, the continuation retry, and every pending reaction enqueue for that exit.
+- When the resolved observation is not terminal, one verification read runs immediately before the handoff write, so a state change that landed after the last observation is still caught. The verification read is skipped when `terminal_states` is empty, because no value can classify as terminal there. A failed verification read is logged and the handoff proceeds.
+- A transition suppressed by a terminal state, or by the issue not being in an active state at worker exit, increments `sortie_handoff_transitions_total` with `result="skipped"`. A run withheld by the evidence verdict increments the same counter with `result="withheld"` instead, but only when its own verification read below does not find the issue terminal; when that read does find the issue terminal, the run increments `result="skipped"` instead (see [Section 4.1](#41-http-server-serverport-serverhost)).
 
 **`handoff_evidence` runtime behavior:**
 
-- The evidence condition is a fifth condition on the handoff path, consulted only where four
-  conditions already select that path: a handoff state is configured, the issue is still in an
-  active state, the exit is not a blocked soft stop, and the dispatch drives issue state. It can
-  suppress a handoff write and can never cause one.
-- The verdict has three values, not two: work observed, absence of work observed, and evidence not
-  determinable. It is computed at worker exit over the run's workspace against a baseline captured
-  immediately before the agent starts. Under `off` no baseline is captured and no verdict is
-  computed, so the four-condition decision stands unchanged.
-- A withheld verdict is, immediately before any of its effects, checked once more against the
-  tracker: a verification read for the issue, gated the same way the permit path's own pre-write
-  read above is gated. When that read reports the issue terminal, the run takes the terminal
-  disposition instead: no handoff transition, no failure record, no retry, and the completion
-  comment where `tracker.comments.on_completion` is enabled. Only when that read does not find the
-  issue terminal does the withheld run make no handoff transition, leave the issue in its active
-  tracker state, get recorded in run history as `failed` with an error reason composed of a
-  reserved marker prefix, the verdict, and the policy that withheld it, and schedule the ordinary
-  exponential-backoff failure path rather than the fixed-delay continuation path.
-- Consecutive withheld outcomes are counted per issue, and reaching the ceiling parks the issue
-  under a label whose name is taken from `reactions.review_comments.escalation_label`. That
-  ceiling is governed by `agent.max_consecutive_absences`; the reset rule for the count, and the
-  two operator gestures that release a park, are specified in
-  [architecture §14.2](architecture/19-failure-model-and-recovery-strategy.md#142-recovery-behavior).
+- The evidence condition is a fifth condition on the handoff path, consulted only where four conditions already select that path: a handoff state is configured, the issue is still in an active state, the exit is not a blocked soft stop, and the dispatch drives issue state. It can suppress a handoff write and can never cause one.
+- The verdict has three values, not two: work observed, absence of work observed, and evidence not determinable. It is computed at worker exit over the run's workspace against a baseline captured immediately before the agent starts. Under `off` no baseline is captured and no verdict is computed, so the four-condition decision stands unchanged.
+- A withheld verdict is, immediately before any of its effects, checked once more against the tracker: a verification read for the issue, gated the same way the permit path's own pre-write read above is gated. When that read reports the issue terminal, the run takes the terminal disposition instead: no handoff transition, no failure record, no retry, and the completion comment where `tracker.comments.on_completion` is enabled. Only when that read does not find the issue terminal does the withheld run make no handoff transition, leave the issue in its active tracker state, get recorded in run history as `failed` with an error reason composed of a reserved marker prefix, the verdict, and the policy that withheld it, and schedule the ordinary exponential-backoff failure path rather than the fixed-delay continuation path.
+- Consecutive withheld outcomes are counted per issue, and reaching the ceiling parks the issue under a label whose name is taken from `reactions.review_comments.escalation_label`. That ceiling is governed by `agent.max_consecutive_absences`; the reset rule for the count, and the two operator gestures that release a park, are specified in [architecture §14.2](architecture/19-failure-model-and-recovery-strategy.md#142-recovery-behavior).
 
 **`no_change_state` validation rules:**
 
-- Supports `$VAR` environment indirection and the `SORTIE_TRACKER_NO_CHANGE_STATE` environment
-  override.
-- When set, must be a non-empty string after `$VAR` resolution. Empty resolution is a
-  configuration error.
-- Requires `handoff_state` to be non-empty. A declared run performs no transition where no
-  handoff path applies, so a `no_change_state` set with `handoff_state` unset is a configuration
-  error rather than a silently inert field.
-- Must equal `handoff_state` (case-insensitive) or name a member of `terminal_states` exactly as
-  written in front matter (case-insensitive). Unlike `handoff_state` and `in_progress_state`, this
-  check never falls back to the tracker adapter's default terminal-state list, so the check is
-  entirely offline and confined to the two values written in configuration.
-- This is the one target-state field permitted to equal a value that is also a member of
-  `terminal_states`; every sibling target-state field is rejected on that collision.
+- Supports `$VAR` environment indirection and the `SORTIE_TRACKER_NO_CHANGE_STATE` environment override.
+- When set, must be a non-empty string after `$VAR` resolution. Empty resolution is a configuration error.
+- Requires `handoff_state` to be non-empty. A declared run performs no transition where no handoff path applies, so a `no_change_state` set with `handoff_state` unset is a configuration error rather than a silently inert field.
+- Must equal `handoff_state` (case-insensitive) or name a member of `terminal_states` exactly as written in front matter (case-insensitive). Unlike `handoff_state` and `in_progress_state`, this check never falls back to the tracker adapter's default terminal-state list, so the check is entirely offline and confined to the two values written in configuration.
+- This is the one target-state field permitted to equal a value that is also a member of `terminal_states`; every sibling target-state field is rejected on that collision.
 
 **`no_change_state` runtime behavior:**
 
-- The declaration is the agent's own assertion. It is checked only by the self-review phase,
-  through its `pass` verdict and its verification commands (Section 2.9); on a deployment with
-  self-review disabled, the declaration is taken on the agent's word with no check at all.
-- Under `tracker.handoff_evidence: observed` or `strict`, a run whose declaration stands is always
-  treated as positive evidence: no absence verdict is computed, the run is recorded as `succeeded`,
-  the consecutive-absence count is reset rather than advanced, and a park held for consecutive
-  absences is released, on the same terms as any other work-observed verdict.
-- Under `tracker.handoff_evidence: off`, no verdict is computed for a declared run, so neither the
-  count reset nor the park release occurs; the declaration's only effect there is the transition
-  target.
-- A terminal `no_change_state` ends the issue with no reaction running for a pull request the run
-  left behind: no CI feedback, no review comments, no bot review, no auto-merge, no
-  merge-conflict handling, and no merge completion. This is the same residue any handoff to a
-  terminal state carries, made the ordinary outcome rather than an operator's own terminal action
-  once this field names a terminal state.
+- The declaration is the agent's own assertion. It is checked only by the self-review phase, through its `pass` verdict and its verification commands (Section 2.9); on a deployment with self-review disabled, the declaration is taken on the agent's word with no check at all.
+- Under `tracker.handoff_evidence: observed` or `strict`, a run whose declaration stands is always treated as positive evidence: no absence verdict is computed, the run is recorded as `succeeded`, the consecutive-absence count is reset rather than advanced, and a park held for consecutive absences is released, on the same terms as any other work-observed verdict.
+- Under `tracker.handoff_evidence: off`, no verdict is computed for a declared run, so neither the count reset nor the park release occurs; the declaration's only effect there is the transition target.
+- A terminal `no_change_state` ends the issue with no reaction running for a pull request the run left behind: no CI feedback, no review comments, no bot review, no auto-merge, no merge-conflict handling, and no merge completion. This is the same residue any handoff to a terminal state carries, made the ordinary outcome rather than an operator's own terminal action once this field names a terminal state.
 
 **`in_progress_state` validation rules:**
 
 - Supports `$VAR` environment indirection.
-- When set, must be a non-empty string after `$VAR` resolution. Empty resolution is a
-  configuration error.
-- Must appear in `active_states` (case-insensitive). If the issue transitions to a state
-  outside `active_states`, reconciliation would immediately cancel the worker.
-- Must **not** appear in `terminal_states` (case-insensitive). A terminal state would
-  trigger workspace cleanup on the next reconciliation tick.
-- Must **not** collide with `handoff_state` (case-insensitive). The two transitions represent
-  different lifecycle phases — dispatch vs. exit.
-- The `terminal_states` check compares against the effective list. When `terminal_states` is
-  empty, the effective list is the tracker adapter's own fallback list, and the dispatch preflight
-  reports the collision under check `tracker.in_progress_state`. The `active_states` membership
-  check compares against the workflow list as written, because dispatch and reconciliation gate on
-  that list.
-- Transition failure at runtime is non-fatal: the worker logs a warning and continues to
-  workspace preparation.
-- If the issue is already in the target state (case-insensitive), the transition API call
-  is skipped and a debug-level message is logged.
+- When set, must be a non-empty string after `$VAR` resolution. Empty resolution is a configuration error.
+- Must appear in `active_states` (case-insensitive). If the issue transitions to a state outside `active_states`, reconciliation would immediately cancel the worker.
+- Must **not** appear in `terminal_states` (case-insensitive). A terminal state would trigger workspace cleanup on the next reconciliation tick.
+- Must **not** collide with `handoff_state` (case-insensitive). The two transitions represent different lifecycle phases — dispatch vs. exit.
+- The `terminal_states` check compares against the effective list. When `terminal_states` is empty, the effective list is the tracker adapter's own fallback list, and the dispatch preflight reports the collision under check `tracker.in_progress_state`. The `active_states` membership check compares against the workflow list as written, because dispatch and reconciliation gate on that list.
+- Transition failure at runtime is non-fatal: the worker logs a warning and continues to workspace preparation.
+- If the issue is already in the target state (case-insensitive), the transition API call is skipped and a debug-level message is logged.
 - Requires **write permissions** on the tracker API token (same as `handoff_state`).
 
 **`api_key` environment resolution:**
 
-The `api_key` field uses full environment expansion (`$VAR`, `${VAR}`, and mixed content
-at any position in the string).
-All other `$VAR`-supporting fields in `tracker` use targeted resolution: if the trimmed
-value starts with `$`, the entire string is expanded via `os.ExpandEnv` (for example,
-`$HOST/api/rest` expands as expected). Values that do not start with `$` are returned
-unchanged, preserving literal URI strings.
+The `api_key` field uses full environment expansion (`$VAR`, `${VAR}`, and mixed content at any position in the string). All other `$VAR`-supporting fields in `tracker` use targeted resolution: if the trimmed value starts with `$`, the entire string is expanded via `os.ExpandEnv` (for example, `$HOST/api/rest` expands as expected). Values that do not start with `$` are returned unchanged, preserving literal URI strings.
 
 **Linear tracker (`kind: linear`):**
 
-The Linear adapter talks to Linear's single GraphQL endpoint. Configure it with the same generic
-`tracker.*` fields used for every adapter; the Linear-specific interpretation of those fields is:
+The Linear adapter talks to Linear's single GraphQL endpoint. Configure it with the same generic `tracker.*` fields used for every adapter; the Linear-specific interpretation of those fields is:
 
-- `endpoint` defaults to `https://api.linear.app/graphql` and rarely needs to be set, since there
-  is no self-hosted Linear.
-- `api_key` is a Linear personal API key (it carries the `lin_api_` prefix). The key is sent
-  verbatim in the `Authorization` header with no `Bearer` prefix, so leading or trailing
-  whitespace fails authentication. Supply it through environment indirection like any other
-  tracker, for example `api_key: $SORTIE_LINEAR_API_KEY`. The key resolves through the standard
-  `tracker.api_key` field (env override `SORTIE_TRACKER_API_KEY`); `SORTIE_LINEAR_API_KEY` is the
-  conventional variable name the `sortie validate` advisory suggests, not a separate config path.
-- `project` is the Linear **team key** (the prefix in identifiers such as `ENG-123`), for example
-  `ENG`. It is not a Linear project and not an `owner/repo` path. Team scoping is required because
-  Linear workflow states are team-scoped.
-- `active_states`, `terminal_states`, and `handoff_state` name Linear **workflow states** by their
-  display name (for example `Backlog`, `Todo`, `In Progress`, `Done`, `Canceled`). The adapter
-  matches names case-insensitively and verifies at startup that every configured name exists in
-  the team. When `active_states` or `terminal_states` is omitted or set to an empty list, the
-  adapter applies the stock Linear defaults: active `["Backlog", "Todo", "In Progress"]`, terminal
-  `["Done", "Canceled", "Duplicate"]`. The general rule that an empty `active_states` pauses
-  dispatch (see the field table above) does not hold for Linear: an empty list is replaced by the
-  defaults, so emptying it does not stop dispatch.
+- `endpoint` defaults to `https://api.linear.app/graphql` and rarely needs to be set, since there is no self-hosted Linear.
+- `api_key` is a Linear personal API key (it carries the `lin_api_` prefix). The key is sent verbatim in the `Authorization` header with no `Bearer` prefix, so leading or trailing whitespace fails authentication. Supply it through environment indirection like any other tracker, for example `api_key: $SORTIE_LINEAR_API_KEY`. The key resolves through the standard `tracker.api_key` field (env override `SORTIE_TRACKER_API_KEY`); `SORTIE_LINEAR_API_KEY` is the conventional variable name the `sortie validate` advisory suggests, not a separate config path.
+- `project` is the Linear **team key** (the prefix in identifiers such as `ENG-123`), for example `ENG`. It is not a Linear project and not an `owner/repo` path. Team scoping is required because Linear workflow states are team-scoped.
+- `active_states`, `terminal_states`, and `handoff_state` name Linear **workflow states** by their display name (for example `Backlog`, `Todo`, `In Progress`, `Done`, `Canceled`). The adapter matches names case-insensitively and verifies at startup that every configured name exists in the team. When `active_states` or `terminal_states` is omitted or set to an empty list, the adapter applies the stock Linear defaults: active `["Backlog", "Todo", "In Progress"]`, terminal `["Done", "Canceled", "Duplicate"]`. The general rule that an empty `active_states` pauses dispatch (see the field table above) does not hold for Linear: an empty list is replaced by the defaults, so emptying it does not stop dispatch.
 
-`handoff_state` and `in_progress_state` also name Linear workflow states. At transition time the
-adapter resolves the configured name to its team-scoped workflow-state id and applies it. Linear
-imposes no transition graph, so any state can move to any state.
+`handoff_state` and `in_progress_state` also name Linear workflow states. At transition time the adapter resolves the configured name to its team-scoped workflow-state id and applies it. Linear imposes no transition graph, so any state can move to any state.
 
-**Linear `query_filter`:** For `kind: linear`, `query_filter` is a Linear `IssueFilter` JSON
-**object**, not a string predicate. The adapter parses the value as JSON and merges it as
-additional fields of the GraphQL `filter` argument alongside the team and state constraints it
-always applies, so Linear ANDs the operator filter with the base query. This differs from Jira,
-where the fragment is appended to a JQL string. Rules:
+**Linear `query_filter`:** For `kind: linear`, `query_filter` is a Linear `IssueFilter` JSON **object**, not a string predicate. The adapter parses the value as JSON and merges it as additional fields of the GraphQL `filter` argument alongside the team and state constraints it always applies, so Linear ANDs the operator filter with the base query. This differs from Jira, where the fragment is appended to a JQL string. Rules:
 
-- The value MUST be a JSON object. A value that is not valid JSON, or parses to a non-object,
-  is a configuration error.
-- The object MUST NOT contain a top-level `team` or `state` key. Those keys are reserved for the
-  adapter's own team and state constraints, and supplying either is a configuration error.
+- The value MUST be a JSON object. A value that is not valid JSON, or parses to a non-object, is a configuration error.
+- The object MUST NOT contain a top-level `team` or `state` key. Those keys are reserved for the adapter's own team and state constraints, and supplying either is a configuration error.
 
 ```yaml
 tracker:
@@ -407,71 +296,23 @@ Fix {{ .issue.identifier }}: {{ .issue.title }}
 
 **Gitea tracker (`kind: gitea`):**
 
-The Gitea adapter talks to a self-hosted Gitea instance over the Gitea REST API v1. Configure it
-with the same generic `tracker.*` fields used for every adapter; the Gitea-specific interpretation
-of those fields is:
+The Gitea adapter talks to a self-hosted Gitea instance over the Gitea REST API v1. Configure it with the same generic `tracker.*` fields used for every adapter; the Gitea-specific interpretation of those fields is:
 
-- `endpoint` is the instance base URL (for example `https://gitea.example.com`) and is required:
-  there is no default host, because Gitea is self-hosted. Supply the site root; the adapter trims a
-  trailing slash and appends `/api/v1`, and tolerates an endpoint that already ends in `/api/v1`.
-  Use `https`, since the token travels in a request header.
-- `api_key` is a Gitea access token. The adapter sends it verbatim as `Authorization: token <key>`
-  (the canonical Gitea scheme, not a `Bearer` prefix), so leading or trailing whitespace fails
-  authentication. Supply it through environment indirection like any other tracker, for example
-  `api_key: $SORTIE_GITEA_TOKEN`. The key resolves through the standard `tracker.api_key` field
-  (env override `SORTIE_TRACKER_API_KEY`); `SORTIE_GITEA_TOKEN` is the conventional variable name
-  the `sortie validate` advisory suggests, not a separate config path.
-- `project` is the repository in **`owner/repo`** form (for example `sortie-ai/sortie`): exactly one
-  slash, with a non-empty owner and repository.
-- `active_states`, `terminal_states`, and `handoff_state` name repository **labels**, compared
-  case-insensitively (the adapter lowercases them). The adapter carries internal fallback labels
-  (active `["backlog", "in-progress", "review"]`, terminal `["done", "wontfix"]`) that it applies
-  when the matching list is omitted or empty, both to derive an issue's state from its labels and to
-  narrow its own candidate query. The dispatch preflight also checks `handoff_state` and
-  `in_progress_state` against the fallback list when the matching workflow list is empty. But the
-  orchestrator gates dispatch and reconciliation on the workflow's `tracker.active_states` and
-  `tracker.terminal_states`, so the field-table rule above holds for Gitea. An empty
-  `active_states` dispatches nothing, and validation rejects a workflow with both lists empty.
-  Configure `active_states` with the labels a dispatched Gitea issue must carry.
+- `endpoint` is the instance base URL (for example `https://gitea.example.com`) and is required: there is no default host, because Gitea is self-hosted. Supply the site root; the adapter trims a trailing slash and appends `/api/v1`, and tolerates an endpoint that already ends in `/api/v1`. Use `https`, since the token travels in a request header.
+- `api_key` is a Gitea access token. The adapter sends it verbatim as `Authorization: token <key>` (the canonical Gitea scheme, not a `Bearer` prefix), so leading or trailing whitespace fails authentication. Supply it through environment indirection like any other tracker, for example `api_key: $SORTIE_GITEA_TOKEN`. The key resolves through the standard `tracker.api_key` field (env override `SORTIE_TRACKER_API_KEY`); `SORTIE_GITEA_TOKEN` is the conventional variable name the `sortie validate` advisory suggests, not a separate config path.
+- `project` is the repository in **`owner/repo`** form (for example `sortie-ai/sortie`): exactly one slash, with a non-empty owner and repository.
+- `active_states`, `terminal_states`, and `handoff_state` name repository **labels**, compared case-insensitively (the adapter lowercases them). The adapter carries internal fallback labels (active `["backlog", "in-progress", "review"]`, terminal `["done", "wontfix"]`) that it applies when the matching list is omitted or empty, both to derive an issue's state from its labels and to narrow its own candidate query. The dispatch preflight also checks `handoff_state` and `in_progress_state` against the fallback list when the matching workflow list is empty. But the orchestrator gates dispatch and reconciliation on the workflow's `tracker.active_states` and `tracker.terminal_states`, so the field-table rule above holds for Gitea. An empty `active_states` dispatches nothing, and validation rejects a workflow with both lists empty. Configure `active_states` with the labels a dispatched Gitea issue must carry.
 
-Gitea has no transition workflow, so the adapter derives an issue's state from its labels: it scans
-the configured active, terminal, then handoff labels in order and takes the first match. An issue
-carrying no configured state label falls back to the first active label when it is open and the
-first terminal label when it is closed. A configured label that does not yet exist in the
-repository is created on demand the first time an issue transitions into it.
+Gitea has no transition workflow, so the adapter derives an issue's state from its labels: it scans the configured active, terminal, then handoff labels in order and takes the first match. An issue carrying no configured state label falls back to the first active label when it is open and the first terminal label when it is closed. A configured label that does not yet exist in the repository is created on demand the first time an issue transitions into it.
 
-`handoff_state` and `in_progress_state` also name repository labels. At transition time the adapter
-swaps the issue's current state label for the target label; a move to a terminal label also closes
-the issue, and a move to an active label reopens a closed one. Gitea imposes no transition graph, so
-any state can move to any state. The dispatch-time `in_progress_state` transition runs through this
-same label swap, so its generic validation rules (must appear in `active_states`, must not collide
-with `terminal_states` or `handoff_state`) apply unchanged.
+`handoff_state` and `in_progress_state` also name repository labels. At transition time the adapter swaps the issue's current state label for the target label; a move to a terminal label also closes the issue, and a move to an active label reopens a closed one. Gitea imposes no transition graph, so any state can move to any state. The dispatch-time `in_progress_state` transition runs through this same label swap, so its generic validation rules (must appear in `active_states`, must not collide with `terminal_states` or `handoff_state`) apply unchanged.
 
-**Gitea `query_filter`:** For `kind: gitea`, `query_filter` is a URL query fragment for Gitea's
-repository issue-list route, not a string predicate or a JSON object. The adapter parses it with
-`url.ParseQuery` and merges the parameters into candidate polling, so an operator can scope which
-open issues the agent picks up (for example, to issues assigned to or mentioning the automation
-identity). Parameters combine with `&`. Rules:
+**Gitea `query_filter`:** For `kind: gitea`, `query_filter` is a URL query fragment for Gitea's repository issue-list route, not a string predicate or a JSON object. The adapter parses it with `url.ParseQuery` and merges the parameters into candidate polling, so an operator can scope which open issues the agent picks up (for example, to issues assigned to or mentioning the automation identity). Parameters combine with `&`. Rules:
 
-- The adapter rejects only the four keys it owns: `state`, `type`, `page`, and `limit`. Naming any
-  of them fails construction with a configuration error.
-- Any other key is accepted and merged. A key outside Gitea's known repo issue-list filter set
-  (`labels`, `q`, `milestones`, `since`, `before`, `created_by`, `assigned_by`, `mentioned_by`) is a
-  likely typo, such as `assignee=` or `assigned_to=` for the Gitea key `assigned_by`. The adapter
-  warns at construction and names the unrecognized key, but still passes it through unchecked. Gitea
-  silently ignores a parameter it does not honor and returns every open issue, so a misspelled key
-  widens rather than narrows the candidate set; correcting it is the operator's responsibility.
-- A `labels` value inherits Gitea's server-side semantics: AND across comma-separated names, and
-  case-sensitive matching. A name that resolves to no repository label silently drops the entire
-  filter, so Gitea returns every open issue rather than an empty set. The adapter warns at
-  construction when a `labels` value does not match a repository label by exact case, turning the
-  silent drop into a visible signal. The warning does not block construction, because an operator
-  may reference a label that does not exist yet.
-- `mentioned_by` does not count an author mentioning themselves. This behavior is verified against
-  the tested Gitea version but is not documented in Gitea's REST API, so it can differ across Gitea
-  or Forgejo releases. `mentioned_by=<identity>` matches an issue only when the identity differs from
-  the issue author, so setting the automation identity as both author and mention target yields no
-  candidates.
+- The adapter rejects only the four keys it owns: `state`, `type`, `page`, and `limit`. Naming any of them fails construction with a configuration error.
+- Any other key is accepted and merged. A key outside Gitea's known repo issue-list filter set (`labels`, `q`, `milestones`, `since`, `before`, `created_by`, `assigned_by`, `mentioned_by`) is a likely typo, such as `assignee=` or `assigned_to=` for the Gitea key `assigned_by`. The adapter warns at construction and names the unrecognized key, but still passes it through unchecked. Gitea silently ignores a parameter it does not honor and returns every open issue, so a misspelled key widens rather than narrows the candidate set; correcting it is the operator's responsibility.
+- A `labels` value inherits Gitea's server-side semantics: AND across comma-separated names, and case-sensitive matching. A name that resolves to no repository label silently drops the entire filter, so Gitea returns every open issue rather than an empty set. The adapter warns at construction when a `labels` value does not match a repository label by exact case, turning the silent drop into a visible signal. The warning does not block construction, because an operator may reference a label that does not exist yet.
+- `mentioned_by` does not count an author mentioning themselves. This behavior is verified against the tested Gitea version but is not documented in Gitea's REST API, so it can differ across Gitea or Forgejo releases. `mentioned_by=<identity>` matches an issue only when the identity differs from the issue author, so setting the automation identity as both author and mention target yields no candidates.
 
 ```yaml
 tracker:
@@ -503,113 +344,31 @@ Fix {{ .issue.identifier }}: {{ .issue.title }}
 
 **GitLab tracker (`kind: gitlab`):**
 
-The GitLab adapter talks to GitLab.com or a self-managed instance over the GitLab REST API v4.
-Configure it with the same generic `tracker.*` fields used for every adapter; the GitLab-specific
-interpretation of those fields is:
+The GitLab adapter talks to GitLab.com or a self-managed instance over the GitLab REST API v4. Configure it with the same generic `tracker.*` fields used for every adapter; the GitLab-specific interpretation of those fields is:
 
-- `endpoint` is the instance base URL (for example `https://gitlab.example.com`) and is optional:
-  it defaults to `https://gitlab.com`, so a GitLab.com workflow omits it and a self-managed
-  workflow sets it. Supply the site root; the adapter trims a trailing slash and appends `/api/v4`,
-  and tolerates an endpoint that already ends in `/api/v4`, though `sortie validate` warns about the
-  redundant suffix. Use `https`, since the token travels in a request header; a cleartext `http`
-  endpoint also draws a validation warning.
-- `api_key` is a GitLab access token: personal, project, or group. The adapter sends it verbatim in
-  the `PRIVATE-TOKEN` header, so leading or trailing whitespace fails authentication. The token
-  needs the `api` scope, which is the only classic scope that permits issue writes; `read_api`
-  suffices only for a deployment that never transitions an issue, posts a comment, or attaches a
-  label. A project access token is the least-privilege choice, because GitLab confines it to one
-  project server-side, and a self-managed instance offers that token type at any license. On
-  GitLab.com it requires a Premium or Ultimate subscription, so a Free namespace uses a personal
-  access token. Supply the token through environment indirection like any other tracker, for
-  example `api_key: $SORTIE_GITLAB_TOKEN`. The
-  key resolves through the standard `tracker.api_key` field (env override `SORTIE_TRACKER_API_KEY`);
-  `SORTIE_GITLAB_TOKEN` is the conventional variable name the `sortie validate` advisory suggests,
-  not a separate config path.
-- `project` is the project's full namespace path (for example `group/project`) or its numeric
-  project ID (for example `"1"`, quoted so YAML keeps it a string). GitLab nests subgroups to any
-  depth, so `group/subgroup/project` is equally valid and the adapter enforces no one-slash rule,
-  unlike the GitHub and Gitea `owner/repo` grammar. A project in a user namespace works the same
-  way. Write the path unencoded: the adapter percent-encodes it once for the API path, and
-  `sortie validate` rejects a value that is already percent-encoded.
-- `active_states`, `terminal_states`, and `handoff_state` name project or group **labels**, compared
-  case-insensitively (the adapter lowercases them). The adapter carries internal fallback labels
-  (active `["backlog", "in-progress", "review"]`, terminal `["done", "wontfix"]`) that it applies
-  when the matching list is omitted or empty, both to derive an issue's state from its labels and to
-  decide which issues are candidates. The dispatch preflight also checks `handoff_state` and
-  `in_progress_state` against the fallback list when the matching workflow list is empty. But the
-  orchestrator gates dispatch and reconciliation on the workflow's `tracker.active_states` and
-  `tracker.terminal_states`, so the field-table rule above holds for GitLab. An empty
-  `active_states` dispatches nothing, and validation rejects a workflow with both lists empty.
-  Configure `active_states` with the labels a dispatched GitLab issue must carry.
+- `endpoint` is the instance base URL (for example `https://gitlab.example.com`) and is optional: it defaults to `https://gitlab.com`, so a GitLab.com workflow omits it and a self-managed workflow sets it. Supply the site root; the adapter trims a trailing slash and appends `/api/v4`, and tolerates an endpoint that already ends in `/api/v4`, though `sortie validate` warns about the redundant suffix. Use `https`, since the token travels in a request header; a cleartext `http` endpoint also draws a validation warning.
+- `api_key` is a GitLab access token: personal, project, or group. The adapter sends it verbatim in the `PRIVATE-TOKEN` header, so leading or trailing whitespace fails authentication. The token needs the `api` scope, which is the only classic scope that permits issue writes; `read_api` suffices only for a deployment that never transitions an issue, posts a comment, or attaches a label. A project access token is the least-privilege choice, because GitLab confines it to one project server-side, and a self-managed instance offers that token type at any license. On GitLab.com it requires a Premium or Ultimate subscription, so a Free namespace uses a personal access token. Supply the token through environment indirection like any other tracker, for example `api_key: $SORTIE_GITLAB_TOKEN`. The key resolves through the standard `tracker.api_key` field (env override `SORTIE_TRACKER_API_KEY`); `SORTIE_GITLAB_TOKEN` is the conventional variable name the `sortie validate` advisory suggests, not a separate config path.
+- `project` is the project's full namespace path (for example `group/project`) or its numeric project ID (for example `"1"`, quoted so YAML keeps it a string). GitLab nests subgroups to any depth, so `group/subgroup/project` is equally valid and the adapter enforces no one-slash rule, unlike the GitHub and Gitea `owner/repo` grammar. A project in a user namespace works the same way. Write the path unencoded: the adapter percent-encodes it once for the API path, and `sortie validate` rejects a value that is already percent-encoded.
+- `active_states`, `terminal_states`, and `handoff_state` name project or group **labels**, compared case-insensitively (the adapter lowercases them). The adapter carries internal fallback labels (active `["backlog", "in-progress", "review"]`, terminal `["done", "wontfix"]`) that it applies when the matching list is omitted or empty, both to derive an issue's state from its labels and to decide which issues are candidates. The dispatch preflight also checks `handoff_state` and `in_progress_state` against the fallback list when the matching workflow list is empty. But the orchestrator gates dispatch and reconciliation on the workflow's `tracker.active_states` and `tracker.terminal_states`, so the field-table rule above holds for GitLab. An empty `active_states` dispatches nothing, and validation rejects a workflow with both lists empty. Configure `active_states` with the labels a dispatched GitLab issue must carry.
 
-GitLab has no transition workflow, so the adapter derives an issue's state from its labels: it scans
-the configured active, terminal, then handoff labels in order and takes the first match. An issue
-carrying no configured state label falls back to the first active label when it is open and the
-first terminal label when it is closed. An issue carrying more than one configured state label logs
-a warning and keeps the first.
+GitLab has no transition workflow, so the adapter derives an issue's state from its labels: it scans the configured active, terminal, then handoff labels in order and takes the first match. An issue carrying no configured state label falls back to the first active label when it is open and the first terminal label when it is closed. An issue carrying more than one configured state label logs a warning and keeps the first.
 
-GitLab label names are case-sensitive, and attaching a name no label matches creates that label
-rather than failing. Configuring `review` for a project that already holds `Review` would therefore
-leave the project with two near-duplicate labels. To prevent that, the adapter reads the project
-label catalog at startup, project labels and inherited group labels alike, and rewrites every
-configured state label to the casing the project already stores. Spell the configured labels however
-you like; the adapter writes the project's spelling. A configured label the project does not hold
-yet is not an error: it is created the first time an issue transitions into it.
+GitLab label names are case-sensitive, and attaching a name no label matches creates that label rather than failing. Configuring `review` for a project that already holds `Review` would therefore leave the project with two near-duplicate labels. To prevent that, the adapter reads the project label catalog at startup, project labels and inherited group labels alike, and rewrites every configured state label to the casing the project already stores. Spell the configured labels however you like; the adapter writes the project's spelling. A configured label the project does not hold yet is not an error: it is created the first time an issue transitions into it.
 
-`handoff_state` and `in_progress_state` also name labels. At transition time the adapter swaps the
-issue's current state label for the target label and reconciles the native status in a single
-request: a move to a terminal label also closes the issue, and a move to an active label reopens a
-closed one. GitLab imposes no transition graph, so any state can move to any state, and a transition
-that is already converged issues no write at all. The dispatch-time `in_progress_state` transition
-runs through this same label swap, so its generic validation rules (must appear in `active_states`,
-must not collide with `terminal_states` or `handoff_state`) apply unchanged.
+`handoff_state` and `in_progress_state` also name labels. At transition time the adapter swaps the issue's current state label for the target label and reconciles the native status in a single request: a move to a terminal label also closes the issue, and a move to an active label reopens a closed one. GitLab imposes no transition graph, so any state can move to any state, and a transition that is already converged issues no write at all. The dispatch-time `in_progress_state` transition runs through this same label swap, so its generic validation rules (must appear in `active_states`, must not collide with `terminal_states` or `handoff_state`) apply unchanged.
 
-**GitLab `query_filter`:** For `kind: gitlab`, `query_filter` is a URL query fragment for GitLab's
-project issue-list route, not a string predicate or a JSON object. The adapter parses it with
-`url.ParseQuery` and merges the parameters into candidate polling, so an operator can scope which
-open issues the agent picks up. Parameters combine with `&`. Every rejection below happens at
-startup, before the first poll, and `sortie validate` reports the same verdict offline by running
-the same parser. Rules:
+**GitLab `query_filter`:** For `kind: gitlab`, `query_filter` is a URL query fragment for GitLab's project issue-list route, not a string predicate or a JSON object. The adapter parses it with `url.ParseQuery` and merges the parameters into candidate polling, so an operator can scope which open issues the agent picks up. Parameters combine with `&`. Every rejection below happens at startup, before the first poll, and `sortie validate` reports the same verdict offline by running the same parser. Rules:
 
-- The adapter rejects the eight keys it owns: `state`, `issue_type`, `order_by`, `sort`, `page`,
-  `per_page`, `pagination`, and `with_labels_details`. Naming any of them fails construction with a
-  configuration error, because overriding one changes correctness rather than scope.
-- Every other key MUST be one the project issue-list route honors: `assignee_id`,
-  `assignee_username`, `author_id`, `author_username`, `confidential`, `created_after`,
-  `created_before`, `due_date`, `iids`, `in`, `labels`, `milestone`, `milestone_id`,
-  `my_reaction_emoji`, `scope`, `search`, `updated_after`, and `updated_before`. An unrecognized key
-  fails construction rather than passing through. This is stricter than the Gitea adapter, which
-  warns and forwards, because GitLab silently ignores a parameter it does not recognize: a typo such
-  as `assignee=` for `assignee_username=` would return every open issue, widening the candidate set
-  with no visible signal.
-- Negation uses GitLab's `not[...]` hash, accepted for the subset GitLab honors there:
-  `not[assignee_id]`, `not[assignee_username]`, `not[author_id]`, `not[author_username]`,
-  `not[iids]`, `not[labels]`, `not[milestone]`, and `not[milestone_id]`. A `not[...]` key naming
-  anything else is rejected, since the excluded parameters parse without error and then have no
-  effect.
-- Repeat an array parameter with the `[]` suffix (`iids[]=3&iids[]=4`). A key without the suffix
-  MUST carry exactly one value: repeating it is rejected, because repeat semantics are not portable
-  across GitLab versions.
-- Naming one parameter under two spellings is rejected: `labels` and `labels[]` are the same
-  parameter. `labels` and `not[labels]` are different parameters and MAY both appear.
+- The adapter rejects the eight keys it owns: `state`, `issue_type`, `order_by`, `sort`, `page`, `per_page`, `pagination`, and `with_labels_details`. Naming any of them fails construction with a configuration error, because overriding one changes correctness rather than scope.
+- Every other key MUST be one the project issue-list route honors: `assignee_id`, `assignee_username`, `author_id`, `author_username`, `confidential`, `created_after`, `created_before`, `due_date`, `iids`, `in`, `labels`, `milestone`, `milestone_id`, `my_reaction_emoji`, `scope`, `search`, `updated_after`, and `updated_before`. An unrecognized key fails construction rather than passing through. This is stricter than the Gitea adapter, which warns and forwards, because GitLab silently ignores a parameter it does not recognize: a typo such as `assignee=` for `assignee_username=` would return every open issue, widening the candidate set with no visible signal.
+- Negation uses GitLab's `not[...]` hash, accepted for the subset GitLab honors there: `not[assignee_id]`, `not[assignee_username]`, `not[author_id]`, `not[author_username]`, `not[iids]`, `not[labels]`, `not[milestone]`, and `not[milestone_id]`. A `not[...]` key naming anything else is rejected, since the excluded parameters parse without error and then have no effect.
+- Repeat an array parameter with the `[]` suffix (`iids[]=3&iids[]=4`). A key without the suffix MUST carry exactly one value: repeating it is rejected, because repeat semantics are not portable across GitLab versions.
+- Naming one parameter under two spellings is rejected: `labels` and `labels[]` are the same parameter. `labels` and `not[labels]` are different parameters and MAY both appear.
 - A value carrying an empty comma-separated segment (`labels=ready,,urgent`) is rejected.
-- `scope` is both adapter-set and operator-settable. The adapter polls with `scope=all`; an operator
-  value replaces it rather than combining with it, which is how a filter narrows polling to, for
-  example, `scope=assigned_to_me`.
-- A `labels` value inherits GitLab's server-side semantics: AND across comma-separated names, and
-  case-sensitive matching. A name matching no label returns an empty result rather than dropping the
-  filter, so a misspelling shows up as "no candidates" instead of "every candidate". The adapter
-  still warns at construction for each `labels` name absent from the project catalog, once per
-  distinct name, so the empty result has a stated cause. The warning does not block construction,
-  because an operator may reference a label that does not exist yet. GitLab reads `none` and `any`
-  as wildcards on the non-negated `labels` parameter, so neither is checked against the catalog
-  there.
+- `scope` is both adapter-set and operator-settable. The adapter polls with `scope=all`; an operator value replaces it rather than combining with it, which is how a filter narrows polling to, for example, `scope=assigned_to_me`.
+- A `labels` value inherits GitLab's server-side semantics: AND across comma-separated names, and case-sensitive matching. A name matching no label returns an empty result rather than dropping the filter, so a misspelling shows up as "no candidates" instead of "every candidate". The adapter still warns at construction for each `labels` name absent from the project catalog, once per distinct name, so the empty result has a stated cause. The warning does not block construction, because an operator may reference a label that does not exist yet. GitLab reads `none` and `any` as wildcards on the non-negated `labels` parameter, so neither is checked against the catalog there.
 
-The filter merges into the open-issue listings that back candidate polling and not into the
-closed-issue listing used for terminal-state cleanup, so an operator filter never hides a terminal
-issue from reconciliation. The batched state lookups that reconcile active runs address issues by
-`iid` and carry no filter either, so a running issue stays visible even after an edit moves it
-outside the filter.
+The filter merges into the open-issue listings that back candidate polling and not into the closed-issue listing used for terminal-state cleanup, so an operator filter never hides a terminal issue from reconciliation. The batched state lookups that reconcile active runs address issues by `iid` and carry no filter either, so a running issue stays visible even after an edit moves it outside the filter.
 
 ```yaml
 tracker:
@@ -640,14 +399,7 @@ tracker:
 Fix {{ .issue.identifier }}: {{ .issue.title }}
 ```
 
-Four prompt-template variables (see [Section 5.2](#52-template-input-variables)) are always empty
-for this tracker, so a template that reads them renders nothing rather than failing:
-`{{ .issue.priority }}`, because GitLab issues carry no priority field; `{{ .issue.blocked_by }}`,
-because Community Edition has no blocking relationship between issues; `{{ .issue.parent }}`,
-because the issue route exposes no sub-issue relationship; and `{{ .issue.branch_name }}`, because
-GitLab computes branch names in the UI rather than storing one on the issue. Both
-`{{ .issue.id }}` and `{{ .issue.identifier }}` are the project-scoped issue number (GitLab's
-`iid`), the number shown as `#7` in the GitLab UI, never the instance-global issue ID.
+Four prompt-template variables (see [Section 5.2](#52-template-input-variables)) are always empty for this tracker, so a template that reads them renders nothing rather than failing: `{{ .issue.priority }}`, because GitLab issues carry no priority field; `{{ .issue.blocked_by }}`, because Community Edition has no blocking relationship between issues; `{{ .issue.parent }}`, because the issue route exposes no sub-issue relationship; and `{{ .issue.branch_name }}`, because GitLab computes branch names in the UI rather than storing one on the issue. Both `{{ .issue.id }}` and `{{ .issue.identifier }}` are the project-scoped issue number (GitLab's `iid`), the number shown as `#7` in the GitLab UI, never the instance-global issue ID.
 
 ---
 
@@ -680,27 +432,18 @@ workspace:
 **Path resolution:**
 
 - `~` and `~/...` prefixes are expanded to the user's home directory via `os.UserHomeDir()`.
-- All `$VAR` and `${VAR}` references anywhere in the string are then expanded via
-  `os.ExpandEnv`. This applies in any position, not only to pure `$VAR` values.
-- Bare strings with no `~` prefix or `$` references are used as-is. Relative roots are
-  allowed but discouraged.
+- All `$VAR` and `${VAR}` references anywhere in the string are then expanded via `os.ExpandEnv`. This applies in any position, not only to pure `$VAR` values.
+- Bare strings with no `~` prefix or `$` references are used as-is. Relative roots are allowed but discouraged.
 
 **Per-issue workspace path:** `<workspace.root>/<sanitized_issue_identifier>`
 
-**Workspace key sanitization:** Only `[A-Za-z0-9._-]` are allowed. All other characters in
-the issue identifier are replaced with `_`.
+**Workspace key sanitization:** Only `[A-Za-z0-9._-]` are allowed. All other characters in the issue identifier are replaced with `_`.
 
 #### Changing `workspace.root`
 
-> **Warning:** Changing `workspace.root` and restarting the orchestrator will leave the
-> old workspace directory on disk. Sortie's startup cleanup scans only the path that is
-> currently configured, so any directories under the previous root become orphans and
-> accumulate disk space until removed manually.
+> **Warning:** Changing `workspace.root` and restarting the orchestrator will leave the old workspace directory on disk. Sortie's startup cleanup scans only the path that is currently configured, so any directories under the previous root become orphans and accumulate disk space until removed manually.
 
-**Why this happens:** On startup, Sortie lists workspace subdirectory names under
-`workspace.root`, queries the tracker for their states, and removes any whose issues are
-in terminal states. Because the scan is anchored to the configured root, a prior root is
-never consulted.
+**Why this happens:** On startup, Sortie lists workspace subdirectory names under `workspace.root`, queries the tracker for their states, and removes any whose issues are in terminal states. Because the scan is anchored to the configured root, a prior root is never consulted.
 
 **Disk leak scenario:**
 
@@ -716,9 +459,7 @@ never consulted.
 3. Update `workspace.root` in `WORKFLOW.md`.
 4. Restart Sortie.
 
-> **Note:** Dynamic changes to `workspace.root` at runtime (without a restart) are safe
-> for in-flight sessions — cleanup for already-running sessions uses the path stored in
-> memory at the time the session was started.
+> **Note:** Dynamic changes to `workspace.root` at runtime (without a restart) are safe for in-flight sessions — cleanup for already-running sessions uses the path stored in memory at the time the session was started.
 
 ---
 
@@ -741,18 +482,9 @@ hooks:
   timeout_ms: 120000
 ```
 
-> **Note:** `after_create` runs only when Sortie first creates the per-issue
-> workspace directory, so the directory is empty when the clone runs. If
-> `after_create` fails, Sortie removes the directory before the next retry, so
-> a retry also starts from an empty directory. A clone error such as
-> "destination path already exists" or "directory not empty" does not come from
-> this example on the normal path.
+> **Note:** `after_create` runs only when Sortie first creates the per-issue workspace directory, so the directory is empty when the clone runs. If `after_create` fails, Sortie removes the directory before the next retry, so a retry also starts from an empty directory. A clone error such as "destination path already exists" or "directory not empty" does not come from this example on the normal path.
 >
-> Hooks also run with a restricted environment: an allowlist (including `HOME`
-> and `SSH_AUTH_SOCK`) plus `SORTIE_*` variables. Sortie strips any variable
-> outside that set, such as `GIT_SSH_COMMAND`, so an SSH clone must reach its
-> key through the SSH agent (`SSH_AUTH_SOCK`) or through `~/.ssh` via `HOME`,
-> not through a stripped variable. See Section 6.2 for the full allowlist.
+> Hooks also run with a restricted environment: an allowlist (including `HOME` and `SSH_AUTH_SOCK`) plus `SORTIE_*` variables. Sortie strips any variable outside that set, such as `GIT_SSH_COMMAND`, so an SSH clone must reach its key through the SSH agent (`SSH_AUTH_SOCK`) or through `~/.ssh` via `HOME`, not through a stripped variable. See Section 6.2 for the full allowlist.
 
 | Field           | Type                           | Required | Default  | Dynamic Reload         | Description                                                                          |
 | --------------- | ------------------------------ | -------- | -------- | ---------------------- | ------------------------------------------------------------------------------------ |
@@ -762,8 +494,7 @@ hooks:
 | `before_remove` | multiline shell script or null | No       | _(none)_ | Future hook executions | Runs before workspace deletion, if the directory exists.                             |
 | `timeout_ms`    | integer                        | No       | `60000`  | Future hook executions | Timeout in milliseconds for all hooks. Non-positive values fall back to the default. |
 
-See [Section 6: Hook Lifecycle Reference](#6-hook-lifecycle-reference) for execution
-contract, environment variables, and failure semantics.
+See [Section 6: Hook Lifecycle Reference](#6-hook-lifecycle-reference) for execution contract, environment variables, and failure semantics.
 
 ---
 
@@ -802,10 +533,7 @@ agent:
 | `max_tokens`                     | integer                           | No                                  | `0` (unlimited) | **Yes** — stops a run already in flight and affects future retry evaluations | Cumulative per-issue token ceiling. The orchestrator sums `total_tokens` across the issue's run history, adds the running session's own reported spend, and stops re-dispatching once the sum reaches the limit; reaching the ceiling also stops a run already in flight, on the event loop, as soon as a usage figure carries the sum there. A run whose coding agent reported no token usage contributes nothing to the sum, and such a run makes the ceiling report that it could not be fully evaluated (a warning is logged and the dispatch proceeds). `0` disables the budget (unlimited). Must be non-negative. Reaching the ceiling also posts one comment on the issue naming the token budget and `agent.max_tokens` as the setting that raises it, stating whether a session was stopped in flight. |
 | `max_consecutive_absences`       | integer                           | No                                  | `3`             | **Yes** — affects future worker exits, retry evaluations, and poll-tick park sweeps | Bounds how many runs in a row may be observed to have produced no evidence of work before the issue is parked. Any run that produces evidence of work resets the count to zero. `0` and negative values are rejected as a configuration error. The separate `max_sessions` governs the total per-issue session budget. |
 
-**Orchestrator vs adapter fields:** The fields above are consumed by the orchestrator
-for scheduling, concurrency, and retry decisions. They are **not** passed through to the
-agent adapter. Adapter-specific configuration uses separate pass-through blocks — see
-[Section 4.4](#44-adapter-specific-pass-through-config).
+**Orchestrator vs adapter fields:** The fields above are consumed by the orchestrator for scheduling, concurrency, and retry decisions. They are **not** passed through to the agent adapter. Adapter-specific configuration uses separate pass-through blocks — see [Section 4.4](#44-adapter-specific-pass-through-config).
 
 ---
 
@@ -826,25 +554,17 @@ db_path: /var/lib/sortie/state.db
 - Relative paths are resolved against the directory containing `WORKFLOW.md`.
 - An explicit empty string (`db_path: ""`) is equivalent to omitting the field.
 - Non-string values are rejected with a configuration error.
-- If the value resolves to empty after environment expansion (e.g., unset `$VAR`), startup
-  fails.
+- If the value resolves to empty after environment expansion (e.g., unset `$VAR`), startup fails.
 
-**Runtime behavior:** `db_path` is read once at startup to open the database connection.
-Dynamic reloads update the in-memory config value but have no effect on the already-open
-connection. A restart is required to change the database file.
+**Runtime behavior:** `db_path` is read once at startup to open the database connection. Dynamic reloads update the in-memory config value but have no effect on the already-open connection. A restart is required to change the database file.
 
-> **Migration note:** Changing `db_path` and restarting causes Sortie to open (or create) the
-> new file with a fresh schema. Retry queues and run history from the previous database file
-> are **not** migrated automatically. If you need to preserve state, copy the old `.sortie.db`
-> to the new path before restarting.
+> **Migration note:** Changing `db_path` and restarting causes Sortie to open (or create) the new file with a fresh schema. Retry queues and run history from the previous database file are **not** migrated automatically. If you need to preserve state, copy the old `.sortie.db` to the new path before restarting.
 
 ---
 
 ### 2.8 `ci_feedback` — CI Feedback Loop (**deprecated**)
 
-> **Deprecated.** Use `reactions.ci_failure` instead (Section 2.10). When both `ci_feedback`
-> and `reactions.ci_failure` are present, `reactions.ci_failure` takes precedence and a
-> deprecation warning is logged at startup.
+> **Deprecated.** Use `reactions.ci_failure` instead (Section 2.10). When both `ci_feedback` and `reactions.ci_failure` are present, `reactions.ci_failure` takes precedence and a deprecation warning is logged at startup.
 
 ```yaml
 ci_feedback:
@@ -863,12 +583,9 @@ ci_feedback:
 | `escalation`       | string  | No                    | `label`        | Future dispatches | Action when `max_retries` is exceeded. Valid values: `"label"` (add a label to the issue), `"comment"` (post a comment on the issue). |
 | `escalation_label` | string  | No                    | `needs-human`  | Future dispatches | Label applied to the issue when `escalation` is `"label"`.                                                            |
 
-The deprecated `ci_feedback` section exposes no `watch_window_ms` key. A deployment that still uses
-this section receives the default value described in Section 2.10.
+The deprecated `ci_feedback` section exposes no `watch_window_ms` key. A deployment that still uses this section receives the default value described in Section 2.10.
 
-**Activation pattern:** CI feedback has no `enabled` flag. The feature is active when
-`ci_feedback.kind` is present and non-empty. Omit the entire `ci_feedback` section to
-disable the feature:
+**Activation pattern:** CI feedback has no `enabled` flag. The feature is active when `ci_feedback.kind` is present and non-empty. Omit the entire `ci_feedback` section to disable the feature:
 
 ```yaml
 # CI feedback disabled — section omitted entirely
@@ -876,20 +593,14 @@ disable the feature:
 #   kind: github
 ```
 
-**SCM coordinates:** Owner, repository, and token are not part of `ci_feedback`. They
-live in the adapter pass-through block (e.g., the existing `github:` top-level section)
-and are shared with the tracker adapter when both use the same SCM provider.
+**SCM coordinates:** Owner, repository, and token are not part of `ci_feedback`. They live in the adapter pass-through block (e.g., the existing `github:` top-level section) and are shared with the tracker adapter when both use the same SCM provider.
 
 **Validation rules:**
 
-- `max_retries` must be non-negative. Negative values are rejected with a configuration
-  error.
-- `max_log_lines` must be non-negative. Negative values are rejected with a configuration
-  error.
-- `escalation` must be `"label"` or `"comment"`. Other values are rejected with a
-  configuration error.
-- When `kind` is absent or empty, all other fields in the section are ignored and the
-  `CIFeedbackConfig` is a zero value.
+- `max_retries` must be non-negative. Negative values are rejected with a configuration error.
+- `max_log_lines` must be non-negative. Negative values are rejected with a configuration error.
+- `escalation` must be `"label"` or `"comment"`. Other values are rejected with a configuration error.
+- When `kind` is absent or empty, all other fields in the section are ignored and the `CIFeedbackConfig` is a zero value.
 
 ---
 
@@ -907,11 +618,7 @@ self_review:
   reviewer: same
 ```
 
-The self-review section configures an optional post-coding verification and iterative
-review phase. When enabled, the orchestrator runs verification commands after the coding
-turn loop, generates a workspace diff, and presents both to the agent for a structured
-verdict. If the agent identifies issues ("iterate"), a fix turn runs and the cycle repeats
-up to `max_iterations`.
+The self-review section configures an optional post-coding verification and iterative review phase. When enabled, the orchestrator runs verification commands after the coding turn loop, generates a workspace diff, and presents both to the agent for a structured verdict. If the agent identifies issues ("iterate"), a fix turn runs and the cycle repeats up to `max_iterations`.
 
 | Key                        | Type     | Required           | Default    | Description                                                       |
 | -------------------------- | -------- | ------------------ | ---------- | ----------------------------------------------------------------- |
@@ -922,20 +629,14 @@ up to `max_iterations`.
 | `max_diff_bytes`           | integer  | No                 | `102400`   | Max bytes of diff to include in review prompt.                    |
 | `reviewer`                 | string   | No                 | `"same"`   | Which agent reviews. Only `"same"` in v1.                         |
 
-**Turn Accounting:** `max_iterations: N` means up to `2N − 1` additional agent turns
-(N review turns + N−1 fix turns). For the default `max_iterations: 3`, this is up to 5
-additional turns beyond the coding turn loop. Plan token budgets accordingly.
+**Turn Accounting:** `max_iterations: N` means up to `2N − 1` additional agent turns (N review turns + N−1 fix turns). For the default `max_iterations: 3`, this is up to 5 additional turns beyond the coding turn loop. Plan token budgets accordingly.
 
 **Validation rules:**
 
-- When `enabled` is `true`, `verification_commands` must be a non-empty list. An empty list
-  is rejected with a configuration error.
-- `max_iterations` must be in the range [1, 10]. Values outside this range are rejected with
-  a configuration error.
-- `reviewer` must be `"same"`. Other values are reserved for future use and are rejected
-  with a configuration error.
-- When `enabled` is `false` or the section is absent, all other fields are ignored and the
-  self-review phase adds zero overhead.
+- When `enabled` is `true`, `verification_commands` must be a non-empty list. An empty list is rejected with a configuration error.
+- `max_iterations` must be in the range [1, 10]. Values outside this range are rejected with a configuration error.
+- `reviewer` must be `"same"`. Other values are reserved for future use and are rejected with a configuration error.
+- When `enabled` is `false` or the section is absent, all other fields are ignored and the self-review phase adds zero overhead.
 
 ---
 
@@ -953,9 +654,7 @@ reactions:
     max_continuation_turns: 3
 ```
 
-The `reactions` section configures feedback loops that respond to external events (CI
-failures, PR review comments) by dispatching continuation turns to the agent. Each key
-under `reactions` identifies a reaction kind.
+The `reactions` section configures feedback loops that respond to external events (CI failures, PR review comments) by dispatching continuation turns to the agent. Each key under `reactions` identifies a reaction kind.
 
 **Common fields** (shared across all reaction kinds):
 
@@ -966,56 +665,15 @@ under `reactions` identifies a reaction kind.
 | `escalation`       | string  | No                    | `label`       | Requires restart | Action taken when the kind hands the subject to a person, either because retries are exhausted or because a `triage` command answered `escalate`. Valid: `"label"`, `"comment"`. |
 | `escalation_label` | string  | No                    | `needs-human` | Requires restart | Label applied when `escalation` is `"label"`.                                                    |
 
-**Reload behavior:** every field of every reaction kind is read once when the orchestrator
-is constructed and is not rebuilt on a `WORKFLOW.md` reload, so a change takes effect only
-on the next restart. `reactions.ci_failure` is the single exception: the orchestrator folds
-it into the `ci_feedback` shape and re-reads `max_retries`, `escalation`,
-`escalation_label`, and `watch_window_ms` from the reloaded config on each tick. Its
-`max_log_lines` and its `triage` block still require a restart: the CI provider is constructed
-once at process start, and the triage configuration is frozen at construction for every kind that
-offers it, so a script or timeout changed mid-run cannot apply one configuration's timeout to
-another configuration's script.
+**Reload behavior:** every field of every reaction kind is read once when the orchestrator is constructed and is not rebuilt on a `WORKFLOW.md` reload, so a change takes effect only on the next restart. `reactions.ci_failure` is the single exception: the orchestrator folds it into the `ci_feedback` shape and re-reads `max_retries`, `escalation`, `escalation_label`, and `watch_window_ms` from the reloaded config on each tick. Its `max_log_lines` and its `triage` block still require a restart: the CI provider is constructed once at process start, and the triage configuration is frozen at construction for every kind that offers it, so a script or timeout changed mid-run cannot apply one configuration's timeout to another configuration's script.
 
-**Escalation recurrence:** `escalation: label` is idempotent (re-applying a
-present label is a no-op); `escalation: comment` posts a new comment each time
-it fires. Two conditions fire it: the kind's own budget is exhausted, or a
-`triage` command answers `escalate`. Recurrence depends on the kind rather than
-on which condition fired. For kinds whose escalation releases the issue claim
-(`ci_failure`, `review_comments`), escalation fires once and the reaction stops.
-For kinds whose escalation is scoped and keeps the claim (`auto_merge`,
-`bot_review`), the reaction re-arms if its condition recurs and escalates again,
-so on a long-lived PR `escalation: comment` can accumulate repeated comments
-while `escalation: label` stays a single mark. Prefer `label` for kinds that may
-escalate repeatedly. A triage escalation is not re-posted for a subject already
-escalated: the answer is retained for as long as the subject's fingerprint
-stands, and a retained `escalate` re-applies without invoking the escalation a
-second time.
+**Escalation recurrence:** `escalation: label` is idempotent (re-applying a present label is a no-op); `escalation: comment` posts a new comment each time it fires. Two conditions fire it: the kind's own budget is exhausted, or a `triage` command answers `escalate`. Recurrence depends on the kind rather than on which condition fired. For kinds whose escalation releases the issue claim (`ci_failure`, `review_comments`), escalation fires once and the reaction stops. For kinds whose escalation is scoped and keeps the claim (`auto_merge`, `bot_review`), the reaction re-arms if its condition recurs and escalates again, so on a long-lived PR `escalation: comment` can accumulate repeated comments while `escalation: label` stays a single mark. Prefer `label` for kinds that may escalate repeatedly. A triage escalation is not re-posted for a subject already escalated: the answer is retained for as long as the subject's fingerprint stands, and a retained `escalate` re-applies without invoking the escalation a second time.
 
-**Release on terminal state:** each reconcile pass reads tracker state for every running
-issue and for every issue holding a pending reaction entry, whether or not a worker is
-still running for it. When the tracker reports an issue in a state from
-`tracker.terminal_states`, the pass releases that issue's pending reaction entries, its
-reaction attempt counters, its pending retry, and its dispatch claim. Polling for that
-issue stops on the same pass. The release is scoped to in-memory state and leaves the
-`reaction_fingerprints` rows untouched.
+**Release on terminal state:** each reconcile pass reads tracker state for every running issue and for every issue holding a pending reaction entry, whether or not a worker is still running for it. When the tracker reports an issue in a state from `tracker.terminal_states`, the pass releases that issue's pending reaction entries, its reaction attempt counters, its pending retry, and its dispatch claim. Polling for that issue stops on the same pass. The release is scoped to in-memory state and leaves the `reaction_fingerprints` rows untouched.
 
 Remaining keys within a kind sub-object are kind-specific and collected into an `Extra` map.
 
-**SCM and CI provider selection.** The reaction `provider` field (and the deprecated
-`ci_feedback.kind`) names a registered SCM adapter or CI provider kind: `github`, `gitea`, or
-`gitlab`. The reaction kinds are provider-agnostic. Setting `provider: gitea` activates the Gitea
-adapter for that reaction. Its `endpoint`, `api_key`, and `project` come from the top-level `gitea:`
-pass-through block ([Section 4.5](#45-adapter-specific-pass-through-config)); when `tracker.kind`
-is also `gitea`, any of the three left unset in that block falls back to the matching `tracker:`
-value. A Gitea reaction can therefore pair with a non-Gitea tracker, as long as the `gitea:` block
-supplies the credentials, including the instance `endpoint` Gitea always requires. Setting
-`provider: gitlab` activates the GitLab adapter for that reaction and resolves the same three
-fields from the top-level `gitlab:` block by the same rule. `endpoint` is optional there, because
-the GitLab adapter defaults it to `https://gitlab.com`; only a self-managed instance sets one. The
-GitLab SCM adapter ignores `project` and takes the owner and repository from the pull request
-metadata on every call, while the GitLab CI provider requires `project`, so a GitLab `ci_failure`
-reaction paired with a non-GitLab tracker MUST set it in the `gitlab:` block. Every active
-SCM reaction in one workflow MUST name the same provider.
+**SCM and CI provider selection.** The reaction `provider` field (and the deprecated `ci_feedback.kind`) names a registered SCM adapter or CI provider kind: `github`, `gitea`, or `gitlab`. The reaction kinds are provider-agnostic. Setting `provider: gitea` activates the Gitea adapter for that reaction. Its `endpoint`, `api_key`, and `project` come from the top-level `gitea:` pass-through block ([Section 4.5](#45-adapter-specific-pass-through-config)); when `tracker.kind` is also `gitea`, any of the three left unset in that block falls back to the matching `tracker:` value. A Gitea reaction can therefore pair with a non-Gitea tracker, as long as the `gitea:` block supplies the credentials, including the instance `endpoint` Gitea always requires. Setting `provider: gitlab` activates the GitLab adapter for that reaction and resolves the same three fields from the top-level `gitlab:` block by the same rule. `endpoint` is optional there, because the GitLab adapter defaults it to `https://gitlab.com`; only a self-managed instance sets one. The GitLab SCM adapter ignores `project` and takes the owner and repository from the pull request metadata on every call, while the GitLab CI provider requires `project`, so a GitLab `ci_failure` reaction paired with a non-GitLab tracker MUST set it in the `gitlab:` block. Every active SCM reaction in one workflow MUST name the same provider.
 
 #### Triage command (`triage`)
 
@@ -1094,9 +752,7 @@ Exit code 0 together with a well-formed result file naming one of the three valu
 
 #### Reaction kind: `ci_failure`
 
-Equivalent to the deprecated `ci_feedback` section. Configures the CI failure feedback
-loop. The orchestrator resolves the pull request's current head on each pass and polls CI
-status for that head, dispatching continuation turns when CI fails on it.
+Equivalent to the deprecated `ci_feedback` section. Configures the CI failure feedback loop. The orchestrator resolves the pull request's current head on each pass and polls CI status for that head, dispatching continuation turns when CI fails on it.
 
 Its `provider` must match the provider of every other active SCM reaction.
 
@@ -1121,9 +777,7 @@ reactions:
 
 #### Reaction kind: `review_comments`
 
-PR review comment routing. When configured, the orchestrator polls for human
-`CHANGES_REQUESTED` review comments on Sortie-created PRs and dispatches continuation
-turns so the agent can address the feedback.
+PR review comment routing. When configured, the orchestrator polls for human `CHANGES_REQUESTED` review comments on Sortie-created PRs and dispatches continuation turns so the agent can address the feedback.
 
 Additional fields (via Extra):
 
@@ -1134,38 +788,19 @@ Additional fields (via Extra):
 | `max_continuation_turns` | integer | `3`      | Requires restart | Maximum review-fix continuation dispatches per issue before escalation. Must be positive.                  |
 | `watch_window_ms`        | integer | `1800000` | Requires restart | Bounds a pending entry's age, measured from the entry's creation. `0` removes the bound. Must be non-negative and must not exceed `9223372036854`. |
 
-**Activation:** The `reactions.review_comments` block is active when `provider` is present
-and non-empty. Agent-created PRs MUST write `pr_number`, `owner`, and `repo` to
-`.sortie/scm.json` in the workspace for review polling to activate.
+**Activation:** The `reactions.review_comments` block is active when `provider` is present and non-empty. Agent-created PRs MUST write `pr_number`, `owner`, and `repo` to `.sortie/scm.json` in the workspace for review polling to activate.
 
-**SCM coordinates:** The `owner` and `repo` values are sourced from `.sortie/scm.json`
-(written by the agent), not from the tracker project configuration. This decouples SCM
-repository identity from the tracker project identifier.
+**SCM coordinates:** The `owner` and `repo` values are sourced from `.sortie/scm.json` (written by the agent), not from the tracker project configuration. This decouples SCM repository identity from the tracker project identifier.
 
-**Recovery timestamp:** Hooks that push commits or create PRs SHOULD write `pushed_at` to
-`.sortie/scm.json` when review or CI reaction recovery is enabled. Startup recovery uses
-`pushed_at` to decide whether handoff-stage reaction work is fresh. If `pushed_at` is absent,
-recovery falls back to `run_history.completed_at`, so long-lived PRs can age out based on the
-agent completion time instead of the latest push time.
+**Recovery timestamp:** Hooks that push commits or create PRs SHOULD write `pushed_at` to `.sortie/scm.json` when review or CI reaction recovery is enabled. Startup recovery uses `pushed_at` to decide whether handoff-stage reaction work is fresh. If `pushed_at` is absent, recovery falls back to `run_history.completed_at`, so long-lived PRs can age out based on the agent completion time instead of the latest push time.
 
-**Debounce behavior:** When review comments are detected but the newest comment timestamp
-is within the debounce window, dispatch is deferred. This ensures the reviewer has finished
-their full review before the agent starts addressing comments.
+**Debounce behavior:** When review comments are detected but the newest comment timestamp is within the debounce window, dispatch is deferred. This ensures the reviewer has finished their full review before the agent starts addressing comments.
 
-**Fingerprint dedup:** The orchestrator computes a SHA-256 fingerprint from sorted
-non-outdated comment IDs. If the fingerprint has not changed since the last dispatch,
-no new continuation is triggered. Fingerprints are persisted across restarts in the
-`reaction_fingerprints` SQLite table.
+**Fingerprint dedup:** The orchestrator computes a SHA-256 fingerprint from sorted non-outdated comment IDs. If the fingerprint has not changed since the last dispatch, no new continuation is triggered. Fingerprints are persisted across restarts in the `reaction_fingerprints` SQLite table.
 
-**Bot exclusion:** Human-loop selection drops a comment whose author the platform reports as
-an automated bot account, and separately drops a comment whose author matches
-`reactions.bot_review.bot_usernames`. The allowlist half takes effect only while
-`reactions.bot_review` is configured with a provider, because that is the only condition under
-which the allowlist is built; a deployment running `review_comments` alone sees no allowlist
-exclusion.
+**Bot exclusion:** Human-loop selection drops a comment whose author the platform reports as an automated bot account, and separately drops a comment whose author matches `reactions.bot_review.bot_usernames`. The allowlist half takes effect only while `reactions.bot_review` is configured with a provider, because that is the only condition under which the allowlist is built; a deployment running `review_comments` alone sees no allowlist exclusion.
 
-**Escalation:** When `max_continuation_turns` is exhausted, the orchestrator applies the
-configured escalation action (label or comment) and releases the claim.
+**Escalation:** When `max_continuation_turns` is exhausted, the orchestrator applies the configured escalation action (label or comment) and releases the claim.
 
 Example:
 
@@ -1183,11 +818,7 @@ reactions:
 
 #### Reaction kind: `auto_merge`
 
-PR auto-merge. When configured and enabled, the orchestrator polls merge preconditions
-(review decision, CI status, draft state, mergeability) on Sortie-created PRs and
-executes the merge directly through the SCM adapter once the compound condition is
-satisfied. Auto-merge is disabled by default; enabling it is an explicit opt-in because
-the merge is irreversible.
+PR auto-merge. When configured and enabled, the orchestrator polls merge preconditions (review decision, CI status, draft state, mergeability) on Sortie-created PRs and executes the merge directly through the SCM adapter once the compound condition is satisfied. Auto-merge is disabled by default; enabling it is an explicit opt-in because the merge is irreversible.
 
 Additional fields (via Extra):
 
@@ -1199,62 +830,21 @@ Additional fields (via Extra):
 | `poll_interval_ms` | integer | `60000`  | Requires restart | Polling interval for the precondition state machine. Minimum: `30000` (30 sec).                           |
 | `watch_window_ms`  | integer | `1800000` | Requires restart | Bounds a pending entry's age, measured from the entry's creation. `0` removes the bound. Must be non-negative and must not exceed `9223372036854`. |
 
-For a GitLab provider, `require_ci` reads the head pipeline the platform reports for the PR
-rather than a fetched check-run list, with one exception. A head pipeline the platform reports
-as `skipped` satisfies the gate, because that status is non-failing. A head pipeline the
-platform reports as `manual` is the exception, and the one case that costs a second request.
-GitLab reports `manual` both for a pipeline whose only remaining work is a manual job and for
-one that already carries a failed job beside it, so `require_ci` reads the commit statuses
-GitLab records for that pipeline and applies to them the same rule it applies to every other
-check. An untriggered manual job is not a failure, so a manual pipeline carrying no failed job
-satisfies the gate even though that job has not run; one carrying a failed job does not; one
-whose manual gate still holds later jobs at not-yet-started defers until they run. A project's "Pipelines
-must succeed" setting is the control that holds a merge on a pipeline that did not succeed.
+For a GitLab provider, `require_ci` reads the head pipeline the platform reports for the PR rather than a fetched check-run list, with one exception. A head pipeline the platform reports as `skipped` satisfies the gate, because that status is non-failing. A head pipeline the platform reports as `manual` is the exception, and the one case that costs a second request. GitLab reports `manual` both for a pipeline whose only remaining work is a manual job and for one that already carries a failed job beside it, so `require_ci` reads the commit statuses GitLab records for that pipeline and applies to them the same rule it applies to every other check. An untriggered manual job is not a failure, so a manual pipeline carrying no failed job satisfies the gate even though that job has not run; one carrying a failed job does not; one whose manual gate still holds later jobs at not-yet-started defers until they run. A project's "Pipelines must succeed" setting is the control that holds a merge on a pipeline that did not succeed.
 
-**Activation:** The `reactions.auto_merge` block is active when `provider` is present
-and non-empty. Agent-created PRs MUST write `pr_number` (positive integer), `owner`,
-`repo`, and `branch` (all non-empty) to `.sortie/scm.json` in the workspace for
-auto-merge to activate. Recovery on restart additionally consults `pushed_at` (when
-present) to skip stale PRs older than the recovery lookback window.
+**Activation:** The `reactions.auto_merge` block is active when `provider` is present and non-empty. Agent-created PRs MUST write `pr_number` (positive integer), `owner`, `repo`, and `branch` (all non-empty) to `.sortie/scm.json` in the workspace for auto-merge to activate. Recovery on restart additionally consults `pushed_at` (when present) to skip stale PRs older than the recovery lookback window.
 
-**Token scopes required:** for a GitHub provider the configured token must carry
-`pull_requests:write` for the merge endpoint, and when `delete_branch` is not `false`, also
-`contents:write` for the branch delete endpoint. The classic `repo` scope is a superset that
-covers both. The orchestrator validates scopes once at startup; failure emits an ERROR log with
-the missing scope and disables auto-merge for the process lifetime. A transport-class startup
-failure (network outage) schedules a single bounded retry on the next reconcile tick before
-disabling auto-merge.
+**Token scopes required:** for a GitHub provider the configured token must carry `pull_requests:write` for the merge endpoint, and when `delete_branch` is not `false`, also `contents:write` for the branch delete endpoint. The classic `repo` scope is a superset that covers both. The orchestrator validates scopes once at startup; failure emits an ERROR log with the missing scope and disables auto-merge for the process lifetime. A transport-class startup failure (network outage) schedules a single bounded retry on the next reconcile tick before disabling auto-merge.
 
-For a Gitea provider the scope model differs: Gitea has one coarse `write:repository` scope
-covering both the merge and branch-delete routes, and it exposes no scope-introspection surface.
-The startup check substitutes a user-role gate, reading the repository's `permissions.push` field
-and disabling auto-merge when the token's user lacks repository write access. A read-scoped token
-whose user has write access passes that gate and surfaces the missing scope only at runtime, as a
-403 on the first merge or branch delete that the adapter rewrites to name `write:repository`.
-Grant the token's user repository write access and the token the `write:repository` scope.
+For a Gitea provider the scope model differs: Gitea has one coarse `write:repository` scope covering both the merge and branch-delete routes, and it exposes no scope-introspection surface. The startup check substitutes a user-role gate, reading the repository's `permissions.push` field and disabling auto-merge when the token's user lacks repository write access. A read-scoped token whose user has write access passes that gate and surfaces the missing scope only at runtime, as a 403 on the first merge or branch delete that the adapter rewrites to name `write:repository`. Grant the token's user repository write access and the token the `write:repository` scope.
 
-For a GitLab provider one scope covers the whole API. `api` grants complete read and write access,
-so it covers the merge and branch-delete routes together and `delete_branch` does not change what
-the token needs; `read_api` covers the reads and is refused on every write. The startup check reads
-`GET /personal_access_tokens/self`: a classic token whose scopes omit `api` is a verified gap and
-disables auto-merge, while four responses leave the check unable to classify the token at all and
-auto-merge enabled. Those four are the opaque `granular` scopes value a fine-grained token reports,
-an empty scopes array, an unreadable introspection body, and a 404 on the introspection route. That
-skip is not a preflight failure and blocks nothing, so confirm a fine-grained token's permissions
-directly. Grant the token the `api` scope.
+For a GitLab provider one scope covers the whole API. `api` grants complete read and write access, so it covers the merge and branch-delete routes together and `delete_branch` does not change what the token needs; `read_api` covers the reads and is refused on every write. The startup check reads `GET /personal_access_tokens/self`: a classic token whose scopes omit `api` is a verified gap and disables auto-merge, while four responses leave the check unable to classify the token at all and auto-merge enabled. Those four are the opaque `granular` scopes value a fine-grained token reports, an empty scopes array, an unreadable introspection body, and a 404 on the introspection route. That skip is not a preflight failure and blocks nothing, so confirm a fine-grained token's permissions directly. Grant the token the `api` scope.
 
-**Fingerprint dedup:** The fingerprint is the SHA-256 of the PR head SHA concatenated
-with the review decision. A new push or a change in review decision invalidates the
-fingerprint and allows a new merge attempt; an unchanged fingerprint with the dispatched
-flag set suppresses duplicate merge calls within the poll interval.
+**Fingerprint dedup:** The fingerprint is the SHA-256 of the PR head SHA concatenated with the review decision. A new push or a change in review decision invalidates the fingerprint and allows a new merge attempt; an unchanged fingerprint with the dispatched flag set suppresses duplicate merge calls within the poll interval.
 
-**Cross-kind isolation:** Auto-merge success and failure cleanup scope mutation to the
-`merge` kind only. CI failure and review comment continuations on the same issue are
-unaffected by a successful merge or by escalation.
+**Cross-kind isolation:** Auto-merge success and failure cleanup scope mutation to the `merge` kind only. CI failure and review comment continuations on the same issue are unaffected by a successful merge or by escalation.
 
-**Escalation:** When `max_retries` is exhausted, the orchestrator applies the configured
-escalation action (label or comment) and removes the pending merge entry. Other reaction
-kinds on the same issue are preserved.
+**Escalation:** When `max_retries` is exhausted, the orchestrator applies the configured escalation action (label or comment) and removes the pending merge entry. Other reaction kinds on the same issue are preserved.
 
 Example:
 
@@ -1272,11 +862,7 @@ reactions:
 
 #### Reaction kind: `bot_review`
 
-Automated review-bot comment routing. When configured, the orchestrator polls for
-PR comments authored by automated review tools (linters, static analyzers, security
-scanners, and AI reviewers such as GitHub Copilot or CodeRabbit) on Sortie-created PRs and dispatches continuation turns so
-the agent can address them. This is the complement of `review_comments`, which routes
-only human `CHANGES_REQUESTED` comments and excludes bot-authored ones.
+Automated review-bot comment routing. When configured, the orchestrator polls for PR comments authored by automated review tools (linters, static analyzers, security scanners, and AI reviewers such as GitHub Copilot or CodeRabbit) on Sortie-created PRs and dispatches continuation turns so the agent can address them. This is the complement of `review_comments`, which routes only human `CHANGES_REQUESTED` comments and excludes bot-authored ones.
 
 Additional fields (via Extra):
 
@@ -1287,41 +873,17 @@ Additional fields (via Extra):
 | `watch_window_ms`        | integer      | `1800000` | Requires restart | Bounds a pending entry's age, measured from the entry's creation. `0` removes the bound. Must be non-negative and must not exceed `9223372036854`. |
 | `max_continuation_turns` | integer      | `5`     | Requires restart | Maximum bot-fix continuation dispatches per issue before escalation. Must be positive. Higher than `review_comments` because bot fixes are mechanical.    |
 
-**Activation:** The `reactions.bot_review` block is active when `provider` is present
-and non-empty, on its own, with no `reactions.review_comments` or `reactions.auto_merge`
-block required. When `provider` is absent or empty, the block is inactive. Agent-created
-PRs MUST write `pr_number` (positive integer), `owner`, `repo`, and `branch` (all non-empty)
-to `.sortie/scm.json` in the workspace for bot-review polling to activate.
+**Activation:** The `reactions.bot_review` block is active when `provider` is present and non-empty, on its own, with no `reactions.review_comments` or `reactions.auto_merge` block required. When `provider` is absent or empty, the block is inactive. Agent-created PRs MUST write `pr_number` (positive integer), `owner`, `repo`, and `branch` (all non-empty) to `.sortie/scm.json` in the workspace for bot-review polling to activate.
 
-**Classification:** Bot detection is deterministic author-metadata matching, not a
-content heuristic. A comment is selected when the platform marks its author as a bot OR
-its author login matches a `bot_usernames` entry, case-insensitively. The `bot_usernames`
-allowlist covers review tools that comment under a regular user account (`user.type == "User"`)
-rather than a bot account, such as Hound (`houndci-bot`), which posts inline style comments under a regular user account. Unlike
-`review_comments`, no `CHANGES_REQUESTED` review state is required, because review bots
-commonly post comment-only reviews. The same `bot_usernames` entry also excludes its author from
-`review_comments`, so a `bot_review` comment set and a `review_comments` comment set never both
-carry the same allowlisted author's feedback.
+**Classification:** Bot detection is deterministic author-metadata matching, not a content heuristic. A comment is selected when the platform marks its author as a bot OR its author login matches a `bot_usernames` entry, case-insensitively. The `bot_usernames` allowlist covers review tools that comment under a regular user account (`user.type == "User"`) rather than a bot account, such as Hound (`houndci-bot`), which posts inline style comments under a regular user account. Unlike `review_comments`, no `CHANGES_REQUESTED` review state is required, because review bots commonly post comment-only reviews. The same `bot_usernames` entry also excludes its author from `review_comments`, so a `bot_review` comment set and a `review_comments` comment set never both carry the same allowlisted author's feedback.
 
-**No debounce:** Bot comments are dispatched immediately. There is no `debounce_ms`
-field; the debounce window that `review_comments` applies does not apply to `bot_review`,
-because bot comments arrive in bulk on push rather than at reviewer pace.
+**No debounce:** Bot comments are dispatched immediately. There is no `debounce_ms` field; the debounce window that `review_comments` applies does not apply to `bot_review`, because bot comments arrive in bulk on push rather than at reviewer pace.
 
-**Fingerprint dedup:** The orchestrator computes a SHA-256 fingerprint from sorted
-non-outdated comment IDs and persists it in the `reaction_fingerprints` SQLite table
-under a kind distinct from `review_comments`. A new push that changes the bot comment-ID
-set changes the fingerprint and re-triggers dispatch; an unchanged dispatched fingerprint
-suppresses re-dispatch within the poll interval.
+**Fingerprint dedup:** The orchestrator computes a SHA-256 fingerprint from sorted non-outdated comment IDs and persists it in the `reaction_fingerprints` SQLite table under a kind distinct from `review_comments`. A new push that changes the bot comment-ID set changes the fingerprint and re-triggers dispatch; an unchanged dispatched fingerprint suppresses re-dispatch within the poll interval.
 
-**Cross-kind isolation:** `bot_review` and `review_comments` never interfere on the same
-PR; each owns its own pending entry, fingerprint row, and attempt counter. Escalation
-cleanup is scoped to the `bot_review` kind only and does not release the issue claim or
-clear sibling reaction kinds.
+**Cross-kind isolation:** `bot_review` and `review_comments` never interfere on the same PR; each owns its own pending entry, fingerprint row, and attempt counter. Escalation cleanup is scoped to the `bot_review` kind only and does not release the issue claim or clear sibling reaction kinds.
 
-**Escalation:** When `max_continuation_turns` is exhausted, the orchestrator applies the
-configured escalation action (`label` or `comment`, default `label`, with
-`escalation_label` defaulting to `needs-human`) and removes the pending bot-review entry.
-Other reaction kinds on the same issue are preserved.
+**Escalation:** When `max_continuation_turns` is exhausted, the orchestrator applies the configured escalation action (`label` or `comment`, default `label`, with `escalation_label` defaulting to `needs-human`) and removes the pending bot-review entry. Other reaction kinds on the same issue are preserved.
 
 Example:
 
@@ -1339,16 +901,9 @@ reactions:
 
 #### Reaction kind: `merge_conflicts`
 
-Merge-conflict detection and resolution. When configured, the orchestrator polls
-mergeability on Sortie-created open PRs each reconcile cycle and dispatches one
-rebase-and-resolve continuation turn each time a PR transitions from no-conflict to
-conflict. The continuation carries the PR's real base branch so the agent rebases the PR
-head branch onto the correct target and resolves the conflicts on the existing workspace.
+Merge-conflict detection and resolution. When configured, the orchestrator polls mergeability on Sortie-created open PRs each reconcile cycle and dispatches one rebase-and-resolve continuation turn each time a PR transitions from no-conflict to conflict. The continuation carries the PR's real base branch so the agent rebases the PR head branch onto the correct target and resolves the conflicts on the existing workspace.
 
-Retry semantics are episodic: a resolved conflict closes the episode and resets the
-attempt counter, so a later independent conflict opens a fresh episode rather than
-counting against the prior budget. The default `max_retries` is `1`, lower than the other
-kinds, because merge-conflict resolution is less likely to succeed on retry than a CI fix.
+Retry semantics are episodic: a resolved conflict closes the episode and resets the attempt counter, so a later independent conflict opens a fresh episode rather than counting against the prior budget. The default `max_retries` is `1`, lower than the other kinds, because merge-conflict resolution is less likely to succeed on retry than a CI fix.
 
 Fields:
 
@@ -1361,32 +916,13 @@ Fields:
 | `poll_interval_ms` | integer | `60000`       | Requires restart | Polling interval for the conflict-detection state machine. Minimum: `30000` (30 sec).                     |
 | `watch_window_ms`  | integer | `1800000`     | Requires restart | Bounds a pending entry's age, measured from the entry's creation rather than from the last recorded head. `0` removes the bound. Must be non-negative and must not exceed `9223372036854`. |
 
-**Activation:** The `reactions.merge_conflicts` block is active when `provider` is present
-and non-empty, on its own, with no other `reactions` block required. Agent-created PRs MUST
-write `pr_number` (positive integer), `owner`, `repo`, and `branch` (all non-empty) to
-`.sortie/scm.json` in the workspace for merge-conflict polling to activate. To disable the
-reaction, omit the `merge_conflicts` block; setting `max_retries: 0` does not disable it but
-escalates on the first detected conflict.
+**Activation:** The `reactions.merge_conflicts` block is active when `provider` is present and non-empty, on its own, with no other `reactions` block required. Agent-created PRs MUST write `pr_number` (positive integer), `owner`, `repo`, and `branch` (all non-empty) to `.sortie/scm.json` in the workspace for merge-conflict polling to activate. To disable the reaction, omit the `merge_conflicts` block; setting `max_retries: 0` does not disable it but escalates on the first detected conflict.
 
-**Fingerprint dedup:** The fingerprint is the SHA-256 of the PR head SHA, persisted in the
-`reaction_fingerprints` SQLite table under a kind distinct from the other reactions. A
-single conflicted head dispatches exactly one rebase turn; after the agent rebases and
-pushes a new head, the new head produces a new fingerprint, so a conflict that persists
-across the rebase re-arms a new attempt bounded by `max_retries`. When the conflict clears,
-the row is deleted, so the next conflict observation dispatches again.
+**Fingerprint dedup:** The fingerprint is the SHA-256 of the PR head SHA, persisted in the `reaction_fingerprints` SQLite table under a kind distinct from the other reactions. A single conflicted head dispatches exactly one rebase turn; after the agent rebases and pushes a new head, the new head produces a new fingerprint, so a conflict that persists across the rebase re-arms a new attempt bounded by `max_retries`. When the conflict clears, the row is deleted, so the next conflict observation dispatches again.
 
-**Cross-kind isolation:** Merge-conflict detection runs independently of every other
-reaction kind; each owns its own pending entry, fingerprint row, and attempt counter.
-Escalation cleanup is scoped to the `merge-conflict` kind only and does not release the
-issue claim or clear sibling reaction kinds. Auto-merge and merge-conflict coexist on the
-same PR: auto-merge defers while a PR is conflicted, and merge-conflict drives the
-resolution, after which auto-merge proceeds once the PR is clean and approved.
+**Cross-kind isolation:** Merge-conflict detection runs independently of every other reaction kind; each owns its own pending entry, fingerprint row, and attempt counter. Escalation cleanup is scoped to the `merge-conflict` kind only and does not release the issue claim or clear sibling reaction kinds. Auto-merge and merge-conflict coexist on the same PR: auto-merge defers while a PR is conflicted, and merge-conflict drives the resolution, after which auto-merge proceeds once the PR is clean and approved.
 
-**Escalation:** When `max_retries` is exhausted within an episode (a new conflicting head
-pushes the attempt count strictly over the budget), the orchestrator applies the configured
-escalation action (`label` or `comment`, default `label`, with `escalation_label`
-defaulting to `needs-human`) and removes the pending merge-conflict entry and its attempt
-counter. Other reaction kinds on the same issue are preserved.
+**Escalation:** When `max_retries` is exhausted within an episode (a new conflicting head pushes the attempt count strictly over the budget), the orchestrator applies the configured escalation action (`label` or `comment`, default `label`, with `escalation_label` defaulting to `needs-human`) and removes the pending merge-conflict entry and its attempt counter. Other reaction kinds on the same issue are preserved.
 
 Example:
 
@@ -1400,39 +936,15 @@ reactions:
     poll_interval_ms: 60000
 ```
 
-**`watch_window_ms` across `review_comments`, `bot_review`, `merge_conflicts`, and
-`auto_merge`.** All four default to `1800000` (thirty minutes), the same lifetime these
-kinds carried before the key existed, so an upgrade with nothing set in `WORKFLOW.md`
-changes no behavior. A workflow without `auto_merge`, where a person reviews and merges,
-normally wants a value on the order of `reactions.ci_failure.watch_window_ms`'s default
-(twenty-four hours) rather than the thirty-minute default: raising it costs one additional
-poll call per interval for as long as the entry lives, at the same poll rate the kind
-already uses. Unlike `reactions.ci_failure`, none of these four kinds carries a
-merged-or-closed drop branch, so setting `watch_window_ms: 0` leaves a `review_comments`,
-`bot_review`, or `merge_conflicts` entry polling after a person merges the pull request
-until the tracker issue reaches a terminal state, and leaves an `auto_merge` entry polling
-until its own merge attempt returns the already-merged disposition. A quoted numeric value
-(for example `"1800000"`) is rejected for these four keys, although
-`reactions.ci_failure.watch_window_ms` accepts one.
+**`watch_window_ms` across `review_comments`, `bot_review`, `merge_conflicts`, and `auto_merge`.** All four default to `1800000` (thirty minutes), the same lifetime these kinds carried before the key existed, so an upgrade with nothing set in `WORKFLOW.md` changes no behavior. A workflow without `auto_merge`, where a person reviews and merges, normally wants a value on the order of `reactions.ci_failure.watch_window_ms`'s default (twenty-four hours) rather than the thirty-minute default: raising it costs one additional poll call per interval for as long as the entry lives, at the same poll rate the kind already uses. Unlike `reactions.ci_failure`, none of these four kinds carries a merged-or-closed drop branch, so setting `watch_window_ms: 0` leaves a `review_comments`, `bot_review`, or `merge_conflicts` entry polling after a person merges the pull request until the tracker issue reaches a terminal state, and leaves an `auto_merge` entry polling until its own merge attempt returns the already-merged disposition. A quoted numeric value (for example `"1800000"`) is rejected for these four keys, although `reactions.ci_failure.watch_window_ms` accepts one.
 
 #### Reaction kind: `label_commands`
 
-Label-command detection. When configured, the orchestrator polls each Sortie-managed PR's
-label-event journal and dispatches a read-only, no-clone agent session when an operator
-applies the configured review label. The session reads the PR diff and posts review
-comments under the agent's own identity; it performs no branch mutation and requires no
-repository checkout.
+Label-command detection. When configured, the orchestrator polls each Sortie-managed PR's label-event journal and dispatches a read-only, no-clone agent session when an operator applies the configured review label. The session reads the PR diff and posts review comments under the agent's own identity; it performs no branch mutation and requires no repository checkout.
 
-Unlike the other reaction kinds, `label_commands` carries no escalation semantics and does
-not use the shared per-kind fields (`max_retries`, `escalation`, `escalation_label`). It
-parses through a dedicated path and never appears as a generic reaction entry, so its
-fields sit directly on the block.
+Unlike the other reaction kinds, `label_commands` carries no escalation semantics and does not use the shared per-kind fields (`max_retries`, `escalation`, `escalation_label`). It parses through a dedicated path and never appears as a generic reaction entry, so its fields sit directly on the block.
 
-`label_commands` is the configuration key only. The runtime and persisted reaction-kind
-discriminators are `label-review` (the review command) and `label-fix` (the fix command):
-these values appear in logs and in the `reaction_fingerprints.kind` column. Each command
-has its own prompt continuation key, a third and fourth name: `label_review` and
-`label_fix` (both underscore; see Section 5.2).
+`label_commands` is the configuration key only. The runtime and persisted reaction-kind discriminators are `label-review` (the review command) and `label-fix` (the fix command): these values appear in logs and in the `reaction_fingerprints.kind` column. Each command has its own prompt continuation key, a third and fourth name: `label_review` and `label_fix` (both underscore; see Section 5.2).
 
 Fields:
 
@@ -1443,57 +955,17 @@ Fields:
 | `fix_label`        | string  | `sortie:fix`    | Requires restart | Label that triggers the fix command. An explicit empty string disables the fix command.                 |
 | `poll_interval_ms` | integer | `60000`         | Requires restart | Journal poll interval. Minimum `30000` (30 sec); a lower value is clamped up to the floor with a warning. |
 
-**Activation:** The `reactions.label_commands` block is active when `provider` is present
-and non-empty and at least one command label is non-empty. Activation considers `fix_label`
-exactly as it considers `review_label`: a fix-only configuration (`review_label` empty,
-`fix_label` non-empty) activates the block and constructs the SCM adapter exactly as a
-review-only configuration does. Agent-created PRs MUST write `pr_number` (positive
-integer), `owner`, and `repo` (all non-empty) to `.sortie/scm.json` in the workspace for
-label detection to activate. The review command requires no branch: the review session has
-no checkout. The fix command additionally requires a non-empty `branch` in the same file,
-because the fix session checks out and pushes to it; a PR record without one is not seeded
-for the fix command.
+**Activation:** The `reactions.label_commands` block is active when `provider` is present and non-empty and at least one command label is non-empty. Activation considers `fix_label` exactly as it considers `review_label`: a fix-only configuration (`review_label` empty, `fix_label` non-empty) activates the block and constructs the SCM adapter exactly as a review-only configuration does. Agent-created PRs MUST write `pr_number` (positive integer), `owner`, and `repo` (all non-empty) to `.sortie/scm.json` in the workspace for label detection to activate. The review command requires no branch: the review session has no checkout. The fix command additionally requires a non-empty `branch` in the same file, because the fix session checks out and pushes to it; a PR record without one is not seeded for the fix command.
 
-**Acknowledgment:** On a confirmed command the orchestrator removes the label from the PR.
-The label's disappearance is the operator-visible signal that the command was accepted:
-present means "queued, not yet picked up"; gone means "accepted" (or retracted by the
-operator). A removal failure leaves the label in place and logs a warning; correctness is
-unaffected because deduplication rests on the journal position, not the removal. Re-applying
-the label after a review completes is a new gesture and produces a new session.
+**Acknowledgment:** On a confirmed command the orchestrator removes the label from the PR. The label's disappearance is the operator-visible signal that the command was accepted: present means "queued, not yet picked up"; gone means "accepted" (or retracted by the operator). A removal failure leaves the label in place and logs a warning; correctness is unaffected because deduplication rests on the journal position, not the removal. Re-applying the label after a review completes is a new gesture and produces a new session.
 
-**Validation:** Setting `provider` while both `review_label` and `fix_label` are empty is a
-configuration error. Because the defaults are non-empty, this occurs only when the operator
-explicitly sets both labels to `""`. The rule is a config-shape check and surfaces offline
-via `sortie validate`. A `provider` naming an unregistered SCM adapter is also a `validate`
-error, reported under the check name `scm_adapter` by the activation checks that fold every
-active SCM reaction kind, `label_commands` included, into one provider set.
+**Validation:** Setting `provider` while both `review_label` and `fix_label` are empty is a configuration error. Because the defaults are non-empty, this occurs only when the operator explicitly sets both labels to `""`. The rule is a config-shape check and surfaces offline via `sortie validate`. A `provider` naming an unregistered SCM adapter is also a `validate` error, reported under the check name `scm_adapter` by the activation checks that fold every active SCM reaction kind, `label_commands` included, into one provider set.
 
-**Operator prerequisite:** Enabling `review_label` requires the active prompt template to
-contain a `{{ if .label_review }}` branch that fetches the PR diff and posts review comments
-using the agent's own SCM tooling (see the `label_review` continuation key in Section 5.2).
-The orchestrator injects only the PR coordinates, never the diff text and never a posted
-comment, so without this branch a label-review dispatch runs the normal work prompt and
-posts no review. The orchestrator emits an info log at each dispatch and a warning at prompt
-load when the template omits the `label_review` token, so the inert outcome is diagnosable.
+**Operator prerequisite:** Enabling `review_label` requires the active prompt template to contain a `{{ if .label_review }}` branch that fetches the PR diff and posts review comments using the agent's own SCM tooling (see the `label_review` continuation key in Section 5.2). The orchestrator injects only the PR coordinates, never the diff text and never a posted comment, so without this branch a label-review dispatch runs the normal work prompt and posts no review. The orchestrator emits an info log at each dispatch and a warning at prompt load when the template omits the `label_review` token, so the inert outcome is diagnosable.
 
-**Operator prerequisite (fix):** Enabling `fix_label` requires the active prompt template to
-contain a `{{ if .label_fix }}` branch that checks out `label_fix.branch`, fetches and
-addresses the outstanding review comments, pushes the fixes to that branch, posts a summary
-comment, and writes `.sortie/status` to signal completion (see the `label_fix` continuation
-key in Section 5.2). The completion signal matters more here than for review: a review is
-naturally one turn, but a fix is multi-turn, so without it a completed fix session runs to
-`agent.max_turns` and wastes turns. Unlike the review case, a missing `label_fix` branch is
-not a structural no-op: the fix command clones and checks out a real workspace with
-content-write scope, so an applied fix label without the template branch runs the normal
-work prompt against a real checkout that can push. The workflow loader MUST (not SHOULD)
-emit a warning at prompt load when `label_commands` is active with a non-empty fix label but
-the template omits the `label_fix` token, and the orchestrator emits an info log at each fix
-dispatch, so the misconfiguration stays diagnosable.
+**Operator prerequisite (fix):** Enabling `fix_label` requires the active prompt template to contain a `{{ if .label_fix }}` branch that checks out `label_fix.branch`, fetches and addresses the outstanding review comments, pushes the fixes to that branch, posts a summary comment, and writes `.sortie/status` to signal completion (see the `label_fix` continuation key in Section 5.2). The completion signal matters more here than for review: a review is naturally one turn, but a fix is multi-turn, so without it a completed fix session runs to `agent.max_turns` and wastes turns. Unlike the review case, a missing `label_fix` branch is not a structural no-op: the fix command clones and checks out a real workspace with content-write scope, so an applied fix label without the template branch runs the normal work prompt against a real checkout that can push. The workflow loader MUST (not SHOULD) emit a warning at prompt load when `label_commands` is active with a non-empty fix label but the template omits the `label_fix` token, and the orchestrator emits an info log at each fix dispatch, so the misconfiguration stays diagnosable.
 
-**Default-on activation:** `fix_label` defaults to `sortie:fix`, so shipping the fix command
-activates it for every deployment that already sets `provider` for `label_commands`,
-including a deployment that enabled only the review command. A review-only deployment MUST
-set `reactions.label_commands.fix_label: ""` to opt out.
+**Default-on activation:** `fix_label` defaults to `sortie:fix`, so shipping the fix command activates it for every deployment that already sets `provider` for `label_commands`, including a deployment that enabled only the review command. A review-only deployment MUST set `reactions.label_commands.fix_label: ""` to opt out.
 
 Example:
 
@@ -1508,11 +980,7 @@ reactions:
 
 #### Reaction kind: `merge_completion`
 
-Merge-completion detection. When configured, the orchestrator observes the merge state of
-Sortie-managed pull requests independently of who performs the merge, and transitions the
-linked issue to a single configured terminal state exactly once. The reaction is off by
-default: a deployment that omits the block behaves exactly as one running without it, and
-enabling it grants the tracker credential write authority it did not need before.
+Merge-completion detection. When configured, the orchestrator observes the merge state of Sortie-managed pull requests independently of who performs the merge, and transitions the linked issue to a single configured terminal state exactly once. The reaction is off by default: a deployment that omits the block behaves exactly as one running without it, and enabling it grants the tracker credential write authority it did not need before.
 
 Fields:
 
@@ -1525,46 +993,13 @@ Fields:
 | `escalation`       | string  | `label`       | Requires restart  | Escalation action when retries are exhausted. One of `label` or `comment`.                        |
 | `escalation_label` | string  | `needs-human` | Requires restart  | Label applied when `escalation` is `label`.                                                       |
 
-**Tracker prerequisites:** two `tracker` fields must be set before this block activates, and
-each is enforced offline. `tracker.handoff_state` must be non-empty: it is the state a merge
-waits in, and pending-reaction recovery across a restart is disabled entirely without it.
-`tracker.terminal_states` must be written out in front matter rather than left to the tracker
-adapter's default list: the reconcile pass and the terminal workspace sweep both read the
-list exactly as configured, with no fallback to an adapter default, so a defaulted list would
-let the validator accept a `target_state` the runtime never treats as terminal.
+**Tracker prerequisites:** two `tracker` fields must be set before this block activates, and each is enforced offline. `tracker.handoff_state` must be non-empty: it is the state a merge waits in, and pending-reaction recovery across a restart is disabled entirely without it. `tracker.terminal_states` must be written out in front matter rather than left to the tracker adapter's default list: the reconcile pass and the terminal workspace sweep both read the list exactly as configured, with no fallback to an adapter default, so a defaulted list would let the validator accept a `target_state` the runtime never treats as terminal.
 
-**Activation:** The `reactions.merge_completion` block is active when `provider` is present
-and non-empty, on its own, with no other `reactions` block required. Agent-created PRs MUST
-write `pr_number` (positive integer), `owner`, and `repo` (all non-empty) to
-`.sortie/scm.json` in the workspace for merge-completion polling to activate; unlike the
-checkout-bearing kinds, no `branch` is required because the reaction performs no checkout.
+**Activation:** The `reactions.merge_completion` block is active when `provider` is present and non-empty, on its own, with no other `reactions` block required. Agent-created PRs MUST write `pr_number` (positive integer), `owner`, and `repo` (all non-empty) to `.sortie/scm.json` in the workspace for merge-completion polling to activate; unlike the checkout-bearing kinds, no `branch` is required because the reaction performs no checkout.
 
-**Target-state rule and irreversibility:** the target is never inferred from the terminal
-list; the operator names it explicitly, and it is applied verbatim once the merge is
-observed. The transition is not reversible by the orchestrator: naming an abandonment state
-where a completion state was meant closes finished work under the wrong label, and no
-validator can detect that mistake, because it is a judgement about the issue rather than a
-configuration shape.
+**Target-state rule and irreversibility:** the target is never inferred from the terminal list; the operator names it explicitly, and it is applied verbatim once the merge is observed. The transition is not reversible by the orchestrator: naming an abandonment state where a completion state was meant closes finished work under the wrong label, and no validator can detect that mistake, because it is a judgement about the issue rather than a configuration shape.
 
-**Idempotency key:** the fingerprint is the merge commit identifier reported by the provider, not
-the pull request number, persisted in the `reaction_fingerprints` SQLite table under a kind
-distinct from every other reaction. A row is created on the first observed merge, retained (never
-deleted) once the transition succeeds, and re-armed only when a later merge reports a different
-commit identifier. A pull request may remain unmerged for any length of time without starting a
-failure clock. When the provider first reports `Merged: true` with no commit identifier, Sortie
-records that PR identity separately and waits thirty minutes, retrying with exponential pending
-backoff floored at `poll_interval_ms`. If the identifier is still absent on the first poll at or
-after the deadline, Sortie stops polling that pending entry without transitioning the issue and
-attempts the configured label or comment. Delivery is recorded only after that tracker write
-succeeds. A failure does not restart the stopped polling loop; a later fresh pending entry,
-including one recovered after restart, can retry the undelivered notification. If the tracker write
-succeeds but the follow-up marker write itself fails, the notification has already reached the
-operator even though the observation stays recorded as undelivered; a later fresh pending entry
-then delivers it a second time. `escalation: label` repeats harmlessly, because re-applying a
-present label is a no-op; `escalation: comment` posts the operator a duplicate comment. If such a
-later entry instead observes a real identifier, it follows the normal merge-commit fingerprint path
-and clears the temporary observation after that latch completes. `max_retries` applies only to
-failed tracker transitions, not to this grace period.
+**Idempotency key:** the fingerprint is the merge commit identifier reported by the provider, not the pull request number, persisted in the `reaction_fingerprints` SQLite table under a kind distinct from every other reaction. A row is created on the first observed merge, retained (never deleted) once the transition succeeds, and re-armed only when a later merge reports a different commit identifier. A pull request may remain unmerged for any length of time without starting a failure clock. When the provider first reports `Merged: true` with no commit identifier, Sortie records that PR identity separately and waits thirty minutes, retrying with exponential pending backoff floored at `poll_interval_ms`. If the identifier is still absent on the first poll at or after the deadline, Sortie stops polling that pending entry without transitioning the issue and attempts the configured label or comment. Delivery is recorded only after that tracker write succeeds. A failure does not restart the stopped polling loop; a later fresh pending entry, including one recovered after restart, can retry the undelivered notification. If the tracker write succeeds but the follow-up marker write itself fails, the notification has already reached the operator even though the observation stays recorded as undelivered; a later fresh pending entry then delivers it a second time. `escalation: label` repeats harmlessly, because re-applying a present label is a no-op; `escalation: comment` posts the operator a duplicate comment. If such a later entry instead observes a real identifier, it follows the normal merge-commit fingerprint path and clears the temporary observation after that latch completes. `max_retries` applies only to failed tracker transitions, not to this grace period.
 
 **Failure matrix:**
 
@@ -1575,32 +1010,13 @@ failed tracker transitions, not to this grace period.
 | Payload failure (target state unreachable) | Escalate immediately, no retry                    |
 | Issue not found                | Stop, mark the fingerprint dispatched, log a warning, no escalation |
 
-**Restart-to-apply:** reaction configuration, including `target_state`, is captured once at
-orchestrator construction and is not rebuilt on a workflow reload. A change to this block, or
-to the two tracker prerequisites, takes effect only on the next restart; `sortie validate`
-compares the same configuration a restart would build, so the offline verdict and the
-construction verdict cannot diverge. Environment indirection through `$VAR` is not supported
-for any field in this block, matching every other reaction kind.
+**Restart-to-apply:** reaction configuration, including `target_state`, is captured once at orchestrator construction and is not rebuilt on a workflow reload. A change to this block, or to the two tracker prerequisites, takes effect only on the next restart; `sortie validate` compares the same configuration a restart would build, so the offline verdict and the construction verdict cannot diverge. Environment indirection through `$VAR` is not supported for any field in this block, matching every other reaction kind.
 
-**Request cost:** each parked issue costs one tracker issue-state read and one pull-request
-read per poll interval while it is unmerged, plus one tracker write per observed merge. A merged
-pull request missing its commit identifier backs off rather than issuing a forge read on every
-fixed poll. On a forge tracker the tracker and the SCM adapter share one credential against one
-host, so the steady-state unmerged cost approaches two requests per parked issue per poll
-interval. A deployment with many simultaneously parked issues SHOULD raise `poll_interval_ms`
-above the default rather than accept it.
+**Request cost:** each parked issue costs one tracker issue-state read and one pull-request read per poll interval while it is unmerged, plus one tracker write per observed merge. A merged pull request missing its commit identifier backs off rather than issuing a forge read on every fixed poll. On a forge tracker the tracker and the SCM adapter share one credential against one host, so the steady-state unmerged cost approaches two requests per parked issue per poll interval. A deployment with many simultaneously parked issues SHOULD raise `poll_interval_ms` above the default rather than accept it.
 
-**Cross-kind isolation:** CI-failure and review escalations are scoped to their own kind:
-each clears only its own pending entry, attempt counter, and fingerprint, so merge-completion
-tracking for that issue survives an unrelated escalation. Other reaction kinds on the same
-issue are unaffected by a merge-completion transition or escalation, and vice versa.
+**Cross-kind isolation:** CI-failure and review escalations are scoped to their own kind: each clears only its own pending entry, attempt counter, and fingerprint, so merge-completion tracking for that issue survives an unrelated escalation. Other reaction kinds on the same issue are unaffected by a merge-completion transition or escalation, and vice versa.
 
-**Configuration drift on a running process:** editing `tracker.terminal_states` while the
-process runs does not update the `target_state` a running orchestrator already captured. When
-the two disagree, the reaction logs one warning naming both values and keeps transitioning
-issues to the frozen target; the terminal workspace sweep stops collecting the workspaces of
-issues this reaction closes until the two lists agree again. A restart re-validates the edited
-file offline and rejects the same drifted configuration before the process starts.
+**Configuration drift on a running process:** editing `tracker.terminal_states` while the process runs does not update the `target_state` a running orchestrator already captured. When the two disagree, the reaction logs one warning naming both values and keeps transitioning issues to the frozen target; the terminal workspace sweep stops collecting the workspaces of issues this reaction closes until the two lists agree again. A restart re-validates the edited file offline and rejects the same drifted configuration before the process starts.
 
 Example:
 
@@ -1617,8 +1033,7 @@ reactions:
 
 **Validation rules:**
 
-- Reaction kind keys must match `[a-z][a-z0-9_-]*`. Invalid keys are rejected with a
-  configuration error.
+- Reaction kind keys must match `[a-z][a-z0-9_-]*`. Invalid keys are rejected with a configuration error.
 - `max_retries` must be non-negative for all kinds.
 - `escalation` must be `"label"` or `"comment"` for all kinds.
 - `watch_window_ms` must be non-negative and must not exceed `9223372036854` for `ci_failure`, `review_comments`, `bot_review`, `merge_conflicts`, and `auto_merge`.
@@ -1641,13 +1056,7 @@ reactions:
 - `poll_interval_ms` must be >= `30000` for `merge_completion`.
 - When `provider` is absent or empty, all other fields in the kind sub-object are ignored.
 
-**Where each rule is enforced:** the rules that the config layer owns (reaction key shape,
-`max_retries`, `escalation`, `escalation_label`, every `label_commands` rule, and
-`reactions.ci_failure`'s Extra keys) run during typed config construction, so `sortie validate`
-reports them offline. For the kind-specific
-rules, `sortie validate` runs the `review_comments`, `auto_merge`, `bot_review`,
-`merge_conflicts`, and `merge_completion` builders. These are the same builders used when the
-orchestrator constructs the reactions at startup, so both paths report the same invalid values.
+**Where each rule is enforced:** the rules that the config layer owns (reaction key shape, `max_retries`, `escalation`, `escalation_label`, every `label_commands` rule, and `reactions.ci_failure`'s Extra keys) run during typed config construction, so `sortie validate` reports them offline. For the kind-specific rules, `sortie validate` runs the `review_comments`, `auto_merge`, `bot_review`, `merge_conflicts`, and `merge_completion` builders. These are the same builders used when the orchestrator constructs the reactions at startup, so both paths report the same invalid values.
 
 ---
 
@@ -1696,8 +1105,7 @@ The `match` block accepts only these keys:
 | `identifier` | string or list | Glob (any element) | Matches when `issue.identifier` glob-matches any pattern, in the case the adapter produced. |
 | `assignee` | string or list | Case-insensitive equality (any element) | Matches when the issue assignee equals any list entry. |
 
-The `dispatch.default` block accepts only `agent` and `template`, with the same types and
-fallback behavior as the per-rule fields.
+The `dispatch.default` block accepts only `agent` and `template`, with the same types and fallback behavior as the per-rule fields.
 
 #### Matching semantics
 
@@ -1707,8 +1115,7 @@ Evaluation applies AND logic across keys and OR logic within a single key:
 - A key whose value is a list succeeds when any element matches.
 - An absent or empty `match` block always succeeds (catch-all).
 
-String-valued keys (`labels`, `issue_type`, `identifier`, `assignee`) accept either a
-single string or a list of strings. A scalar is treated as a one-element list.
+String-valued keys (`labels`, `issue_type`, `identifier`, `assignee`) accept either a single string or a list of strings. A scalar is treated as a one-element list.
 
 #### Priority predicates
 
@@ -1723,48 +1130,35 @@ The `priority` key takes a predicate object with exactly one operator key:
 | `gt` | Priority is greater than value |
 | `gte` | Priority is greater than or equal to value |
 
-For `in`, the value is a list of integers (e.g., `{ in: [1, 2] }`). For all other
-operators, the value is a single integer. An issue with no priority never matches a
-`priority` predicate.
+For `in`, the value is a list of integers (e.g., `{ in: [1, 2] }`). For all other operators, the value is a single integer. An issue with no priority never matches a `priority` predicate.
 
 #### Fallback resolution chain
 
-Rules evaluate in YAML order. The first rule whose `match` block succeeds is selected;
-later rules are not consulted. For each selected rule, `agent` and `template` may each be
-omitted independently. Missing fields fall through in order:
+Rules evaluate in YAML order. The first rule whose `match` block succeeds is selected; later rules are not consulted. For each selected rule, `agent` and `template` may each be omitted independently. Missing fields fall through in order:
 
 1. The matched rule's `agent` / `template`.
 2. `dispatch.default.agent` / `dispatch.default.template`.
-3. Top-level `agent.kind` (for agent) or the `WORKFLOW.md` Markdown body (for template).
-   See [Section 2.6](#26-agent--coding-agent-configuration) for the top-level `agent.kind`
-   default.
+3. Top-level `agent.kind` (for agent) or the `WORKFLOW.md` Markdown body (for template). See [Section 2.6](#26-agent--coding-agent-configuration) for the top-level `agent.kind` default.
 
-When no rule matches and `dispatch.default` supplies an agent or template, the default is
-applied with the same fallback chain for any unset field.
+When no rule matches and `dispatch.default` supplies an agent or template, the default is applied with the same fallback chain for any unset field.
 
 A kind an `agent` selector introduces here, rather than falling through to the top-level `agent.kind`, must carry its own top-level settings block; see [Section 4.5](#45-adapter-specific-pass-through-config) for the requirement and the `dispatch.agent.missing_block` check that enforces it.
 
 #### Freeze-on-dispatch
 
-The resolved `(agent_kind, template_id, rule_name)` is recorded at the initial dispatch
-and reused by retries and reaction-driven continuations for the same claim. Rules are
-re-evaluated only after the claim is released.
+The resolved `(agent_kind, template_id, rule_name)` is recorded at the initial dispatch and reused by retries and reaction-driven continuations for the same claim. Rules are re-evaluated only after the claim is released.
 
-A changed rule set from a `WORKFLOW.md` reload applies to future claims only. In-flight
-issues keep their frozen selection.
+A changed rule set from a `WORKFLOW.md` reload applies to future claims only. In-flight issues keep their frozen selection.
 
 #### Per-rule template paths
 
-Template paths for rules and `dispatch.default` resolve relative to the directory
-containing `WORKFLOW.md` (`filepath.Dir(workflow_path)`). The following paths are rejected
-at load time:
+Template paths for rules and `dispatch.default` resolve relative to the directory containing `WORKFLOW.md` (`filepath.Dir(workflow_path)`). The following paths are rejected at load time:
 
 - Absolute paths (starting with `/`).
 - `~`-prefixed paths.
 - Paths that resolve, after symlink evaluation, outside the workflow directory tree.
 
-An empty `template` field falls through to the Markdown body (the same behavior as
-omitting the field).
+An empty `template` field falls through to the Markdown body (the same behavior as omitting the field).
 
 #### Example
 
@@ -1790,15 +1184,11 @@ dispatch:
     template: ./prompts/default.md
 ```
 
-The two named rules carry `match` blocks. The third rule has no `match` block and acts as
-the terminal catch-all. Each rule carries a `template:` path that is relative to the
-`WORKFLOW.md` directory and uses forward-slash separators.
+The two named rules carry `match` blocks. The third rule has no `match` block and acts as the terminal catch-all. Each rule carries a `template:` path that is relative to the `WORKFLOW.md` directory and uses forward-slash separators.
 
 #### Further reading (optional)
 
-The design rationale is in [architecture §5.3.10](architecture/05-workflow-specification.md#5310-dispatch-object-optional) and
-[ADR-0011](decisions/0011-dispatch-rule-configuration.md). Neither document is required
-to write a valid `dispatch` block; they explain why the feature is shaped as it is.
+The design rationale is in [architecture §5.3.10](architecture/05-workflow-specification.md#5310-dispatch-object-optional) and [ADR-0011](decisions/0011-dispatch-rule-configuration.md). Neither document is required to write a valid `dispatch` block; they explain why the feature is shaped as it is.
 
 ---
 
@@ -1813,14 +1203,9 @@ notifications: # ordered list of notifier backends; optional
     url: $SORTIE_OPS_WEBHOOK_URL            # SORTIE_-prefixed reference (mandatory)
 ```
 
-The `notifications` list configures the backends behind the `notify_operator` agent tool.
-While a session runs, the agent calls `notify_operator` to escalate a decision, report
-progress, or flag a blocker to a real-time channel. The tool is registered only when at
-least one valid backend is configured; an empty or absent list leaves it unregistered, so
-the agent is never offered a tool it cannot use.
+The `notifications` list configures the backends behind the `notify_operator` agent tool. While a session runs, the agent calls `notify_operator` to escalate a decision, report progress, or flag a blocker to a real-time channel. The tool is registered only when at least one valid backend is configured; an empty or absent list leaves it unregistered, so the agent is never offered a tool it cannot use.
 
-The value is a sequence, not a single object. A second channel is a second list entry. Each
-entry is a map carrying a required `kind` discriminator and that backend's own fields.
+The value is a sequence, not a single object. A second channel is a second list entry. Each entry is a map carrying a required `kind` discriminator and that backend's own fields.
 
 | Field | Type | Required | Default | Description |
 | ----- | ---- | -------- | ------- | ----------- |
@@ -1834,32 +1219,19 @@ Per-backend fields depend on `kind` and are passed through to the backend untype
 | `webhook` | `url` | Endpoint that receives an HTTP POST of the notification as a JSON object using generic field names. |
 | `slack` | `webhook_url` | Slack incoming webhook URL that receives a Slack-shaped JSON body with a `text` field. |
 
-The `notifications` `webhook` backend is an outbound POST to an operator-supplied endpoint.
-It is unrelated to inbound tracker webhooks ([architecture §20](architecture/25-webhook-support.md)), which trigger
-reconciliation. The two share a name but not a direction.
+The `notifications` `webhook` backend is an outbound POST to an operator-supplied endpoint. It is unrelated to inbound tracker webhooks ([architecture §20](architecture/25-webhook-support.md)), which trigger reconciliation. The two share a name but not a direction.
 
-When the list configures more than one backend, the effective per-session cap is the
-maximum non-zero `max_per_session` across entries, falling back to the default when every
-entry is `0` or unset. The cap counts `notify_operator` calls, not per-backend sends.
+When the list configures more than one backend, the effective per-session cap is the maximum non-zero `max_per_session` across entries, falling back to the default when every entry is `0` or unset. The cap counts `notify_operator` calls, not per-backend sends.
 
 **`SORTIE_`-prefixed secret rule:**
 
-A backend secret MUST be given as a reference to a `SORTIE_`-prefixed environment variable,
-written as `$SORTIE_NAME` or `${SORTIE_NAME}`. The prefix is mandatory, not stylistic. The
-`notify_operator` tool runs in a separate `sortie mcp-server` process that receives only the
-workflow file path and the orchestrator's `SORTIE_`-prefixed variables. A reference without
-the `SORTIE_` prefix, or to an unset variable, resolves to an empty string in that process.
-The backend rejects an empty required secret, which surfaces as a fatal startup error rather
-than a notification posted nowhere. Name every notification secret with the `SORTIE_` prefix.
+A backend secret MUST be given as a reference to a `SORTIE_`-prefixed environment variable, written as `$SORTIE_NAME` or `${SORTIE_NAME}`. The prefix is mandatory, not stylistic. The `notify_operator` tool runs in a separate `sortie mcp-server` process that receives only the workflow file path and the orchestrator's `SORTIE_`-prefixed variables. A reference without the `SORTIE_` prefix, or to an unset variable, resolves to an empty string in that process. The backend rejects an empty required secret, which surfaces as a fatal startup error rather than a notification posted nowhere. Name every notification secret with the `SORTIE_` prefix.
 
 ---
 
 ## 3. Environment Variable Overrides
 
-Sortie supports a curated set of `SORTIE_*` environment variables that override YAML front
-matter values. This enables twelve-factor app deployment patterns: operators inject secrets,
-endpoint URLs, and tuning parameters via environment rather than committing them to a
-workflow file.
+Sortie supports a curated set of `SORTIE_*` environment variables that override YAML front matter values. This enables twelve-factor app deployment patterns: operators inject secrets, endpoint URLs, and tuning parameters via environment rather than committing them to a workflow file.
 
 ### 3.1 Source precedence
 
@@ -1869,19 +1241,14 @@ Configuration sources are resolved in the following order (highest to lowest):
 2. **`SORTIE_*` real environment variables**.
 3. **`.env` file values** (when `SORTIE_ENV_FILE` or `--env-file` is set).
 4. **YAML front matter values**.
-5. **`$VAR` indirection** inside YAML values — applies only to values that survive the
-   merge (fields not overridden by env).
+5. **`$VAR` indirection** inside YAML values — applies only to values that survive the merge (fields not overridden by env).
 6. **Built-in defaults**.
 
-An env override replaces the YAML value in the raw config map *before* `$VAR` expansion
-and section builders run. If `WORKFLOW.md` says `api_key: $MY_TOKEN` and
-`SORTIE_TRACKER_API_KEY=secret`, the env var value `secret` replaces the YAML value
-entirely. The `$MY_TOKEN` indirection never executes for that field.
+An env override replaces the YAML value in the raw config map *before* `$VAR` expansion and section builders run. If `WORKFLOW.md` says `api_key: $MY_TOKEN` and `SORTIE_TRACKER_API_KEY=secret`, the env var value `secret` replaces the YAML value entirely. The `$MY_TOKEN` indirection never executes for that field.
 
 ### 3.2 Curated variable list
 
-Each variable maps to exactly one config field. The naming convention is
-`SORTIE_<SECTION>_<FIELD>` with underscores separating words.
+Each variable maps to exactly one config field. The naming convention is `SORTIE_<SECTION>_<FIELD>` with underscores separating words.
 
 #### Tracker
 
@@ -1945,8 +1312,7 @@ Each variable maps to exactly one config field. The naming convention is
 
 ### 3.3 Type coercion
 
-All environment variable values are strings. The override layer coerces them to the
-expected type before section builders run.
+All environment variable values are strings. The override layer coerces them to the expected type before section builders run.
 
 | Target type  | Coercion rule                                                                         | Error behavior                              |
 | ------------ | ------------------------------------------------------------------------------------- | ------------------------------------------- |
@@ -1964,25 +1330,19 @@ SORTIE_TRACKER_TERMINAL_STATES="Done,Won't Do"
 
 - Items are trimmed of leading/trailing whitespace.
 - Empty items (from trailing commas or `,,`) are discarded.
-- If the environment variable is unset or set to an empty string, the YAML-configured
-  states are used; there is no environment override to force an empty list.
+- If the environment variable is unset or set to an empty string, the YAML-configured states are used; there is no environment override to force an empty list.
 - State values preserve original casing.
 
 ### 3.4 `.env` file support
 
-Sortie supports an optional `.env` file for operators who prefer file-based secrets over
-shell environment.
+Sortie supports an optional `.env` file for operators who prefer file-based secrets over shell environment.
 
 #### Loading
 
-- `.env` loading is **opt-in**: set `SORTIE_ENV_FILE=/path/to/.env` as a real environment
-  variable, or pass `--env-file /path/to/.env` on the CLI.
-- Sortie does **not** auto-discover `.env` in the working directory. Operators MUST opt
-  in explicitly.
-- When the path is set but the file does not exist, Sortie logs a warning and continues
-  without `.env` values.
-- When the file exists but has parse errors, Sortie fails startup with an error
-  identifying the file and line number.
+- `.env` loading is **opt-in**: set `SORTIE_ENV_FILE=/path/to/.env` as a real environment variable, or pass `--env-file /path/to/.env` on the CLI.
+- Sortie does **not** auto-discover `.env` in the working directory. Operators MUST opt in explicitly.
+- When the path is set but the file does not exist, Sortie logs a warning and continues without `.env` values.
+- When the file exists but has parse errors, Sortie fails startup with an error identifying the file and line number.
 
 #### File format
 
@@ -1999,32 +1359,22 @@ Rules:
 - Lines starting with `#` (after optional whitespace) are comments.
 - Empty lines are ignored.
 - Leading/trailing whitespace on keys and values is trimmed.
-- Values MAY be quoted with single or double quotes; quotes are stripped but no escape
-  processing is performed.
+- Values MAY be quoted with single or double quotes; quotes are stripped but no escape processing is performed.
 - Keys MUST match `[A-Za-z_][A-Za-z0-9_]*`.
 - Only `SORTIE_*` prefixed keys are loaded; other keys are silently ignored.
 - Variable interpolation within `.env` values is **not** supported.
 
 #### Precedence
 
-Non-empty real environment variables win over `.env` file values. Empty real environment
-variables are treated as unset and fall back to the `.env` value. The `.env` file provides
-defaults for env vars not already set in the process environment. The `--env-file` CLI
-flag takes precedence over the `SORTIE_ENV_FILE` environment variable when resolving the
-file path.
+Non-empty real environment variables win over `.env` file values. Empty real environment variables are treated as unset and fall back to the `.env` value. The `.env` file provides defaults for env vars not already set in the process environment. The `--env-file` CLI flag takes precedence over the `SORTIE_ENV_FILE` environment variable when resolving the file path.
 
 ### 3.5 Interaction with `$VAR` indirection
 
-Values injected by environment overrides are already fully resolved. They MUST NOT be
-passed through `os.ExpandEnv`, `resolveEnv`, or `resolveEnvRef`. This prevents
-double-expansion that would corrupt values containing `$` characters.
+Values injected by environment overrides are already fully resolved. They MUST NOT be passed through `os.ExpandEnv`, `resolveEnv`, or `resolveEnvRef`. This prevents double-expansion that would corrupt values containing `$` characters.
 
-For path fields (`workspace.root`, `db_path`), tilde (`~`) expansion still applies to
-env-sourced values. Only `$VAR` expansion is skipped.
+For path fields (`workspace.root`, `db_path`), tilde (`~`) expansion still applies to env-sourced values. Only `$VAR` expansion is skipped.
 
-**Example:** If `SORTIE_TRACKER_API_KEY=tok$5abc` is set, the literal value `tok$5abc` is
-used as the API key. Without this guard, `os.ExpandEnv` would attempt to expand `$5abc`
-as an environment variable reference.
+**Example:** If `SORTIE_TRACKER_API_KEY=tok$5abc` is set, the literal value `tok$5abc` is used as the API key. Without this guard, `os.ExpandEnv` would attempt to expand `$5abc` as an environment variable reference.
 
 ### 3.6 Fields not overridable via env
 
@@ -2048,26 +1398,18 @@ as an environment variable reference.
 
 ### 3.7 Dynamic reload
 
-On WORKFLOW.md reload, `applyEnvOverrides` re-reads both `os.Getenv` and the `.env` file.
-Env overrides merge into the fresh raw map before section builders run.
+On WORKFLOW.md reload, `applyEnvOverrides` re-reads both `os.Getenv` and the `.env` file. Env overrides merge into the fresh raw map before section builders run.
 
-- **`.env` file changes are picked up** on each reload. The `.env` file itself is not
-  watched by fsnotify — only WORKFLOW.md changes trigger reload.
-- **Real environment variable changes require a process restart.** `os.Getenv` reads the
-  current process environment. While Go can observe in-process changes via `os.Setenv`,
-  operator-provided env vars are inherited at process launch and are effectively immutable
-  from outside the running process.
+- **`.env` file changes are picked up** on each reload. The `.env` file itself is not watched by fsnotify — only WORKFLOW.md changes trigger reload.
+- **Real environment variable changes require a process restart.** `os.Getenv` reads the current process environment. While Go can observe in-process changes via `os.Setenv`, operator-provided env vars are inherited at process launch and are effectively immutable from outside the running process.
 
-For configuration values that need to change without restarting, use the `.env` file and
-trigger a WORKFLOW.md reload.
+For configuration values that need to change without restarting, use the `.env` file and trigger a WORKFLOW.md reload.
 
 ---
 
 ## 4. Extensions
 
-The front matter is extensible. Unknown top-level keys are collected into an `Extensions`
-map and are not validated by the core schema. Extensions should document their own field
-schemas, defaults, and reload behavior.
+The front matter is extensible. Unknown top-level keys are collected into an `Extensions` map and are not validated by the core schema. Extensions should document their own field schemas, defaults, and reload behavior.
 
 ### 4.1 HTTP Server (`server.port`, `server.host`)
 
@@ -2082,11 +1424,7 @@ server:
 | `server.port` | integer     | No       | `7678`      | **No** — requires restart | TCP port for the embedded HTTP observability server. `0` disables the server.    |
 | `server.host` | string (IP) | No       | `127.0.0.1` | **No** — requires restart | Bind address for the HTTP server. Must be a parseable IP address.               |
 
-Sortie starts an HTTP server by default on `127.0.0.1:7678` for runtime observability
-and operational control. `server.port` overrides the default port; `server.host`
-overrides the default bind address. CLI `--port` and `--host` flags take precedence
-over their extension counterparts. Port `0` disables the server entirely (no TCP
-listener, no Prometheus metrics).
+Sortie starts an HTTP server by default on `127.0.0.1:7678` for runtime observability and operational control. `server.port` overrides the default port; `server.host` overrides the default bind address. CLI `--port` and `--host` flags take precedence over their extension counterparts. Port `0` disables the server entirely (no TCP listener, no Prometheus metrics).
 
 #### API Endpoints
 
@@ -2100,20 +1438,13 @@ listener, no Prometheus metrics).
 | POST   | `/api/v1/refresh`        | Trigger an immediate poll+reconciliation cycle. Returns 202 Accepted normally, 409 Conflict during graceful shutdown. Best-effort; repeated requests are coalesced. |
 | GET    | `/metrics`               | Prometheus exposition-format scrape endpoint. Present only when `github.com/prometheus/client_golang` metrics are enabled (always co-located with the HTTP server). |
 
-All responses use `Content-Type: application/json; charset=utf-8` (JSON endpoints).
-Error responses use a standard envelope: `{"error": {"code": "...", "message": "..."}}`.
-API endpoints (`/api/v1/*`) return 405 with the JSON error envelope.
-Health probes (`/livez`, `/readyz`) return the standard HTTP 405 plain-text response.
-The `/metrics` endpoint returns `text/plain` in Prometheus exposition format.
-The `/` dashboard returns `text/html`.
+All responses use `Content-Type: application/json; charset=utf-8` (JSON endpoints). Error responses use a standard envelope: `{"error": {"code": "...", "message": "..."}}`. API endpoints (`/api/v1/*`) return 405 with the JSON error envelope. Health probes (`/livez`, `/readyz`) return the standard HTTP 405 plain-text response. The `/metrics` endpoint returns `text/plain` in Prometheus exposition format. The `/` dashboard returns `text/html`.
 
 #### Health Endpoints
 
-Sortie exposes Kubernetes z-pages health endpoints (`/livez` and `/readyz`) for liveness
-and readiness probes.
+Sortie exposes Kubernetes z-pages health endpoints (`/livez` and `/readyz`) for liveness and readiness probes.
 
-**`GET /livez`** — Liveness probe. Returns 200 when the process is alive, 503 during
-graceful shutdown. No I/O; a single atomic flag check:
+**`GET /livez`** — Liveness probe. Returns 200 when the process is alive, 503 during graceful shutdown. No I/O; a single atomic flag check:
 
 ```json
 {"status": "pass"}
@@ -2125,9 +1456,7 @@ During graceful shutdown:
 {"status": "fail"}
 ```
 
-**`GET /readyz`** — Readiness probe. Returns 200 when all dependencies are healthy,
-503 when any check fails. Checks: SQLite database ping, dispatch preflight validation,
-workflow file loaded:
+**`GET /readyz`** — Readiness probe. Returns 200 when all dependencies are healthy, 503 when any check fails. Checks: SQLite database ping, dispatch preflight validation, workflow file loaded:
 
 ```json
 {
@@ -2157,16 +1486,11 @@ When a check fails, the overall status is `"fail"` and the failing check is iden
 }
 ```
 
-**Draining behavior.** When `SIGTERM` arrives, Sortie sets a draining flag before the
-orchestrator begins its worker drain phase. Both `/livez` and `/readyz` return 503 once
-the flag is set. The HTTP listener remains open during drain so K8s probes receive proper
-HTTP responses. After the orchestrator drain completes, the listener closes and new
-connections are refused.
+**Draining behavior.** When `SIGTERM` arrives, Sortie sets a draining flag before the orchestrator begins its worker drain phase. Both `/livez` and `/readyz` return 503 once the flag is set. The HTTP listener remains open during drain so K8s probes receive proper HTTP responses. After the orchestrator drain completes, the listener closes and new connections are refused.
 
 #### `GET /api/v1/state` — Runtime Snapshot
 
-Returns the system-wide runtime state including running sessions, retry queue,
-aggregate token/runtime totals, and rate limits.
+Returns the system-wide runtime state including running sessions, retry queue, aggregate token/runtime totals, and rate limits.
 
 ```json
 {
@@ -2268,9 +1592,7 @@ aggregate token/runtime totals, and rate limits.
 
 #### `GET /api/v1/{identifier}` — Per-Issue Detail
 
-Returns issue-specific runtime and debug details for a single issue. Returns `404`
-with `{"error":{"code":"issue_not_found","message":"..."}}` when the identifier is
-not in current orchestrator state.
+Returns issue-specific runtime and debug details for a single issue. Returns `404` with `{"error":{"code":"issue_not_found","message":"..."}}` when the identifier is not in current orchestrator state.
 
 ```json
 {
@@ -2318,19 +1640,11 @@ not in current orchestrator state.
 }
 ```
 
-The `running` object uses the same per-session field schema as `GET /api/v1/state`
-(see the per-session fields table above). `status` is `"running"` when the issue has a
-running session, `"retrying"` when it does not but has a pending retry, and
-`"budget_exhausted"` when it has neither but is held out of dispatch by a per-issue
-budget ceiling; the two fields for whichever case does not apply are `null`, and
-`budget_exhausted` carries the same record shape as the `budget_exhausted` array on
-`GET /api/v1/state`.
+The `running` object uses the same per-session field schema as `GET /api/v1/state` (see the per-session fields table above). `status` is `"running"` when the issue has a running session, `"retrying"` when it does not but has a pending retry, and `"budget_exhausted"` when it has neither but is held out of dispatch by a per-issue budget ceiling; the two fields for whichever case does not apply are `null`, and `budget_exhausted` carries the same record shape as the `budget_exhausted` array on `GET /api/v1/state`.
 
 #### `POST /api/v1/refresh`
 
-Triggers an immediate poll+reconciliation cycle. The endpoint is best-effort: repeated
-requests while a refresh is already pending are coalesced. During graceful shutdown the
-endpoint rejects requests with `409 Conflict`.
+Triggers an immediate poll+reconciliation cycle. The endpoint is best-effort: repeated requests while a refresh is already pending are coalesced. During graceful shutdown the endpoint rejects requests with `409 Conflict`.
 
 **Normal response** — refresh signal accepted:
 
@@ -2353,13 +1667,9 @@ HTTP/1.1 409 Conflict
 {"queued": false, "coalesced": false, "requested_at": "...", "operations": []}
 ```
 
-Callers should check the `queued` field or HTTP status to determine whether the refresh
-will be processed. A `409` response indicates the server is draining and the caller
-should retry against another instance or wait for the restart.
+Callers should check the `queued` field or HTTP status to determine whether the refresh will be processed. A `409` response indicates the server is draining and the caller should retry against another instance or wait for the restart.
 
-**Kubernetes probe configuration.** Sortie's graceful shutdown cancels running agents
-before closing the HTTP listener. Configure `terminationGracePeriodSeconds` and liveness
-probe tolerance to exceed the expected drain duration (default: 30 seconds):
+**Kubernetes probe configuration.** Sortie's graceful shutdown cancels running agents before closing the HTTP listener. Configure `terminationGracePeriodSeconds` and liveness probe tolerance to exceed the expected drain duration (default: 30 seconds):
 
 ```yaml
 livenessProbe:
@@ -2379,14 +1689,9 @@ terminationGracePeriodSeconds: 90
 
 #### `GET /metrics` — Prometheus Scrape Endpoint
 
-When the HTTP server is enabled, Sortie exposes a Prometheus exposition-format endpoint
-at `/metrics` for integration with Prometheus, Grafana, and other monitoring stacks. The
-endpoint is co-located with the JSON API and dashboard on the same address and port — no
-separate configuration is required.
+When the HTTP server is enabled, Sortie exposes a Prometheus exposition-format endpoint at `/metrics` for integration with Prometheus, Grafana, and other monitoring stacks. The endpoint is co-located with the JSON API and dashboard on the same address and port — no separate configuration is required.
 
-The endpoint uses a dedicated `prometheus.Registry` (not the Go default global) to
-prevent metric pollution. Standard Go runtime (`go_*`) and process (`process_*`) metrics
-are included alongside Sortie-specific metrics.
+The endpoint uses a dedicated `prometheus.Registry` (not the Go default global) to prevent metric pollution. Standard Go runtime (`go_*`) and process (`process_*`) metrics are included alongside Sortie-specific metrics.
 
 **Sortie-defined metrics:**
 
@@ -2434,10 +1739,7 @@ logging:
 |---|---|---|---|---|---|
 | `logging.level` | string | No | `info` | **No** — requires restart | Log verbosity: `debug`, `info`, `warn`, `error`. CLI `--log-level` overrides. |
 
-When `logging.level` is set, Sortie initializes the log handler at the specified
-verbosity after the workflow config is loaded. The CLI `--log-level` flag takes
-precedence when both are present. Accepted values: `debug`, `info`, `warn`,
-`error` (case-insensitive). Unknown values cause startup failure with exit code 1.
+When `logging.level` is set, Sortie initializes the log handler at the specified verbosity after the workflow config is loaded. The CLI `--log-level` flag takes precedence when both are present. Accepted values: `debug`, `info`, `warn`, `error` (case-insensitive). Unknown values cause startup failure with exit code 1.
 
 ### 4.3 `worker` — SSH Worker Extension
 
@@ -2450,14 +1752,9 @@ worker:
   ssh_strict_host_key_checking: accept-new
 ```
 
-When `worker.ssh_hosts` is configured, Sortie dispatches agent runs to remote
-hosts over SSH using the system `ssh` binary. Each dispatch selects the host
-with the fewest active sessions (least-loaded selection). When a per-host
-concurrency cap is set, hosts at capacity are skipped. On retry, the previous
-host is preferred if it still has capacity.
+When `worker.ssh_hosts` is configured, Sortie dispatches agent runs to remote hosts over SSH using the system `ssh` binary. Each dispatch selects the host with the fewest active sessions (least-loaded selection). When a per-host concurrency cap is set, hosts at capacity are skipped. On retry, the previous host is preferred if it still has capacity.
 
-When `worker.ssh_hosts` is absent or empty, all agents run locally on the
-host where Sortie is started (the default behavior).
+When `worker.ssh_hosts` is absent or empty, all agents run locally on the host where Sortie is started (the default behavior).
 
 | Field                                   | Type             | Required | Default                        | Description                                                                                 |
 | --------------------------------------- | ---------------- | -------- | ------------------------------ | ------------------------------------------------------------------------------------------- |
@@ -2467,10 +1764,7 @@ host where Sortie is started (the default behavior).
 
 #### SSH Hook Environment
 
-When SSH mode is active, all lifecycle hooks (`after_create`, `before_run`,
-`after_run`, `before_remove`) receive the `SORTIE_SSH_HOST` environment variable
-set to the target host for the current session. Hooks can use this variable to
-interact with the remote host — for example:
+When SSH mode is active, all lifecycle hooks (`after_create`, `before_run`, `after_run`, `before_remove`) receive the `SORTIE_SSH_HOST` environment variable set to the target host for the current session. Hooks can use this variable to interact with the remote host — for example:
 
 ```bash
 # after_create — clone repo on the remote host
@@ -2488,20 +1782,9 @@ ssh "$SORTIE_SSH_HOST" "rm -rf \"$SORTIE_WORKSPACE\""
 
 #### Operator Guidance
 
-- **SSH connectivity is validated at dispatch time**, not at startup. Hosts
-  that are temporarily unreachable cause the worker to fail and retry with
-  exponential backoff.
-- **Process lifecycle:** The remote agent process receives stdin EOF when
-  the SSH connection closes (e.g., on cancellation or stall timeout). The
-  agent should terminate on stdin EOF or SIGHUP.
-- **SSH options:** Sortie sets `ServerAliveInterval=15`,
-  `ServerAliveCountMax=3`, and `StrictHostKeyChecking=accept-new` by default.
-  The `StrictHostKeyChecking` value is configurable via
-  `worker.ssh_strict_host_key_checking`. Set to `yes` when `known_hosts` is
-  pre-populated by configuration management; set to `no` only in isolated
-  test environments. Invalid values fall back to `accept-new` with a warning.
-  Operators should ensure SSH key-based authentication is configured for all
-  target hosts.
+- **SSH connectivity is validated at dispatch time**, not at startup. Hosts that are temporarily unreachable cause the worker to fail and retry with exponential backoff.
+- **Process lifecycle:** The remote agent process receives stdin EOF when the SSH connection closes (e.g., on cancellation or stall timeout). The agent should terminate on stdin EOF or SIGHUP.
+- **SSH options:** Sortie sets `ServerAliveInterval=15`, `ServerAliveCountMax=3`, and `StrictHostKeyChecking=accept-new` by default. The `StrictHostKeyChecking` value is configurable via `worker.ssh_strict_host_key_checking`. Set to `yes` when `known_hosts` is pre-populated by configuration management; set to `no` only in isolated test environments. Invalid values fall back to `accept-new` with a warning. Operators should ensure SSH key-based authentication is configured for all target hosts.
 
 #### Complete SSH-Mode Example
 
@@ -2560,19 +1843,11 @@ token_rates:
     cache_read_per_mtok: 0.25
 ```
 
-When `token_rates` is configured, the dashboard displays estimated USD cost for
-currently running sessions, and the `sortie stats` subcommand prices the runs it
-aggregates from run history. Keys are agent adapter kind strings (e.g., `"claude-code"`,
-`"copilot-cli"`, `"codex"`, `"opencode"`). All rates are in USD per 1 million tokens.
+When `token_rates` is configured, the dashboard displays estimated USD cost for currently running sessions, and the `sortie stats` subcommand prices the runs it aggregates from run history. Keys are agent adapter kind strings (e.g., `"claude-code"`, `"copilot-cli"`, `"codex"`, `"opencode"`). All rates are in USD per 1 million tokens.
 
-When `token_rates` is absent or empty, the dashboard shows raw token counts without
-cost estimates and `sortie stats` reports no cost figures.
+When `token_rates` is absent or empty, the dashboard shows raw token counts without cost estimates and `sortie stats` reports no cost figures.
 
-An entry keyed to a kind whose usage-reporting declaration resolves to no token usage for the
-sessions a configuration produces has no effect: no cost can be estimated for it. `sortie validate`
-reports this under the check `agent.kind.no_cost_estimate`, naming the kind, so an operator who
-prices a non-reporting kind learns why the dashboard's Est. Cost column stays blank rather than
-discovering it by reading source.
+An entry keyed to a kind whose usage-reporting declaration resolves to no token usage for the sessions a configuration produces has no effect: no cost can be estimated for it. `sortie validate` reports this under the check `agent.kind.no_cost_estimate`, naming the kind, so an operator who prices a non-reporting kind learns why the dashboard's Est. Cost column stays blank rather than discovering it by reading source.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -2583,31 +1858,20 @@ discovering it by reading source.
 
 **Validation rules:**
 
-- `token_rates` MUST be a map when present. Non-map values produce a warning (not a
-  fatal error).
+- `token_rates` MUST be a map when present. Non-map values produce a warning (not a fatal error).
 - Each `<kind>` value MUST be a map. Non-map values produce a warning for that kind.
-- Rate values MUST be non-negative numbers. Negative values produce a warning and are
-  treated as not configured.
-- Missing rate fields within a kind are valid. Partial rates (e.g., only
-  `output_per_mtok`) compute cost from the configured fields only.
+- Rate values MUST be non-negative numbers. Negative values produce a warning and are treated as not configured.
+- Missing rate fields within a kind are valid. Partial rates (e.g., only `output_per_mtok`) compute cost from the configured fields only.
 - Zero-valued rates are valid and produce `$0.00` for that token type.
 - An entry keyed to the empty string is dropped and produces a warning; it prices no kind.
 
-**Reload behavior:** Token rates do not reload dynamically. Changes require a process
-restart, consistent with `server.port` and `server.host`.
+**Reload behavior:** Token rates do not reload dynamically. Changes require a process restart, consistent with `server.port` and `server.host`.
 
 ### 4.5 Adapter-Specific Pass-Through Config
 
-Each adapter (tracker or agent) may define configuration in a top-level object named
-after its `kind` value. These values are passed through to the adapter without validation
-by the orchestrator core.
+Each adapter (tracker or agent) may define configuration in a top-level object named after its `kind` value. These values are passed through to the adapter without validation by the orchestrator core.
 
-A session reads the block belonging to the agent kind it was dispatched on, and reads it
-again on every attempt of that session. That kind is the one a matching `dispatch.rules`
-entry selected, otherwise `dispatch.default.agent`, otherwise `agent.kind`, following the
-fallback chain in [Section 2.11](#211-dispatch--rule-based-routing). The block named by
-`agent.kind` therefore applies only when neither a matching rule nor the dispatch default
-chose another kind.
+A session reads the block belonging to the agent kind it was dispatched on, and reads it again on every attempt of that session. That kind is the one a matching `dispatch.rules` entry selected, otherwise `dispatch.default.agent`, otherwise `agent.kind`, following the fallback chain in [Section 2.11](#211-dispatch--rule-based-routing). The block named by `agent.kind` therefore applies only when neither a matching rule nor the dispatch default chose another kind.
 
 **File tracker adapter:**
 
@@ -2624,9 +1888,7 @@ file:
   path: /path/to/issues.json
 ```
 
-The `file:` block is forwarded to the file tracker adapter. The `path` field is required
-and specifies the filesystem path to a JSON file containing issue records. This adapter
-is intended for local testing and CI workflows where a live tracker is not available.
+The `file:` block is forwarded to the file tracker adapter. The `path` field is required and specifies the filesystem path to a JSON file containing issue records. This adapter is intended for local testing and CI workflows where a live tracker is not available.
 
 **Claude Code adapter:**
 
@@ -2645,16 +1907,7 @@ claude-code:
   session_persistence: true
 ```
 
-The `claude-code` block is forwarded to the Claude Code adapter, which runs
-`claude -p --output-format stream-json --verbose` once per turn and maps these fields to
-CLI flags. Two keys are checked before a run starts, `permission_mode` and
-`session_persistence`; the preflight refuses a value it cannot support, while the adapter
-itself refuses nothing and would launch on either. Every other value reaches the CLI as
-written, except `mcp_config`, which the generated configuration the worker writes
-supersedes. What the CLI does with an invalid value differs per flag: `--effort` falls
-back to the default effort with a warning, and an unknown model name reaches the API and
-fails there. A string key whose YAML value carries another type fails construction and,
-offline, is reported by `sortie validate` under the check `claude-code.<key>.wrong_type`.
+The `claude-code` block is forwarded to the Claude Code adapter, which runs `claude -p --output-format stream-json --verbose` once per turn and maps these fields to CLI flags. Two keys are checked before a run starts, `permission_mode` and `session_persistence`; the preflight refuses a value it cannot support, while the adapter itself refuses nothing and would launch on either. Every other value reaches the CLI as written, except `mcp_config`, which the generated configuration the worker writes supersedes. What the CLI does with an invalid value differs per flag: `--effort` falls back to the default effort with a warning, and an unknown model name reaches the API and fails there. A string key whose YAML value carries another type fails construction and, offline, is reported by `sortie validate` under the check `claude-code.<key>.wrong_type`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -2670,28 +1923,11 @@ offline, is reported by `sortie validate` under the check `claude-code.<key>.wro
 | `claude-code.mcp_config` | string | _(absent)_ | Path to an MCP server configuration JSON file, resolved relative to the directory holding WORKFLOW.md when it is not absolute. The worker reads that file, merges its own `sortie-tools` server into a generated copy under the workspace, and passes the copy to `--mcp-config`, which takes a single configuration path. The operator's file is never modified. A file that already declares a `sortie-tools` server fails the attempt. |
 | `claude-code.session_persistence` | boolean | `true` | When `false`, adds `--no-session-persistence` and Claude Code writes no session file to disk. Setting it to `false` is refused before the run starts, because the adapter passes `--resume <session_id>` on every turn but the first of a session this run created, which uses `--session-id` instead, and `--resume` needs the persisted session. |
 
-> **Important:** `bypassPermissions` is the only `permission_mode` value that
-> survives the dispatch preflight. Any other non-empty value fails the check
-> `claude-code.permission_mode.interactive` and no agent is dispatched while that value
-> stands, because a mode that lets the agent stop and ask for approval leaves an
-> unattended run with no one to answer the prompt. The check is an allowlist rather
-> than a list of asking modes, so a mode the CLI adds later is refused until someone
-> establishes what it does rather than passing validation unexamined.
+> **Important:** `bypassPermissions` is the only `permission_mode` value that survives the dispatch preflight. Any other non-empty value fails the check `claude-code.permission_mode.interactive` and no agent is dispatched while that value stands, because a mode that lets the agent stop and ask for approval leaves an unattended run with no one to answer the prompt. The check is an allowlist rather than a list of asking modes, so a mode the CLI adds later is refused until someone establishes what it does rather than passing validation unexamined.
 
-> **Important:** `agent.max_turns` (orchestrator turn-loop limit) and
-> `claude-code.max_turns` (CLI `--max-turns` flag) are distinct values. The orchestrator
-> limit controls how many turns the worker runs before exiting. The adapter limit controls
-> the Claude Code CLI's internal turn budget. They serve different purposes and should
-> typically have different values.
+> **Important:** `agent.max_turns` (orchestrator turn-loop limit) and `claude-code.max_turns` (CLI `--max-turns` flag) are distinct values. The orchestrator limit controls how many turns the worker runs before exiting. The adapter limit controls the Claude Code CLI's internal turn budget. They serve different purposes and should typically have different values.
 
-> **Important:** `claude-code.fallback_model` covers model availability, not provider
-> exhaustion. Claude Code switches to the fallback when the primary model is overloaded,
-> unavailable (a retired model, for example), or returns another non-retryable server
-> error. Authentication, billing, rate-limit, request-size, and transport errors never
-> trigger a switch; they follow their normal retry and error handling. The switch lasts
-> for the current turn only; the next turn starts on the primary model. Claude Code caps
-> a chain at three models after removing duplicates and ignores the rest. The adapter
-> forwards the configured string unchanged.
+> **Important:** `claude-code.fallback_model` covers model availability, not provider exhaustion. Claude Code switches to the fallback when the primary model is overloaded, unavailable (a retired model, for example), or returns another non-retryable server error. Authentication, billing, rate-limit, request-size, and transport errors never trigger a switch; they follow their normal retry and error handling. The switch lasts for the current turn only; the next turn starts on the primary model. Claude Code caps a chain at three models after removing duplicates and ignores the rest. The adapter forwards the configured string unchanged.
 
 **Copilot CLI adapter:**
 
@@ -2708,20 +1944,7 @@ copilot-cli:
   experimental: true
 ```
 
-The `copilot-cli` block is forwarded to the Copilot CLI adapter, which runs
-`copilot -p --output-format json -s --autopilot --no-ask-user` once per turn and maps
-these fields to CLI flags. The adapter adds `--resume <session_id>` once a session ID is
-known, either because the orchestrator resumed the session or because an earlier turn
-reported one. The first turn of a new session carries neither flag, and a turn that ends
-with no session ID, on a session where none was known already, is followed by
-`--continue`, which resumes the most recent conversation in the workspace directory.
-The adapter validates none of these values and forwards each as written, except in the
-two cases described below: a non-positive `max_autopilot_continues` is replaced by `50`,
-and `mcp_config` is reformatted before it reaches `--additional-mcp-config`. A string key
-whose YAML value carries another type fails construction and, offline, is reported by
-`sortie validate` under the check `copilot-cli.<key>.wrong_type`. The adapter reads the
-runtime's own task-completion report as the turn's outcome, not solely the terminal
-event's exit code.
+The `copilot-cli` block is forwarded to the Copilot CLI adapter, which runs `copilot -p --output-format json -s --autopilot --no-ask-user` once per turn and maps these fields to CLI flags. The adapter adds `--resume <session_id>` once a session ID is known, either because the orchestrator resumed the session or because an earlier turn reported one. The first turn of a new session carries neither flag, and a turn that ends with no session ID, on a session where none was known already, is followed by `--continue`, which resumes the most recent conversation in the workspace directory. The adapter validates none of these values and forwards each as written, except in the two cases described below: a non-positive `max_autopilot_continues` is replaced by `50`, and `mcp_config` is reformatted before it reaches `--additional-mcp-config`. A string key whose YAML value carries another type fails construction and, offline, is reported by `sortie validate` under the check `copilot-cli.<key>.wrong_type`. The adapter reads the runtime's own task-completion report as the turn's outcome, not solely the terminal event's exit code.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -2737,25 +1960,9 @@ event's exit code.
 | `copilot-cli.no_custom_instructions` | boolean | `false` | Adds `--no-custom-instructions` when `true`, so the CLI skips the custom instruction files it would otherwise read. |
 | `copilot-cli.experimental` | boolean | `false` | Adds `--experimental` when `true`, enabling the CLI's experimental features. |
 
-> **Important:** `allowed_tools` is the only one of the four tool-scoping keys that
-> changes what the launch approves. With it unset, the adapter passes `--allow-all` and
-> `denied_tools`, `available_tools`, and `excluded_tools` keep their own effect beside
-> that grant. Setting `allowed_tools` to a non-whitespace value replaces `--allow-all`
-> with the list, so a call the list does not match is denied without a prompt, the turn
-> continues, and a fully denied turn can still finish reporting success. `--allow-all`
-> bundles tool approval, file-path verification, and URL access, so replacing it also
-> restores the runtime's default confinement of file access to the working directory.
-> `sortie validate` reports that one configuration as a warning under check
-> `copilot-cli.allowed_tools.auto_deny` and blocks nothing. The example block above sets
-> `allowed_tools`, so it is the narrowed configuration and the one that draws the warning.
+> **Important:** `allowed_tools` is the only one of the four tool-scoping keys that changes what the launch approves. With it unset, the adapter passes `--allow-all` and `denied_tools`, `available_tools`, and `excluded_tools` keep their own effect beside that grant. Setting `allowed_tools` to a non-whitespace value replaces `--allow-all` with the list, so a call the list does not match is denied without a prompt, the turn continues, and a fully denied turn can still finish reporting success. `--allow-all` bundles tool approval, file-path verification, and URL access, so replacing it also restores the runtime's default confinement of file access to the working directory. `sortie validate` reports that one configuration as a warning under check `copilot-cli.allowed_tools.auto_deny` and blocks nothing. The example block above sets `allowed_tools`, so it is the narrowed configuration and the one that draws the warning.
 
-> **Important:** the generated MCP configuration file supersedes `copilot-cli.mcp_config`
-> as the value of `--additional-mcp-config`, which is why the operator's servers reach the
-> agent through the merge described above rather than through a second flag. The
-> configured value is forwarded on its own only when no generated file exists. In that
-> case its form decides the argument: a value beginning with `{` is passed as inline JSON,
-> a value already beginning with `@` is passed unchanged, and anything else is read as a
-> file path and prefixed with `@`.
+> **Important:** the generated MCP configuration file supersedes `copilot-cli.mcp_config` as the value of `--additional-mcp-config`, which is why the operator's servers reach the agent through the merge described above rather than through a second flag. The configured value is forwarded on its own only when no generated file exists. In that case its form decides the argument: a value beginning with `{` is passed as inline JSON, a value already beginning with `@` is passed unchanged, and anything else is read as a file path and prefixed with `@`.
 
 **Codex adapter:**
 
@@ -2771,17 +1978,9 @@ codex:
   mcp_config: ./mcp-servers.json  # Local launch only; ignored over SSH
 ```
 
-The `codex` block is forwarded to the Codex adapter, which launches `codex app-server`
-once per session and sends these fields on the `thread/start` and `turn/start`
-JSON-RPC requests as the session starts and as each turn runs. One key is checked
-before a run starts, `approval_policy`; the preflight refuses any value other than
-`never`, while the adapter itself refuses nothing further once a run starts. A string
-key whose YAML value carries another type fails construction and, offline, is reported
-by `sortie validate` under the check `codex.<key>.wrong_type`.
+The `codex` block is forwarded to the Codex adapter, which launches `codex app-server` once per session and sends these fields on the `thread/start` and `turn/start` JSON-RPC requests as the session starts and as each turn runs. One key is checked before a run starts, `approval_policy`; the preflight refuses any value other than `never`, while the adapter itself refuses nothing further once a run starts. A string key whose YAML value carries another type fails construction and, offline, is reported by `sortie validate` under the check `codex.<key>.wrong_type`.
 
-The Codex adapter uses a persistent subprocess model: the app-server is launched
-once in `StartSession` and kept alive across turns, unlike the per-turn subprocess
-model used by `claude-code`, `copilot-cli`, and `opencode`.
+The Codex adapter uses a persistent subprocess model: the app-server is launched once in `StartSession` and kept alive across turns, unlike the per-turn subprocess model used by `claude-code`, `copilot-cli`, and `opencode`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -2793,17 +1992,9 @@ model used by `claude-code`, `copilot-cli`, and `opencode`.
 | `codex.personality` | string | _(absent)_ | Forwarded to `thread/start`'s `personality` field when non-empty. |
 | `codex.mcp_config` | string | _(absent)_ | Path to an MCP server configuration JSON file, resolved relative to the directory holding WORKFLOW.md when it is not absolute, same as the other adapters. On a local launch, the generated file's servers are re-expressed as `-c mcp_servers.<name>=<table>` overrides on the app-server launch arguments. An SSH launch delivers neither form; see the MCP configuration section above. |
 
-> **Important:** `never` is the only `approval_policy` value that survives the dispatch
-> preflight. Any other non-empty value, including `untrusted` and `on-request`, fails
-> the check `codex.approval_policy.interactive` and no agent is dispatched while that
-> value stands. Codex also accepts an object form of this policy, a `granular` member
-> whose booleans decide each approval category, but this key is read as a string only,
-> so a map value is a type fault that fails construction rather than a value Codex sees.
+> **Important:** `never` is the only `approval_policy` value that survives the dispatch preflight. Any other non-empty value, including `untrusted` and `on-request`, fails the check `codex.approval_policy.interactive` and no agent is dispatched while that value stands. Codex also accepts an object form of this policy, a `granular` member whose booleans decide each approval category, but this key is read as a string only, so a map value is a type fault that fails construction rather than a value Codex sees.
 
-> **Important:** When `thread_sandbox` is omitted, the adapter defaults to
-> `workspaceWrite` with `writableRoots` set to the workspace path and
-> `networkAccess: false`. Use `turn_sandbox_policy` to override specific sandbox
-> fields per turn.
+> **Important:** When `thread_sandbox` is omitted, the adapter defaults to `workspaceWrite` with `writableRoots` set to the workspace path and `networkAccess: false`. Use `turn_sandbox_policy` to override specific sandbox fields per turn.
 
 **OpenCode adapter:**
 
@@ -2823,13 +2014,7 @@ opencode:
     - bash
 ```
 
-The `opencode` block is forwarded to the OpenCode adapter. The adapter runs
-`opencode run --format json --dir <workspace>` once per turn, appends
-`--session <session_id>` when continuing a session, and recovers final token
-usage with `opencode export --sanitize <session_id>` when the session ID is
-known. A string key whose YAML value carries another type fails construction and,
-offline, is reported by `sortie validate` under the check
-`opencode.<key>.wrong_type`.
+The `opencode` block is forwarded to the OpenCode adapter. The adapter runs `opencode run --format json --dir <workspace>` once per turn, appends `--session <session_id>` when continuing a session, and recovers final token usage with `opencode export --sanitize <session_id>` when the session ID is known. A string key whose YAML value carries another type fails construction and, offline, is reported by `sortie validate` under the check `opencode.<key>.wrong_type`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -2846,9 +2031,7 @@ offline, is reported by `sortie validate` under the check
 **Validation rules:**
 
 - `opencode.allowed_tools` and `opencode.denied_tools` MUST NOT overlap.
-- The adapter always removes any inherited `OPENCODE_PERMISSION` value before
-  launching OpenCode. If either tool list is non-empty, it replaces that value
-  with the adapter-managed JSON policy.
+- The adapter always removes any inherited `OPENCODE_PERMISSION` value before launching OpenCode. If either tool list is non-empty, it replaces that value with the adapter-managed JSON policy.
 
 **Kiro adapter:**
 
@@ -2867,12 +2050,7 @@ kiro:
   agent: my-context-profile
 ```
 
-The `kiro` block is forwarded to the Kiro adapter, which runs
-`kiro-cli chat --no-interactive --wrap never` once per turn and adds `--resume`
-on continuation turns to attach to the cwd-scoped conversation. The Kiro CLI
-is the rebranded Amazon Q Developer CLI; the binary is `kiro-cli`. A string key whose
-YAML value carries another type fails construction and, offline, is reported by
-`sortie validate` under the check `kiro.<key>.wrong_type`.
+The `kiro` block is forwarded to the Kiro adapter, which runs `kiro-cli chat --no-interactive --wrap never` once per turn and adds `--resume` on continuation turns to attach to the cwd-scoped conversation. The Kiro CLI is the rebranded Amazon Q Developer CLI; the binary is `kiro-cli`. A string key whose YAML value carries another type fails construction and, offline, is reported by `sortie validate` under the check `kiro.<key>.wrong_type`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -2883,12 +2061,8 @@ YAML value carries another type fails construction and, offline, is reported by
 
 **Validation rules:**
 
-- `kiro.trust_all_tools: true` and a non-empty `kiro.trust_tools` list MUST NOT
-  be set together. The adapter rejects this combination at construction time and
-  reports it identically from offline validation.
-- A configuration that does not resolve to full trust is refused. Leave both keys
-  unset, or set `kiro.trust_all_tools: true`, and run the agent inside a hardened
-  sandbox.
+- `kiro.trust_all_tools: true` and a non-empty `kiro.trust_tools` list MUST NOT be set together. The adapter rejects this combination at construction time and reports it identically from offline validation.
+- A configuration that does not resolve to full trust is refused. Leave both keys unset, or set `kiro.trust_all_tools: true`, and run the agent inside a hardened sandbox.
 
 **Environment variables consumed by the adapter:**
 
@@ -2896,16 +2070,9 @@ YAML value carries another type fails construction and, offline, is reported by
 | --- | --- | --- |
 | `KIRO_API_KEY` | Yes (local mode) | Headless credential. Requires a Kiro Pro, Pro+, or Power subscription. The adapter rejects a missing key in `StartSession` and runs a `kiro-cli whoami` canary to reject a present-but-invalid key, because headless `chat` with no credential blocks on an interactive device-login flow with no self-timeout. In SSH mode the canary is skipped and the orchestrator forwards `KIRO_API_KEY` from its environment into the remote command instead. |
 
-**Token usage and budgets:** The Kiro adapter emits no token-usage events.
-`kiro-cli` does not report token counts on the headless path (only an abstract
-credits figure on stderr), so `TurnResult.Usage` is the zero value and
-`token_rates.kiro` produces no cost estimate. Token-based budget enforcement
-does not apply to Kiro; `agent.turn_timeout_ms` is the wall-clock budget
-bound. A turn that goes silent is caught first by `agent.stall_timeout_ms`.
+**Token usage and budgets:** The Kiro adapter emits no token-usage events. `kiro-cli` does not report token counts on the headless path (only an abstract credits figure on stderr), so `TurnResult.Usage` is the zero value and `token_rates.kiro` produces no cost estimate. Token-based budget enforcement does not apply to Kiro; `agent.turn_timeout_ms` is the wall-clock budget bound. A turn that goes silent is caught first by `agent.stall_timeout_ms`.
 
-**MCP:** Under `KIRO_API_KEY` authentication the backend `GetProfile` gate
-disables MCP. A workspace `mcp.json` is not loaded and `--require-mcp-startup`
-is unreachable, so MCP-dependent workflows cannot run on the API-key path.
+**MCP:** Under `KIRO_API_KEY` authentication the backend `GetProfile` gate disables MCP. A workspace `mcp.json` is not loaded and `--require-mcp-startup` is unreachable, so MCP-dependent workflows cannot run on the API-key path.
 
 **Agent Client Protocol adapter:**
 
@@ -2922,15 +2089,9 @@ The `agent-client-protocol` block is forwarded to the Agent Client Protocol adap
 
 **MCP configuration and the generated file:**
 
-For every agent kind, the worker writes a generated MCP configuration file into the
-session workspace at `.sortie/mcp.json`. It always carries Sortie's own `sortie-tools`
-server. When the session's own agent block sets `mcp_config`, the servers declared in
-the file that key names are merged into the generated copy; the operator's file itself
-is never modified, and a file that already declares a server named `sortie-tools` fails
-the attempt.
+For every agent kind, the worker writes a generated MCP configuration file into the session workspace at `.sortie/mcp.json`. It always carries Sortie's own `sortie-tools` server. When the session's own agent block sets `mcp_config`, the servers declared in the file that key names are merged into the generated copy; the operator's file itself is never modified, and a file that already declares a server named `sortie-tools` fails the attempt.
 
-Which adapters hand that generated file's servers to the agent process differs by
-kind, and by delivery form:
+Which adapters hand that generated file's servers to the agent process differs by kind, and by delivery form:
 
 | Agent kind | Servers reach the agent | How |
 | --- | --- | --- |
@@ -2942,16 +2103,9 @@ kind, and by delivery form:
 | `mock` | No | the adapter launches no process |
 | `agent-client-protocol` | Yes, local launch only | the generated servers are re-expressed inside the session-creation request |
 
-An SSH session on `codex` or `opencode` receives neither form of delivery: both
-translating kinds carry the generated servers only on a local launch.
+An SSH session on `codex` or `opencode` receives neither form of delivery: both translating kinds carry the generated servers only on a local launch.
 
-Setting `mcp_config` in a block belonging to `kiro` or `mock` therefore has no effect
-on the agent. `sortie validate` reports that combination as a warning naming the kind,
-under the check `agent.mcp_config`. A separate warning, `agent.kind.no_tool_channel`,
-fires for any agent kind whose disposition delivers no channel on a local launch,
-stating that Sortie's tools will be neither advertised nor callable for it. Both are
-warnings and not errors: such a configuration stays valid, the run proceeds, and the
-exit code is unchanged.
+Setting `mcp_config` in a block belonging to `kiro` or `mock` therefore has no effect on the agent. `sortie validate` reports that combination as a warning naming the kind, under the check `agent.mcp_config`. A separate warning, `agent.kind.no_tool_channel`, fires for any agent kind whose disposition delivers no channel on a local launch, stating that Sortie's tools will be neither advertised nor callable for it. Both are warnings and not errors: such a configuration stays valid, the run proceeds, and the exit code is unchanged.
 
 A kind named by `dispatch.default.agent` or by `dispatch.rules[*].agent` that differs from the top-level `agent.kind` must carry its own top-level settings block; `agent.kind` itself never requires one. An empty mapping (`codex: {}`) or a bare key with nothing following (`codex:`) satisfies the requirement; a scalar or a list value does not. `sortie validate` reports a missing or malformed block as an error under the check `dispatch.agent.missing_block`, naming the selector that introduced the kind and the block it expects. `agent.command` is workflow-wide, and a routed kind's own settings block cannot override it ([architecture §5.3.5](architecture/05-workflow-specification.md#535-agent-object)); adding the block satisfies this check without making the route launch the routed kind's own binary.
 
@@ -2965,8 +2119,7 @@ my-custom-adapter:
   option_two: true
 ```
 
-The orchestrator forwards the entire sub-object to the matching adapter without
-interpretation. Any adapter you register can read its fields from this block.
+The orchestrator forwards the entire sub-object to the matching adapter without interpretation. Any adapter you register can read its fields from this block.
 
 ---
 
@@ -2974,8 +2127,7 @@ interpretation. Any adapter you register can read its fields from this block.
 
 ### 5.1 Template Engine
 
-Sortie uses Go [`text/template`](https://pkg.go.dev/text/template) with strict mode
-enabled:
+Sortie uses Go [`text/template`](https://pkg.go.dev/text/template) with strict mode enabled:
 
 ```go
 template.New("prompt").
@@ -2986,23 +2138,17 @@ template.New("prompt").
 
 **Strict mode guarantees:**
 
-- Referencing an **unknown variable** fails rendering immediately (does not produce empty
-  string).
+- Referencing an **unknown variable** fails rendering immediately (does not produce empty string).
 - Calling an **unknown function** fails rendering immediately.
-- `missingkey=error` distinguishes between a map key that is absent (error) and a key
-  that is present with a `nil` value (evaluates as falsy in `{{ if }}`).
+- `missingkey=error` distinguishes between a map key that is absent (error) and a key that is present with a `nil` value (evaluates as falsy in `{{ if }}`).
 
 ### 5.2 Template Input Variables
 
-The data map passed to `Execute` contains **three core top-level keys** (`issue`, `attempt`,
-`run`) plus **continuation context keys** (`ci_failure`, `review_comments`, `bot_review_comments`,
-`merge_conflict`, `label_review`, `label_fix`) that are `nil` by default and populated on
-reaction-triggered dispatches:
+The data map passed to `Execute` contains **three core top-level keys** (`issue`, `attempt`, `run`) plus **continuation context keys** (`ci_failure`, `review_comments`, `bot_review_comments`, `merge_conflict`, `label_review`, `label_fix`) that are `nil` by default and populated on reaction-triggered dispatches:
 
 #### `issue` — Normalized Issue Object
 
-All fields from the tracker, normalized into a stable structure regardless of the
-underlying tracker system.
+All fields from the tracker, normalized into a stable structure regardless of the underlying tracker system.
 
 | Field                | Type            | Description                                                                                                                                      |
 | -------------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -3030,10 +2176,7 @@ underlying tracker system.
 | Integer `0`    | First try, no prior worker failures in this session.                                      |
 | Integer `>= 1` | Retry try number after a worker failure. The value does not change on continuation turns. |
 
-**Template usage:** Use `{{ if .attempt }}` to distinguish first tries from retries.
-`attempt` is always an integer; on the first try it is `0`, so `{{ if .attempt }}`
-evaluates to `false`, and on retries it is `>= 1`, so `{{ if .attempt }}` evaluates to
-`true`. Continuation turns within the same session reuse the same `attempt` value.
+**Template usage:** Use `{{ if .attempt }}` to distinguish first tries from retries. `attempt` is always an integer; on the first try it is `0`, so `{{ if .attempt }}` evaluates to `false`, and on retries it is `>= 1`, so `{{ if .attempt }}` evaluates to `true`. Continuation turns within the same session reuse the same `attempt` value.
 
 #### `run` — Per-Turn Metadata
 
@@ -3045,8 +2188,7 @@ evaluates to `false`, and on retries it is `>= 1`, so `{{ if .attempt }}` evalua
 
 #### `ci_failure` — CI Failure Context (continuation key)
 
-Non-nil only on turn 1 of a CI-fix continuation dispatch. Contains CI failure details
-from `CIResult.ToTemplateMap()`:
+Non-nil only on turn 1 of a CI-fix continuation dispatch. Contains CI failure details from `CIResult.ToTemplateMap()`:
 
 | Field                     | Type            | Description                                              |
 | ------------------------- | --------------- | -------------------------------------------------------- |
@@ -3060,8 +2202,7 @@ When `nil` (default on non-CI dispatches), `{{ if .ci_failure }}` evaluates to `
 
 #### `review_comments` — Review Comment Context (continuation key)
 
-Non-nil only on turn 1 of a review-fix continuation dispatch. Contains a list of human
-review comments from `CHANGES_REQUESTED` PR reviews:
+Non-nil only on turn 1 of a review-fix continuation dispatch. Contains a list of human review comments from `CHANGES_REQUESTED` PR reviews:
 
 | Field (per element)           | Type    | Description                                              |
 | ----------------------------- | ------- | -------------------------------------------------------- |
@@ -3072,8 +2213,7 @@ review comments from `CHANGES_REQUESTED` PR reviews:
 | `.review_comments[].reviewer` | string  | Username of the comment author.                          |
 | `.review_comments[].body`     | string  | Comment text.                                            |
 
-When `nil` (default on non-review dispatches), `{{ if .review_comments }}` evaluates to
-`false`.
+When `nil` (default on non-review dispatches), `{{ if .review_comments }}` evaluates to `false`.
 
 **Template pattern for review comments:**
 
@@ -3094,9 +2234,7 @@ The following review comments were left on the PR. Address each one:
 
 #### `bot_review_comments` — Bot Review Comment Context (continuation key)
 
-Non-nil only on turn 1 of a bot-review-fix continuation dispatch. Contains a list of
-comments authored by automated review bots (see `reactions.bot_review` in Section 2.10).
-The per-element shape is identical to `review_comments`:
+Non-nil only on turn 1 of a bot-review-fix continuation dispatch. Contains a list of comments authored by automated review bots (see `reactions.bot_review` in Section 2.10). The per-element shape is identical to `review_comments`:
 
 | Field (per element)               | Type    | Description                                              |
 | --------------------------------- | ------- | -------------------------------------------------------- |
@@ -3107,8 +2245,7 @@ The per-element shape is identical to `review_comments`:
 | `.bot_review_comments[].reviewer` | string  | Login of the bot that authored the comment.             |
 | `.bot_review_comments[].body`     | string  | Comment text.                                            |
 
-When `nil` (default on non-bot-review dispatches), `{{ if .bot_review_comments }}`
-evaluates to `false`.
+When `nil` (default on non-bot-review dispatches), `{{ if .bot_review_comments }}` evaluates to `false`.
 
 **Template pattern for bot review comments:**
 
@@ -3129,9 +2266,7 @@ The following comments were left on the PR by automated review tools. Address ea
 
 #### `merge_conflict` — Merge Conflict Context (continuation key)
 
-Non-nil only on turn 1 of a merge-conflict-resolution continuation dispatch. Contains the
-PR identity and the rebase target read live from the PR object (see
-`reactions.merge_conflicts` in Section 2.10):
+Non-nil only on turn 1 of a merge-conflict-resolution continuation dispatch. Contains the PR identity and the rebase target read live from the PR object (see `reactions.merge_conflicts` in Section 2.10):
 
 | Field                      | Type    | Description                                                                 |
 | -------------------------- | ------- | --------------------------------------------------------------------------- |
@@ -3140,13 +2275,9 @@ PR identity and the rebase target read live from the PR object (see
 | `.merge_conflict.head_sha` | string  | Latest commit SHA on the PR head branch.                                    |
 | `.merge_conflict.base`     | string  | PR's real target (base) branch, read live from the PR object. The rebase target. |
 
-The `base` value is the PR's actual base ref, not an assumed default branch, so the agent
-rebases onto the correct target for PRs that target a release branch, a GitFlow `develop`,
-or a stacked-PR parent. The orchestrator defers the continuation while the base ref is
-unavailable, so `base` is always a populated branch name when this context is emitted.
+The `base` value is the PR's actual base ref, not an assumed default branch, so the agent rebases onto the correct target for PRs that target a release branch, a GitFlow `develop`, or a stacked-PR parent. The orchestrator defers the continuation while the base ref is unavailable, so `base` is always a populated branch name when this context is emitted.
 
-When `nil` (default on non-merge-conflict dispatches), `{{ if .merge_conflict }}` evaluates
-to `false`.
+When `nil` (default on non-merge-conflict dispatches), `{{ if .merge_conflict }}` evaluates to `false`.
 
 **Template pattern for merge conflicts:**
 
@@ -3166,10 +2297,7 @@ its base branch {{ .merge_conflict.base }}. Resolve them:
 
 #### `label_review` — Label Review Context (continuation key)
 
-Non-nil only on turn 1 of a read-only label-review dispatch, triggered when an operator
-applies the configured review label to a Sortie-managed PR (see `reactions.label_commands`
-in Section 2.10). Carries the PR coordinates the agent needs to fetch the diff and post its
-review:
+Non-nil only on turn 1 of a read-only label-review dispatch, triggered when an operator applies the configured review label to a Sortie-managed PR (see `reactions.label_commands` in Section 2.10). Carries the PR coordinates the agent needs to fetch the diff and post its review:
 
 | Field                        | Type    | Description                                         |
 | ---------------------------- | ------- | --------------------------------------------------- |
@@ -3179,13 +2307,9 @@ review:
 | `.label_review.actor`        | string  | Login of the operator who applied the review label. |
 | `.label_review.requested_at` | string  | RFC 3339 timestamp of the confirmed labeling gesture. |
 
-The orchestrator injects only these coordinates. It never injects the PR diff text and never
-posts a comment itself; the agent fetches the diff and posts review comments using its own
-SCM tooling. A prompt template that omits the `{{ if .label_review }}` branch therefore
-produces no review on a label-review dispatch.
+The orchestrator injects only these coordinates. It never injects the PR diff text and never posts a comment itself; the agent fetches the diff and posts review comments using its own SCM tooling. A prompt template that omits the `{{ if .label_review }}` branch therefore produces no review on a label-review dispatch.
 
-When `nil` (default on non-label-review dispatches), `{{ if .label_review }}` evaluates to
-`false`.
+When `nil` (default on non-label-review dispatches), `{{ if .label_review }}` evaluates to `false`.
 
 **Template pattern for label review:**
 
@@ -3204,10 +2328,7 @@ Produce a code review of pull request #{{ .label_review.pr_number }} in
 
 #### `label_fix`: Label Fix Context (continuation key)
 
-Non-nil only on turn 1 of a fix dispatch, triggered when an operator applies the configured
-fix label to a Sortie-managed PR (see `reactions.label_commands` in Section 2.10). Carries
-the PR coordinates the agent needs to check out the head branch, address the review
-comments, and push:
+Non-nil only on turn 1 of a fix dispatch, triggered when an operator applies the configured fix label to a Sortie-managed PR (see `reactions.label_commands` in Section 2.10). Carries the PR coordinates the agent needs to check out the head branch, address the review comments, and push:
 
 | Field                     | Type    | Description                                           |
 | ------------------------- | ------- | ------------------------------------------------------ |
@@ -3218,15 +2339,9 @@ comments, and push:
 | `.label_fix.actor`        | string  | Login of the operator who applied the fix label.        |
 | `.label_fix.requested_at` | string  | RFC 3339 timestamp of the confirmed labeling gesture.    |
 
-The orchestrator injects only these coordinates. It never fetches the review comments,
-never applies changes, and never pushes or comments itself; the agent checks out
-`label_fix.branch`, addresses the comments, pushes the fixes, and posts the summary comment
-using its own SCM tooling. A prompt template that omits the `{{ if .label_fix }}` branch
-therefore runs the normal work prompt against a real checkout with push capability instead
-of producing a fix.
+The orchestrator injects only these coordinates. It never fetches the review comments, never applies changes, and never pushes or comments itself; the agent checks out `label_fix.branch`, addresses the comments, pushes the fixes, and posts the summary comment using its own SCM tooling. A prompt template that omits the `{{ if .label_fix }}` branch therefore runs the normal work prompt against a real checkout with push capability instead of producing a fix.
 
-When `nil` (default on non-label-fix dispatches), `{{ if .label_fix }}` evaluates to
-`false`.
+When `nil` (default on non-label-fix dispatches), `{{ if .label_fix }}` evaluates to `false`.
 
 **Template pattern for label fix:**
 
@@ -3246,8 +2361,7 @@ Check out {{ .label_fix.branch }} for pull request #{{ .label_fix.pr_number }} i
 
 ### 5.3 Built-in Functions (FuncMap)
 
-In addition to Go `text/template` built-in actions, Sortie ships a minimal set of
-prompt-essential functions. Each is permanent API surface.
+In addition to Go `text/template` built-in actions, Sortie ships a minimal set of prompt-essential functions. Each is permanent API surface.
 
 | Function | Signature                      | Description                                                                                                                            | Example                                              |
 | -------- | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
@@ -3255,9 +2369,7 @@ prompt-essential functions. Each is permanent API surface.
 | `join`   | `join separator list → string` | Join a list of strings with a separator.                                                                                               | `{{ .issue.labels \| join ", " }}` → `bug, urgent`   |
 | `lower`  | `lower string → string`        | Lowercase a string.                                                                                                                    | `{{ .issue.state \| lower }}` → `in progress`        |
 
-> **Note:** `join` uses pipe syntax with reversed arguments: `{{ .issue.labels | join ", " }}`.
-> The separator comes first in the function signature because Go template pipelines pass
-> the piped value as the last argument.
+> **Note:** `join` uses pipe syntax with reversed arguments: `{{ .issue.labels | join ", " }}`. The separator comes first in the function signature because Go template pipelines pass the piped value as the last argument.
 
 ### 5.4 Built-in Actions
 
@@ -3280,8 +2392,7 @@ Go `text/template` provides these built-in actions, all available in workflow te
 
 ### 5.5 First-Turn vs Continuation Semantics
 
-The prompt template supports three distinct modes within a single file. Workflow authors
-use `attempt` and `run.is_continuation` to branch:
+The prompt template supports three distinct modes within a single file. Workflow authors use `attempt` and `run.is_continuation` to branch:
 
 | Scenario              | `attempt`      | `run.is_continuation` | Typical template action                                       |
 | --------------------- | -------------- | --------------------- | ------------------------------------------------------------- |
@@ -3311,31 +2422,21 @@ A previous attempt failed. Diagnose the root cause.
 
 **Turn semantics within a session:**
 
-- The full prompt template is rendered on **every** turn. The runtime always passes the
-  full rendered result to the agent, regardless of turn number.
-- Workflow authors control what the agent receives on continuation turns by branching on
-  `.run.is_continuation`. Without such branching, the agent receives identical instructions
-  every turn.
-- After each turn, the worker re-checks the tracker issue state. If the issue is
-  still active, another turn begins (up to `agent.max_turns`).
+- The full prompt template is rendered on **every** turn. The runtime always passes the full rendered result to the agent, regardless of turn number.
+- Workflow authors control what the agent receives on continuation turns by branching on `.run.is_continuation`. Without such branching, the agent receives identical instructions every turn.
+- After each turn, the worker re-checks the tracker issue state. If the issue is still active, another turn begins (up to `agent.max_turns`).
 
 ### 5.6 Fallback Prompt Behavior
 
-- On **continuation turns** (turn number > 1), if the rendered prompt is empty, the
-  runtime substitutes a built-in default continuation prompt as a safety net. This covers
-  templates that omit `{{ if .run.is_continuation }}` branching.
-- On the **first turn**, if the rendered prompt is empty, no fallback is applied — the
-  empty string is passed to the agent as-is.
-- Workflow file read/parse failures are validation errors and do **not** silently fall
-  back to a default prompt.
+- On **continuation turns** (turn number > 1), if the rendered prompt is empty, the runtime substitutes a built-in default continuation prompt as a safety net. This covers templates that omit `{{ if .run.is_continuation }}` branching.
+- On the **first turn**, if the rendered prompt is empty, no fallback is applied — the empty string is passed to the agent as-is.
+- Workflow file read/parse failures are validation errors and do **not** silently fall back to a default prompt.
 
 ### 5.7 Common Patterns and Pitfalls
 
 #### Dot context inside `{{ range }}`
 
-Inside `{{ range .issue.labels }}`, the dot (`.`) refers to the **current list element**,
-not the root data map. To access top-level variables inside a range block, use the
-dollar-sign prefix:
+Inside `{{ range .issue.labels }}`, the dot (`.`) refers to the **current list element**, not the root data map. To access top-level variables inside a range block, use the dollar-sign prefix:
 
 ```
 {{ range .issue.labels }}
@@ -3343,15 +2444,11 @@ dollar-sign prefix:
 {{ end }}
 ```
 
-> **Common mistake:** Writing `{{ .issue.identifier }}` inside `{{ range }}` produces an
-> error because `.issue` does not exist on a string element. Use `{{ $.issue.identifier }}`
-> instead.
+> **Common mistake:** Writing `{{ .issue.identifier }}` inside `{{ range }}` produces an error because `.issue` does not exist on a string element. Use `{{ $.issue.identifier }}` instead.
 
 #### Nil-safe conditionals
 
-Fields that may be empty (`description`, `url`, `assignee`, etc.) should be guarded to
-avoid rendering blank sections. Empty string evaluates to `false` in `{{ if }}`, making
-this pattern safe whether the field is empty or absent:
+Fields that may be empty (`description`, `url`, `assignee`, etc.) should be guarded to avoid rendering blank sections. Empty string evaluates to `false` in `{{ if }}`, making this pattern safe whether the field is empty or absent:
 
 ```
 {{ if .issue.description }}
@@ -3386,24 +2483,16 @@ Blockers: {{ .issue.blocked_by | toJSON }}
 
 Hooks execute as shell scripts in a local shell context:
 
-- **Shell:** `sh -c <script>` (POSIX default). The orchestrator invokes hooks via `sh`,
-  not `bash`. There is no `hooks.shell` configuration field.
+- **Shell:** `sh -c <script>` (POSIX default). The orchestrator invokes hooks via `sh`, not `bash`. There is no `hooks.shell` configuration field.
 - **Working directory:** The per-issue workspace directory.
 - **Timeout:** Controlled by `hooks.timeout_ms` (default: 60,000 ms).
-- **Logging:** Hook start, completion, failures, and timeouts are logged by the
-  orchestrator.
+- **Logging:** Hook start, completion, failures, and timeouts are logged by the orchestrator.
 
-> **Login shell environments:** If a hook requires a login shell (e.g., for `nvm`, `rbenv`,
-> or other profile-dependent tooling), nest the invocation explicitly inside the script:
+> **Login shell environments:** If a hook requires a login shell (e.g., for `nvm`, `rbenv`, or other profile-dependent tooling), nest the invocation explicitly inside the script:
 >
-> ```yaml
-> hooks:
->   after_create: |
->     bash -lc 'nvm use 20 && npm ci'
-> ```
+> ```yaml hooks: after_create: | bash -lc 'nvm use 20 && npm ci' ```
 >
-> The outer `sh -c` invocation is transparent — it executes the `bash -lc` command, which
-> then sources the login profile and runs the inner script with the full environment.
+> The outer `sh -c` invocation is transparent — it executes the `bash -lc` command, which then sources the login profile and runs the inner script with the full environment.
 
 **Execution order in a typical lifecycle:**
 
@@ -3448,25 +2537,18 @@ These allow hooks to make decisions without parsing orchestrator internals.
 
 **Restricted environment inheritance:**
 
-Hook subprocesses **do not** inherit the full environment of the Sortie process. They
-receive a restricted environment consisting of:
+Hook subprocesses **do not** inherit the full environment of the Sortie process. They receive a restricted environment consisting of:
 
-- A small allowlist of standard POSIX and infrastructure variables: `PATH`, `HOME`,
-  `SHELL`, `TMPDIR`, `USER`, `LOGNAME`, `TERM`, `LANG`, `LC_ALL`, `SSH_AUTH_SOCK`.
+- A small allowlist of standard POSIX and infrastructure variables: `PATH`, `HOME`, `SHELL`, `TMPDIR`, `USER`, `LOGNAME`, `TERM`, `LANG`, `LC_ALL`, `SSH_AUTH_SOCK`.
 - All parent environment variables whose names start with `SORTIE_`.
-- The `SORTIE_ISSUE_ID`, `SORTIE_ISSUE_IDENTIFIER`, `SORTIE_WORKSPACE`, and
-  `SORTIE_ATTEMPT` variables injected by the orchestrator (listed above).
+- The `SORTIE_ISSUE_ID`, `SORTIE_ISSUE_IDENTIFIER`, `SORTIE_WORKSPACE`, and `SORTIE_ATTEMPT` variables injected by the orchestrator (listed above).
 
-All other parent variables — including secrets such as `JIRA_API_TOKEN`,
-`AWS_ACCESS_KEY_ID`, `GOOGLE_APPLICATION_CREDENTIALS`, and similar values — are
-**stripped and not available** inside hooks.
+All other parent variables — including secrets such as `JIRA_API_TOKEN`, `AWS_ACCESS_KEY_ID`, `GOOGLE_APPLICATION_CREDENTIALS`, and similar values — are **stripped and not available** inside hooks.
 
 If a hook needs additional secrets or environment values, arrange for them explicitly:
 
-- Expose the value under a `SORTIE_`-prefixed name in the Sortie process environment
-  (for example, `SORTIE_JIRA_API_TOKEN`) and read that variable inside the hook.
-- Load credentials from a file or external secrets manager inside the hook script
-  (for example, `source /etc/sortie/hooks-env` or `aws sts get-caller-identity`).
+- Expose the value under a `SORTIE_`-prefixed name in the Sortie process environment (for example, `SORTIE_JIRA_API_TOKEN`) and read that variable inside the hook.
+- Load credentials from a file or external secrets manager inside the hook script (for example, `source /etc/sortie/hooks-env` or `aws sts get-caller-identity`).
 
 ### 6.3 Failure Semantics
 
@@ -3481,9 +2563,7 @@ Timeouts are treated the same as failures for each hook's failure semantics.
 
 ### 6.4 Inline Scripts vs File Paths
 
-Hook values are multiline shell script strings defined inline using YAML literal block
-syntax (`|`). For complex hooks, consider extracting scripts to separate files and
-referencing them:
+Hook values are multiline shell script strings defined inline using YAML literal block syntax (`|`). For complex hooks, consider extracting scripts to separate files and referencing them:
 
 ```yaml
 hooks:
@@ -3499,22 +2579,11 @@ hooks:
   after_run: ./hooks/post-run.sh
 ```
 
-> **Note:** `after_create` runs only when Sortie first creates the per-issue
-> workspace directory, so the directory is empty when the clone runs. If
-> `after_create` fails, Sortie removes the directory before the next retry, so
-> a retry also starts from an empty directory. A clone error such as
-> "destination path already exists" or "directory not empty" does not come from
-> this example on the normal path.
+> **Note:** `after_create` runs only when Sortie first creates the per-issue workspace directory, so the directory is empty when the clone runs. If `after_create` fails, Sortie removes the directory before the next retry, so a retry also starts from an empty directory. A clone error such as "destination path already exists" or "directory not empty" does not come from this example on the normal path.
 >
-> Hooks also run with the restricted environment described in Section 6.2: an
-> allowlist (including `HOME` and `SSH_AUTH_SOCK`) plus `SORTIE_*` variables.
-> Sortie strips any variable outside that set, such as `GIT_SSH_COMMAND`, so an
-> SSH clone must reach its key through the SSH agent (`SSH_AUTH_SOCK`) or
-> through `~/.ssh` via `HOME`, not through a stripped variable.
+> Hooks also run with the restricted environment described in Section 6.2: an allowlist (including `HOME` and `SSH_AUTH_SOCK`) plus `SORTIE_*` variables. Sortie strips any variable outside that set, such as `GIT_SSH_COMMAND`, so an SSH clone must reach its key through the SSH agent (`SSH_AUTH_SOCK`) or through `~/.ssh` via `HOME`, not through a stripped variable.
 
-> **Caveat:** Inline scripts are triple-nested (Bash in YAML in Markdown). IDEs cannot
-> provide syntax highlighting or shell linting for inline scripts. For non-trivial logic,
-> external scripts are more maintainable.
+> **Caveat:** Inline scripts are triple-nested (Bash in YAML in Markdown). IDEs cannot provide syntax highlighting or shell linting for inline scripts. For non-trivial logic, external scripts are more maintainable.
 
 ---
 
@@ -3522,20 +2591,15 @@ hooks:
 
 ### 7.1 General Reload Semantics
 
-Sortie watches `WORKFLOW.md` for filesystem changes and automatically re-reads and
-re-applies configuration and prompt template without restart.
+Sortie watches `WORKFLOW.md` for filesystem changes and automatically re-reads and re-applies configuration and prompt template without restart.
 
 **Key guarantees:**
 
-- Reloaded config applies to **future** dispatch, retry scheduling, reconciliation,
-  hook execution, and agent launches.
+- Reloaded config applies to **future** dispatch, retry scheduling, reconciliation, hook execution, and agent launches.
 - **In-flight agent sessions are not restarted** when config changes.
-- **Invalid reloads do not crash** the service. Sortie continues operating with the last
-  known good configuration and emits an operator-visible error.
-- Sortie also performs **defensive re-validation before dispatch** (per tick) in case
-  filesystem watch events are missed.
-- The file watcher monitors the parent directory to detect atomic-rename saves
-  (vim, `sed -i`).
+- **Invalid reloads do not crash** the service. Sortie continues operating with the last known good configuration and emits an operator-visible error.
+- Sortie also performs **defensive re-validation before dispatch** (per tick) in case filesystem watch events are missed.
+- The file watcher monitors the parent directory to detect atomic-rename saves (vim, `sed -i`).
 
 ### 7.2 Per-Field Reload Behavior
 
@@ -3594,24 +2658,17 @@ re-applies configuration and prompt template without restart.
 | `logging.level`                        | **No effect** — requires restart.                                                              |
 | Prompt template                        | Future worker attempts (including continuation retries), not in-flight continuation turns.     |
 
-**Environment variable overrides and reload:** On each WORKFLOW.md reload, `SORTIE_*`
-environment variables and the `.env` file are re-read and merged into the fresh config.
-`.env` file changes are picked up on reload. Real environment variable changes require a
-process restart (standard Unix process semantics). See
-[Section 3.7](#37-dynamic-reload) for details.
+**Environment variable overrides and reload:** On each WORKFLOW.md reload, `SORTIE_*` environment variables and the `.env` file are re-read and merged into the fresh config. `.env` file changes are picked up on reload. Real environment variable changes require a process restart (standard Unix process semantics). See [Section 3.7](#37-dynamic-reload) for details.
 
 ---
 
 ## 8. Dispatch Preflight Validation
 
-Before dispatching work, the orchestrator validates the workflow configuration. This runs
-at two points:
+Before dispatching work, the orchestrator validates the workflow configuration. This runs at two points:
 
-**Startup validation:** Before starting the scheduling loop. If validation fails, startup
-is aborted with an operator-visible error.
+**Startup validation:** Before starting the scheduling loop. If validation fails, startup is aborted with an operator-visible error.
 
-**Per-tick validation:** Before each dispatch cycle. If validation fails, dispatch is
-skipped for that tick, reconciliation remains active, and an error is emitted.
+**Per-tick validation:** Before each dispatch cycle. If validation fails, dispatch is skipped for that tick, reconciliation remains active, and an error is emitted.
 
 **Validation checks:**
 
@@ -3639,19 +2696,9 @@ skipped for that tick, reconciliation remains active, and an error is emitted.
 | `tracker.no_change_state` requires `tracker.handoff_state` | `no_change_state` is set while `handoff_state` is empty. Checked entirely offline, with no tracker call and no adapter fallback. |
 | `tracker.no_change_state` names a permitted value | `no_change_state` is neither equal to `handoff_state` nor a member of `terminal_states` exactly as written in front matter. Checked entirely offline, with no tracker call and no adapter fallback. |
 
-**Advisory warnings vs. configuration errors:** An unknown key placed directly
-under `dispatch` (alongside `rules` and `default`) produces an `unknown_sub_key`
-advisory warning and does not block startup. Unknown keys nested deeper are
-rejected as configuration errors that fail the load: an unrecognized key inside a
-rule map (`dispatch.rules[*]`), inside `dispatch.default`, or inside a `match`
-block. The asymmetry matters: a typo like `lables:` inside `match`, or a stray key
-on a rule, is caught as an error so it cannot silently disable a rule, while a typo
-at the top `dispatch` level is flagged as a warning without preventing startup.
+**Advisory warnings vs. configuration errors:** An unknown key placed directly under `dispatch` (alongside `rules` and `default`) produces an `unknown_sub_key` advisory warning and does not block startup. Unknown keys nested deeper are rejected as configuration errors that fail the load: an unrecognized key inside a rule map (`dispatch.rules[*]`), inside `dispatch.default`, or inside a `match` block. The asymmetry matters: a typo like `lables:` inside `match`, or a stray key on a rule, is caught as an error so it cannot silently disable a rule, while a typo at the top `dispatch` level is flagged as a warning without preventing startup.
 
-**Adapter-specific tracker diagnostics.** A tracker adapter may contribute its own offline
-checks, which run during the same preflight without any network call. An `error`-severity
-diagnostic blocks dispatch like any other preflight error; a `warning`-severity diagnostic is
-advisory and does not block startup. The Linear adapter (`kind: linear`) emits:
+**Adapter-specific tracker diagnostics.** A tracker adapter may contribute its own offline checks, which run during the same preflight without any network call. An `error`-severity diagnostic blocks dispatch like any other preflight error; a `warning`-severity diagnostic is advisory and does not block startup. The Linear adapter (`kind: linear`) emits:
 
 | Check                                            | Severity | Message                                                                                                                                            |
 | ------------------------------------------------ | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -3665,16 +2712,9 @@ advisory and does not block startup. The Linear adapter (`kind: linear`) emits:
 | `tracker.active_states.untrimmed_element` / `tracker.terminal_states.untrimmed_element` | error | `tracker.active_states[<i>]: state name has leading or trailing whitespace and can never match a team state` (same shape for `terminal_states`) |
 | `tracker.states.overlap`                         | warning  | `tracker.active_states and tracker.terminal_states overlap on "<name>"; an issue in state "<name>" would match both sets`                           |
 
-A `handoff_state` or `in_progress_state` that collides with `active_states` or
-`terminal_states` is not an adapter diagnostic. The generic config validation rejects it for
-every `tracker.kind` before the adapter hook runs, reporting it as a `config.tracker.*` error.
-The config loader rules on the state lists as written; the dispatch preflight then runs the same
-rules against the effective lists and reports a collision that only an adapter fallback exposes
-under check `tracker.handoff_state` or `tracker.in_progress_state`, without the `config.` prefix.
+A `handoff_state` or `in_progress_state` that collides with `active_states` or `terminal_states` is not an adapter diagnostic. The generic config validation rejects it for every `tracker.kind` before the adapter hook runs, reporting it as a `config.tracker.*` error. The config loader rules on the state lists as written; the dispatch preflight then runs the same rules against the effective lists and reports a collision that only an adapter fallback exposes under check `tracker.handoff_state` or `tracker.in_progress_state`, without the `config.` prefix.
 
-These offline checks never contact Linear and never log the API key value. State-name existence
-against the team and credential validity are checked by the online preflight at adapter
-construction, not by `sortie validate`.
+These offline checks never contact Linear and never log the API key value. State-name existence against the team and credential validity are checked by the online preflight at adapter construction, not by `sortie validate`.
 
 ---
 
@@ -3692,8 +2732,7 @@ These errors are raised during workflow file loading and prevent dispatch until 
 
 ### 9.2 Configuration Errors
 
-These errors are raised during typed config construction from the parsed front matter.
-Each error identifies the offending field path.
+These errors are raised during typed config construction from the parsed front matter. Each error identifies the offending field path.
 
 | Error pattern                                                                   | Cause                                                                    | Fix                                                                                                                                  |
 | ------------------------------------------------------------------------------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
@@ -3748,8 +2787,7 @@ Each error identifies the offending field path.
 
 ### 9.3 Environment Variable Errors
 
-These errors are raised when `SORTIE_*` environment variables or `.env` file values fail
-type coercion. Each error identifies the env var as the source.
+These errors are raised when `SORTIE_*` environment variables or `.env` file values fail type coercion. Each error identifies the env var as the source.
 
 | Error pattern                                                                                                  | Cause                                                     | Fix                                                                              |
 | -------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- | -------------------------------------------------------------------------------- |
@@ -3766,9 +2804,7 @@ type coercion. Each error identifies the env var as the source.
 | **`template_parse_error`**  | Parse (workflow load) | **Blocks all dispatch** until corrected. | Syntax error in the prompt template: unclosed action, mismatched delimiters, undefined function in pipeline. | Check `{{ }}` balance. Verify function names match the FuncMap (`toJSON`, `join`, `lower`). Look for unclosed `{{ if }}`, `{{ range }}`, or `{{ with }}` blocks.                                                      |
 | **`template_render_error`** | Render (per issue)    | **Fails the current run attempt** only.  | Runtime error: missing variable (`missingkey=error`), type mismatch in pipeline, FuncMap function error.     | Check variable names against the data contract (`.issue.*`, `.attempt`, `.run.*`). Verify that fields accessed inside `{{ range }}` use `$` prefix for top-level access. Ensure `join` receives a list, not a scalar. |
 
-**Line number adjustment:** Template error messages include line numbers adjusted to
-`WORKFLOW.md`-relative positions (front matter line count is added to the
-template-relative line number). The error message format:
+**Line number adjustment:** Template error messages include line numbers adjusted to `WORKFLOW.md`-relative positions (front matter line count is added to the template-relative line number). The error message format:
 
 ```
 template parse error in WORKFLOW.md (line 47): template: prompt:4:15: ...
@@ -3779,9 +2815,7 @@ template render error in WORKFLOW.md (line 52): template: prompt:9: ...
 
 ## 10. Config Fields Summary (Cheat Sheet)
 
-A flat reference of every configuration field, for quick lookup. The "Env Override" column
-lists the `SORTIE_*` variable that overrides the field, or "—" if not overridable (see
-[Section 3](#3-environment-variable-overrides)).
+A flat reference of every configuration field, for quick lookup. The "Env Override" column lists the `SORTIE_*` variable that overrides the field, or "—" if not overridable (see [Section 3](#3-environment-variable-overrides)).
 
 | Field                                   | Type             | Default                      | Env Override                             | Notes                                                                                  |
 | --------------------------------------- | ---------------- | ---------------------------- | ---------------------------------------- | -------------------------------------------------------------------------------------- |
@@ -3885,8 +2919,7 @@ You are a software engineer. Fix the following issue:
 {{ end }}
 ```
 
-This uses all defaults: `claude-code` agent, 30-second polling, system-temp workspace root,
-no tracker (dispatch validation will fail — `tracker.kind` is required for actual dispatch).
+This uses all defaults: `claude-code` agent, 30-second polling, system-temp workspace root, no tracker (dispatch validation will fail — `tracker.kind` is required for actual dispatch).
 
 A minimal workflow with tracker configuration:
 
@@ -3906,18 +2939,9 @@ Fix {{ .issue.identifier }}: {{ .issue.title }}
 
 A complete, production-ready workflow demonstrating all major features:
 
-> **Note:** In this example, `after_create` runs only when Sortie first creates
-> the per-issue workspace directory, so the directory is empty when the clone
-> runs. If `after_create` fails, Sortie removes the directory before the next
-> retry, so a retry also starts from an empty directory. A clone error such as
-> "destination path already exists" or "directory not empty" does not come from
-> this example on the normal path.
+> **Note:** In this example, `after_create` runs only when Sortie first creates the per-issue workspace directory, so the directory is empty when the clone runs. If `after_create` fails, Sortie removes the directory before the next retry, so a retry also starts from an empty directory. A clone error such as "destination path already exists" or "directory not empty" does not come from this example on the normal path.
 >
-> Hooks also run with a restricted environment: an allowlist (including `HOME`
-> and `SSH_AUTH_SOCK`) plus `SORTIE_*` variables. Sortie strips any variable
-> outside that set, such as `GIT_SSH_COMMAND`, so an SSH clone must reach its
-> key through the SSH agent (`SSH_AUTH_SOCK`) or through `~/.ssh` via `HOME`,
-> not through a stripped variable. See Section 6.2 for the full allowlist.
+> Hooks also run with a restricted environment: an allowlist (including `HOME` and `SSH_AUTH_SOCK`) plus `SORTIE_*` variables. Sortie strips any variable outside that set, such as `GIT_SSH_COMMAND`, so an SSH clone must reach its key through the SSH agent (`SSH_AUTH_SOCK`) or through `~/.ssh` via `HOME`, not through a stripped variable. See Section 6.2 for the full allowlist.
 
 ```markdown
 ---
@@ -4140,8 +3164,7 @@ Fix {{ .issue.identifier }}: {{ .issue.title }}
 
 ### 11.4 Linear + Claude Code
 
-A workflow targeting a Linear team. `project` is the team key, the state names are Linear
-workflow states, and `query_filter` is a Linear `IssueFilter` JSON object:
+A workflow targeting a Linear team. `project` is the team key, the state names are Linear workflow states, and `query_filter` is a Linear `IssueFilter` JSON object:
 
 ```markdown
 ---
@@ -4173,6 +3196,4 @@ Fix {{ .issue.identifier }}: {{ .issue.title }}
 
 ---
 
-_This document is derived strictly from the Sortie Architecture Specification
-(Sections 5, 6, 9.4, and 10) and informed by end-to-end testing experience (tasks
-7.11–7.13). It is the authoritative user-facing reference for workflow authors._
+_This document is derived strictly from the Sortie Architecture Specification (Sections 5, 6, 9.4, and 10) and informed by end-to-end testing experience (tasks 7.11–7.13). It is the authoritative user-facing reference for workflow authors._

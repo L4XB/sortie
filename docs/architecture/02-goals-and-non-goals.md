@@ -18,9 +18,7 @@
 - Multi-tenant control plane or separately deployed frontend application.
 - Prescribing a specific dashboard or terminal UI implementation.
 - General-purpose workflow engine or distributed job scheduler.
-- Built-in business logic for how to edit tickets, PRs, or comments. (That logic lives in the
-  workflow prompt and agent tooling.)
+- Built-in business logic for how to edit tickets, PRs, or comments. (That logic lives in the workflow prompt and agent tooling.)
 - Mandating strong sandbox controls beyond what the coding agent and host OS provide.
-- Mandating a single default approval, sandbox, or operator-confirmation posture for all
-  deployments.
+- Mandating a single default approval, sandbox, or operator-confirmation posture for all deployments.
 

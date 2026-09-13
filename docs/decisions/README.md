@@ -1,7 +1,6 @@
 # Architecture Decision Records
 
-This directory contains architecturally significant decisions for Sortie, documented as
-[Markdown Architectural Decision Records (MADR)](https://adr.github.io/madr/).
+This directory contains architecturally significant decisions for Sortie, documented as [Markdown Architectural Decision Records (MADR)](https://adr.github.io/madr/).
 
 ## Decisions
 
