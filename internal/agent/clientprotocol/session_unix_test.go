@@ -13,8 +13,10 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
 )
@@ -61,7 +63,7 @@ func TestStartSessionMCPInjectionWire(t *testing.T) {
 		MCPConfigPath: mcpConfigPath,
 	}
 
-	session, err := startSession(context.Background(), &sessionOrigins{}, params)
+	session, err := startSession(context.Background(), &ClientProtocolAdapter{}, params)
 	if err != nil {
 		t.Fatalf("startSession() error = %v", err)
 	}
@@ -133,7 +135,7 @@ func TestStartSessionCancelledLaunchContextSignalsGracefully(t *testing.T) {
 	scriptPath := agenttest.WriteScript(t, dir, "agent.sh", mcpHandshakeThenGracefulExitScript(evidencePath, "0.4"))
 
 	ctx, cancel := context.WithCancel(context.Background())
-	session, err := startSession(ctx, &sessionOrigins{}, domain.StartSessionParams{
+	session, err := startSession(ctx, &ClientProtocolAdapter{}, domain.StartSessionParams{
 		WorkspacePath: t.TempDir(),
 		AgentConfig:   domain.AgentConfig{Command: scriptPath},
 	})
@@ -179,7 +181,7 @@ func TestStartSessionEmitsCollectedStderrAtWarnOnFailedInitialize(t *testing.T) 
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(orig) })
 
-	_, err := startSession(context.Background(), &sessionOrigins{}, domain.StartSessionParams{
+	_, err := startSession(context.Background(), &ClientProtocolAdapter{}, domain.StartSessionParams{
 		WorkspacePath: t.TempDir(),
 		AgentConfig:   domain.AgentConfig{Command: scriptPath},
 	})
@@ -281,7 +283,7 @@ func TestStartSessionEmitsCollectedStderrAtWarnOnFailedResolveSession(t *testing
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(orig) })
 
-	_, err := startSession(context.Background(), &sessionOrigins{}, domain.StartSessionParams{
+	_, err := startSession(context.Background(), &ClientProtocolAdapter{}, domain.StartSessionParams{
 		WorkspacePath: t.TempDir(),
 		AgentConfig:   domain.AgentConfig{Command: scriptPath},
 	})
@@ -312,7 +314,7 @@ func TestStopSessionReachesGroupChild(t *testing.T) {
 	pidPath := filepath.Join(dir, "group-child.pid")
 	scriptPath := agenttest.WriteScript(t, dir, "agent.sh", mcpHandshakeWithGroupChildScript(pidPath))
 
-	session, err := startSession(context.Background(), &sessionOrigins{}, domain.StartSessionParams{
+	session, err := startSession(context.Background(), &ClientProtocolAdapter{}, domain.StartSessionParams{
 		WorkspacePath: t.TempDir(),
 		AgentConfig:   domain.AgentConfig{Command: scriptPath},
 	})
@@ -345,7 +347,7 @@ func TestStopSessionDoesNotReachEscapedProcessGroupMember(t *testing.T) {
 	pidPath := filepath.Join(dir, "escaped.pid")
 	scriptPath := agenttest.WriteScript(t, dir, "agent.sh", mcpHandshakeWithDetachedChildScript(pidPath))
 
-	session, err := startSession(context.Background(), &sessionOrigins{}, domain.StartSessionParams{
+	session, err := startSession(context.Background(), &ClientProtocolAdapter{}, domain.StartSessionParams{
 		WorkspacePath: t.TempDir(),
 		AgentConfig:   domain.AgentConfig{Command: scriptPath},
 	})
@@ -362,5 +364,168 @@ func TestStopSessionDoesNotReachEscapedProcessGroupMember(t *testing.T) {
 
 	if err := syscall.Kill(escapedPID, 0); err != nil {
 		t.Errorf("escaped process group member (pid %d) liveness probe after stopSession() = %v, want still running", escapedPID, err)
+	}
+}
+
+// stderrThenExitWithDetachedHolderScript writes marker to standard
+// error, backgrounds a setsid descendant that inherits this script's
+// own standard-output handle (a plain shell background job keeps the
+// parent's file descriptors unless it redirects them, and setsid is
+// what lets the descendant survive teardown's group-directed kill),
+// then exits before ever reading or answering the initialize call. The
+// runtime is gone, but the escaped descendant keeps the output pipe
+// from reaching end of file, so a handshake call is still in flight
+// when the release gives up on it.
+func stderrThenExitWithDetachedHolderScript(marker, pidFile string) string {
+	return `setsid sh -c 'echo $$ > ` + pidFile + `; sleep 3600' 2>/dev/null &
+while [ ! -s ` + pidFile + ` ]; do sleep 0.01; done
+printf '%s\n' '` + marker + `' 1>&2
+exit 7
+`
+}
+
+// TestStartSessionHandshakeAbandonedByEscapedDescendantFailsWithPortExit
+// asserts that a runtime that exits during the handshake while an
+// escaped descendant still holds the output handle fails StartSession
+// at the reap plus the injected grace with domain.ErrPortExit, and the
+// runtime's own stderr line still reaches the operator.
+//
+// No t.Parallel(): installs a process-wide slog default.
+func TestStartSessionHandshakeAbandonedByEscapedDescendantFailsWithPortExit(t *testing.T) {
+	agenttest.RequireSetsid(t)
+
+	const marker = "distinguishing-stderr-line-handshake-abandoned"
+	dir := t.TempDir()
+	pidPath := filepath.Join(dir, "escaped.pid")
+	t.Cleanup(func() { killHelperGroup(pidPath) })
+	scriptPath := agenttest.WriteScript(t, dir, "agent.sh", stderrThenExitWithDetachedHolderScript(marker, pidPath))
+
+	var buf bytes.Buffer
+	orig := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(orig) })
+
+	const grace = 200 * time.Millisecond
+	adapter := &ClientProtocolAdapter{drainGrace: grace}
+
+	start := time.Now()
+	_, err := startSession(context.Background(), adapter, domain.StartSessionParams{
+		WorkspacePath: t.TempDir(),
+		AgentConfig:   domain.AgentConfig{Command: scriptPath},
+	})
+	elapsed := time.Since(start)
+
+	agentErr, ok := errors.AsType[*domain.AgentError](err)
+	if !ok {
+		t.Fatalf("startSession() error = %v (%T), want a non-nil *domain.AgentError", err, err)
+	}
+	if agentErr.Kind != domain.ErrPortExit {
+		t.Errorf("startSession() error kind = %q, want %q", agentErr.Kind, domain.ErrPortExit)
+	}
+	const wantMessage = "agent connection ended before responding"
+	if agentErr.Message != wantMessage {
+		t.Errorf("startSession() error message = %q, want %q", agentErr.Message, wantMessage)
+	}
+	if elapsed > 10*time.Second {
+		t.Errorf("startSession() took %v, want well under the 30s handshake timeout it would have hit without the release", elapsed)
+	}
+
+	output := buf.String()
+	if !hasWarnStderrLineRecord(output, marker) {
+		t.Errorf("startSession() output = %s, want one record carrying level=WARN, msg=\"agent stderr\", and line=%s together (the collector also logs this same line at Debug, which must not satisfy this check on its own)", output, marker)
+	}
+}
+
+// hasWarnStderrLineRecord reports whether output contains one log
+// record, on a single line, that carries level=WARN, msg="agent
+// stderr", and line=marker together: the three fields a
+// procutil.EmitWarnLines call produces for a collected stderr line.
+// The collector's own Debug-level record for the same line carries
+// the same message and line fields but a different level, so the
+// three checks must hold on one record rather than anywhere in the
+// buffer.
+func hasWarnStderrLineRecord(output, marker string) bool {
+	for line := range strings.SplitSeq(output, "\n") {
+		if strings.Contains(line, "level=WARN") &&
+			strings.Contains(line, `msg="agent stderr"`) &&
+			strings.Contains(line, "line="+marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// handshakeThenExitWithDetachedHolderScript answers the two calls
+// startSession makes before returning, then spawns a setsid
+// descendant that inherits this script's own standard-output handle
+// and exits without waiting for it, so a real subprocess reproduces
+// "the runtime exits, its descendant survives holding the write end"
+// for a session that has already started.
+func handshakeThenExitWithDetachedHolderScript(pidFile string) string {
+	return `while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
+      ;;
+    *'"method":"session/new"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"sess-1"}}'
+      break
+      ;;
+  esac
+done
+setsid sh -c 'echo $$ > ` + pidFile + `; sleep 3600' 2>/dev/null &
+while [ ! -s ` + pidFile + ` ]; do sleep 0.01; done
+exit 0
+`
+}
+
+// TestStopSessionReturnsBoundedAfterReleaseAbandonsOnARealSubprocess
+// asserts that, with the runtime gone and an escaped descendant still
+// holding the standard-output handle, once the release has abandoned,
+// StopSession still returns inside its pinned teardown ceiling against
+// a real subprocess. On Linux the release's own CloseStdout already
+// unparks the connection's reader by the time this runs, so this alone
+// does not exercise the post-abandonment stop arm runPump's select
+// falls back to when a reader stays genuinely parked; that arm is
+// proven separately, by an untagged test whose pipes are never wired
+// to the connection under test.
+func TestStopSessionReturnsBoundedAfterReleaseAbandonsOnARealSubprocess(t *testing.T) {
+	t.Parallel()
+	agenttest.RequireSetsid(t)
+
+	dir := t.TempDir()
+	pidPath := filepath.Join(dir, "escaped.pid")
+	t.Cleanup(func() { killHelperGroup(pidPath) })
+	scriptPath := agenttest.WriteScript(t, dir, "agent.sh", handshakeThenExitWithDetachedHolderScript(pidPath))
+
+	const grace = 200 * time.Millisecond
+	adapter := &ClientProtocolAdapter{drainGrace: grace}
+	session, err := startSession(context.Background(), adapter, domain.StartSessionParams{
+		WorkspacePath: t.TempDir(),
+		AgentConfig:   domain.AgentConfig{Command: scriptPath},
+	})
+	if err != nil {
+		t.Fatalf("startSession() error = %v, want nil", err)
+	}
+	state, ok := session.Internal.(*sessionState)
+	if !ok {
+		t.Fatalf("session.Internal type = %T, want *sessionState", session.Internal)
+	}
+
+	select {
+	case <-state.release.Abandoned():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the release never abandoned the parked reader")
+	}
+
+	start := time.Now()
+	if err := stopSession(context.Background(), session); err != nil {
+		t.Errorf("stopSession() error = %v, want nil", err)
+	}
+	elapsed := time.Since(start)
+
+	ceiling := procutil.DefaultStopGrace + 3*procutil.DefaultDrainGrace + teardownReturnOverhead
+	if elapsed >= ceiling {
+		t.Errorf("stopSession() took %v, want under %v (the pinned teardown ceiling)", elapsed, ceiling)
 	}
 }

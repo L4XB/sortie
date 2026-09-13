@@ -154,6 +154,15 @@ func runPump(state *sessionState) {
 	writeFailedCh := state.conn.WriteFailed()
 	var writeFailDeadlineC <-chan time.Time
 
+	// abandonedCh closes once the release gives up on the reader parked
+	// on a dead runtime's standard output. It is nil for a session built
+	// without a release.
+	abandonedCh := state.release.Abandoned()
+	// stopArm stays nil until abandonment, so only a session whose reader
+	// was given up on returns on the stop signal without waiting for that
+	// reader to end.
+	var stopArm <-chan struct{}
+
 	for {
 		var cancelSig <-chan struct{}
 		var deadlineC <-chan time.Time
@@ -174,6 +183,10 @@ func runPump(state *sessionState) {
 				doneFired = true
 				writeFailDeadlineC = nil
 				p.handleStreamEnd()
+			case <-abandonedCh:
+				abandonedCh = nil
+				stopArm = state.stopCh
+				p.handleAbandonment()
 			case <-writeFailedCh:
 				writeFailedCh = nil
 				writeFailDeadlineC = p.armWriteFailedDeadline()
@@ -186,6 +199,9 @@ func runPump(state *sessionState) {
 				p.finalizeActiveTurnOnDeadline()
 			case <-p.replayDeadlineC:
 				p.finalizeReplayQueryOnDeadline()
+			case <-stopArm:
+				p.logDroppedQueue()
+				return
 			}
 			continue
 		}
@@ -412,7 +428,28 @@ func (p *pumpState) handleStreamEnd() {
 	p.finalizeTurn(agentcore.TurnEvidence{
 		Terminal:          agentcore.TerminalFailure,
 		TerminalErrorKind: domain.ErrPortExit,
-		TerminalMessage:   streamEndedMessage,
+		TerminalMessage:   p.state.release.TurnEndMessage(streamEndedMessage),
+	})
+}
+
+// handleAbandonment runs once the session's release gives up on the
+// connection's reader. Unlike handleStreamEnd, it does not wait for
+// state.conn.Done(): that reader is exactly what the release gave up
+// on, and waiting for it would make the bound this exists to enforce
+// unbounded on a platform where closing the read end does not unpark a
+// parked read. Like handleStreamEnd, it first handles every item already
+// queued, so a response the reader delivered before it was given up on
+// still decides the turn.
+func (p *pumpState) handleAbandonment() {
+	p.drainReadyItems()
+	p.streamEnded = true
+	if p.activeTurn == nil {
+		return
+	}
+	p.finalizeTurn(agentcore.TurnEvidence{
+		Terminal:          agentcore.TerminalFailure,
+		TerminalErrorKind: domain.ErrPortExit,
+		TerminalMessage:   p.state.release.TurnEndMessage(streamEndedMessage),
 	})
 }
 
@@ -509,7 +546,7 @@ func (p *pumpState) handleStreamEndMessage(msg *jsonrpc.Message) {
 	p.finalizeTurn(agentcore.TurnEvidence{
 		Terminal:          agentcore.TerminalFailure,
 		TerminalErrorKind: domain.ErrPortExit,
-		TerminalMessage:   streamEndedMessage,
+		TerminalMessage:   p.state.release.TurnEndMessage(streamEndedMessage),
 		Cause:             msg.Err,
 	})
 }
@@ -644,7 +681,7 @@ func (p *pumpState) handleStartTurn(ts *turnStart) {
 	if p.streamEnded {
 		ts.reply <- turnVerdict{accepted: false, err: &domain.AgentError{
 			Kind:    domain.ErrPortExit,
-			Message: sessionEndedBeforeTurnMessage,
+			Message: p.state.release.TurnEndMessage(sessionEndedBeforeTurnMessage),
 		}}
 		return
 	}

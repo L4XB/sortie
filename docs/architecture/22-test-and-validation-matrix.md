@@ -280,6 +280,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Unsupported tool names return a JSON-RPC error rather than a result over the MCP execution channel, not at the adapter level, without stalling the session
 - An adapter whose runtime publishes a task-completion report carries a test driving both a turn the agent declared complete and a turn the runtime ended without that report through the adapter, asserting the two dispositions differ
 - A turn whose subprocess standard-error handle is held open by a surviving descendant still publishes its outcome and cleans up its process group within a bounded time
+- A turn whose subprocess standard-output handle is held open by a surviving descendant still ends within the adapter's own bound, naming the runtime's exit, rather than reaching the orchestrator's stall timeout
 
 ### 17.6 Observability
 

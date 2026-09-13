@@ -80,6 +80,7 @@ var contractBanTable = map[string]string{
 	"readResponse":           "jsonrpc.Conn.Call",
 	"startOpenCodeReader":    "procutil.NewStdoutReader",
 	"finishStderrDrain":      "procutil.StderrCollector.FinishAndCollect",
+	"release":                "procutil.StartOutputRelease",
 }
 
 // contractTrackerAdapterMethods are the tracker operation method names
@@ -2011,6 +2012,17 @@ func grace(ms int) time.Duration {
 func withRetry() error { return nil }
 `,
 			wantCount: 1,
+		},
+		{
+			name:       "a re-declared release name is rejected",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+func release() {}
+`,
+			wantCount:  1,
+			wantSubstr: "call procutil.StartOutputRelease",
 		},
 		{
 			name:       "a tracker-registering package's method with no trackermetrics.Track call is rejected",

@@ -84,13 +84,12 @@ type sessionState struct {
 	// that classifies and delivers every message into inbox.
 	conn *jsonrpc.Conn
 
-	// outputAbandoned reports that the release path gave up on the
-	// connection's reader: the runtime had been reaped and the reader
-	// had not ended when the drain bound expired. Written once by the
-	// release goroutine before it closes anything, read by RunTurn
-	// when the connection's end decides a turn, so it is an
-	// atomic.Bool rather than mutex-guarded.
-	outputAbandoned atomic.Bool
+	// release is the shared post-reap release goroutine that gives the
+	// connection's reader up to drainGrace to end on its own before
+	// giving up on it. Set once in StartSession before the handshake,
+	// read by RunTurn through TurnEndMessage; nil receiver semantics
+	// make it safe to read from any goroutine.
+	release *procutil.OutputRelease
 
 	// stderrReported latches the first call to reportStderr: a session
 	// reports the runtime's standard error at most once, however many
@@ -256,68 +255,6 @@ func watchTermination(state *sessionState) {
 // through, since this adapter carries jsonrpc.Message values through
 // the inbox with no adaptation.
 func identity(msg jsonrpc.Message) jsonrpc.Message { return msg }
-
-// outputAbandonedMessage is a turn's terminal message when the release
-// path gave up on the connection's reader, and nothing else: the WARN
-// record it accompanies keeps its own text. It states what the adapter
-// observed rather than why, and it names no channel, field, method, or
-// file.
-const outputAbandonedMessage = "the agent runtime exited before the session finished collecting its output"
-
-// turnEndMessage returns outputAbandonedMessage when the release path
-// gave up on state's connection, and fallback otherwise.
-func turnEndMessage(state *sessionState, fallback string) string {
-	if state.outputAbandoned.Load() {
-		return outputAbandonedMessage
-	}
-	return fallback
-}
-
-// release starts a goroutine that waits for the subprocess to be
-// reaped, then gives the connection's own reader up to grace to end on
-// its own before giving up on it. Without it, a runtime that dies with
-// its output handle still open leaves every handshake call and turn
-// waiting on a reader that cannot end. Every value it touches is
-// captured at construction rather than read from session state, so a
-// failure path that clears state.pipes under state.mu cannot race it.
-//
-// The give-up arm frees a reader parked in a read: closing the
-// standard-output read end releases it. It does not reach a runtime
-// that is still alive: that reader is freed only once the reaper
-// fires.
-//
-// release also anchors the session's one standard-error bound: once
-// the subprocess is reaped, a second goroutine runs
-// [procutil.StderrCollector.FinishAndCollect] concurrently with the
-// standard-output wait above, both bounded by the same grace, so a
-// reportStderr call reaching either path afterward finds the drain
-// already finished or abandoned rather than paying grace again.
-func release(state *sessionState, pipes *procutil.OwnedPipes, collector *procutil.StderrCollector, grace time.Duration, connDone, reaperDone <-chan struct{}, logger *slog.Logger) {
-	go func() {
-		<-reaperDone
-
-		// Closing the read end once the bound has resolved is what ends
-		// the drain itself: abandoning it releases whoever waited for
-		// the lines, while the scanner stays blocked in a read for as
-		// long as an escaped descendant holds the write end.
-		go func() {
-			collector.FinishAndCollect(grace)
-			pipes.CloseStderr() //nolint:errcheck,gosec // best-effort; ends a drain nothing else can
-		}()
-
-		timer := time.NewTimer(grace)
-		defer timer.Stop()
-		select {
-		case <-connDone:
-		case <-timer.C:
-			state.outputAbandoned.Store(true)
-			pipes.CloseStdout() //nolint:errcheck,gosec // best-effort; releases a reader parked on a dead runtime's descendant
-			state.closeConn()
-			logger.Warn("agent stdout was not fully collected before the session ended",
-				slog.Duration("drain_bound", grace))
-		}
-	}()
-}
 
 // drainHandshakeMessages processes every message the handshake left
 // queued in state.inbox, the same way handleOutOfTurnMessage processes
@@ -569,12 +506,20 @@ func (a *CodexAdapter) StartSession(ctx context.Context, params domain.StartSess
 	// Started before the handshake so the handshake wait loops observe
 	// a closed inbox, rather than timing out, when stdout ends mid-handshake.
 	go watchTermination(state)
-	// release ends a handshake call or a turn that would otherwise wait
-	// forever on a reaped runtime whose reader did not end inside the
-	// drain bound. It captures its own copies of pipes and the
+	// The release ends a handshake call or a turn that would otherwise
+	// wait forever on a reaped runtime whose reader did not end inside
+	// the drain bound. It captures its own copies of pipes and the
 	// connection's done channel because killOnError clears state.pipes
 	// under state.mu on every handshake failure path below.
-	release(state, pipes, state.stderrCollector, state.drainGrace, state.conn.Done(), reaper.Done(), logger)
+	state.release = procutil.StartOutputRelease(procutil.OutputReleaseParams{
+		Pipes:      pipes,
+		Reaped:     reaper.Done(),
+		ReaderDone: state.conn.Done(),
+		Stderr:     state.stderrCollector,
+		Grace:      state.drainGrace,
+		OnAbandon:  state.closeConn,
+		Logger:     logger,
+	})
 
 	if err := initializeHandshake(ctx, state); err != nil {
 		state.closeConn()
@@ -724,7 +669,7 @@ func (a *CodexAdapter) RunTurn(ctx context.Context, session domain.Session, para
 		}
 		return domain.TurnResult{UsageMeasured: state.usageMeasured}, &domain.AgentError{
 			Kind:    domain.ErrPortExit,
-			Message: turnEndMessage(state, fmt.Sprintf("turn/start failed: %v", err)),
+			Message: state.release.TurnEndMessage(fmt.Sprintf("turn/start failed: %v", err)),
 			Err:     err,
 		}
 	}
@@ -797,7 +742,7 @@ func (a *CodexAdapter) RunTurn(ctx context.Context, session domain.Session, para
 				ev := agentcore.TurnEvidence{
 					Terminal:          agentcore.TerminalFailure,
 					TerminalErrorKind: domain.ErrPortExit,
-					TerminalMessage:   turnEndMessage(state, "subprocess stdout closed unexpectedly"),
+					TerminalMessage:   state.release.TurnEndMessage("subprocess stdout closed unexpectedly"),
 				}
 				meta := agentcore.TurnMeta{
 					SessionID:     state.threadID,
@@ -822,7 +767,7 @@ func (a *CodexAdapter) RunTurn(ctx context.Context, session domain.Session, para
 				ev := agentcore.TurnEvidence{
 					Terminal:          agentcore.TerminalFailure,
 					TerminalErrorKind: domain.ErrPortExit,
-					TerminalMessage:   turnEndMessage(state, fmt.Sprintf("stdout read error: %v", msg.Err)),
+					TerminalMessage:   state.release.TurnEndMessage(fmt.Sprintf("stdout read error: %v", msg.Err)),
 					Cause:             msg.Err,
 				}
 				meta := agentcore.TurnMeta{

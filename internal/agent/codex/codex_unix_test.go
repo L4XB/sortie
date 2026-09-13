@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
@@ -315,8 +316,8 @@ func TestStartSession_ReleaseEndsTurnWhenEscapedDescendantHoldsOutput(t *testing
 	// Whichever of those two arms wins the race reports the abandonment,
 	// so asserting the message here is what keeps either of them from
 	// silently reverting to its transport text.
-	if agentErr.Message != outputAbandonedMessage {
-		t.Errorf("AgentError.Message = %q, want %q", agentErr.Message, outputAbandonedMessage)
+	if agentErr.Message != procutil.OutputAbandonedMessage {
+		t.Errorf("AgentError.Message = %q, want %q", agentErr.Message, procutil.OutputAbandonedMessage)
 	}
 
 	stopStart := time.Now()
