@@ -529,3 +529,88 @@ func TestStopSessionReturnsBoundedAfterReleaseAbandonsOnARealSubprocess(t *testi
 		t.Errorf("stopSession() took %v, want under %v (the pinned teardown ceiling)", elapsed, ceiling)
 	}
 }
+
+// promptThenExitWithDetachedHolderScript answers the two calls
+// startSession makes, then, once the first session/prompt arrives,
+// spawns a setsid descendant that inherits this script's own
+// standard-output handle and exits without answering, so a turn is in
+// flight when the runtime is gone and its descendant still holds the
+// write end.
+func promptThenExitWithDetachedHolderScript(pidFile string) string {
+	return `while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
+      ;;
+    *'"method":"session/new"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"sess-1"}}'
+      ;;
+    *'"method":"session/prompt"'*)
+      break
+      ;;
+  esac
+done
+setsid sh -c 'echo $$ > ` + pidFile + `; sleep 3600' 2>/dev/null &
+while [ ! -s ` + pidFile + ` ]; do sleep 0.01; done
+exit 0
+`
+}
+
+// TestRunTurnEndsBoundedWhenRuntimeExitsWithEscapedDescendantHoldingOutput
+// asserts that, through a real session, a turn whose runtime exits while
+// an escaped descendant still holds the standard-output handle ends
+// within the injected grace with domain.ErrPortExit and the release's
+// message rather than reaching the orchestrator's stall timeout, and
+// that StopSession still returns inside its pinned ceiling afterward.
+func TestRunTurnEndsBoundedWhenRuntimeExitsWithEscapedDescendantHoldingOutput(t *testing.T) {
+	t.Parallel()
+	agenttest.RequireSetsid(t)
+
+	dir := t.TempDir()
+	pidPath := filepath.Join(dir, "escaped.pid")
+	t.Cleanup(func() { killHelperGroup(pidPath) })
+	scriptPath := agenttest.WriteScript(t, dir, "agent.sh", promptThenExitWithDetachedHolderScript(pidPath))
+
+	const grace = 200 * time.Millisecond
+	adapter := &ClientProtocolAdapter{drainGrace: grace}
+	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
+		WorkspacePath: t.TempDir(),
+		AgentConfig:   domain.AgentConfig{Command: scriptPath},
+	})
+	if err != nil {
+		t.Fatalf("StartSession() error = %v, want nil", err)
+	}
+
+	start := time.Now()
+	result, runErr := adapter.RunTurn(context.Background(), session, domain.RunTurnParams{
+		Prompt:  "work",
+		OnEvent: func(domain.AgentEvent) {},
+	})
+	elapsed := time.Since(start)
+
+	if elapsed > 2*time.Second {
+		t.Errorf("RunTurn() took %v, want well under 2s (bounded by the injected drain grace %v)", elapsed, grace)
+	}
+	agentErr, ok := errors.AsType[*domain.AgentError](runErr)
+	if !ok {
+		t.Fatalf("RunTurn() error = %v (%T), want a non-nil *domain.AgentError", runErr, runErr)
+	}
+	if agentErr.Kind != domain.ErrPortExit {
+		t.Errorf("RunTurn() error kind = %q, want %q", agentErr.Kind, domain.ErrPortExit)
+	}
+	if agentErr.Message != procutil.OutputAbandonedMessage {
+		t.Errorf("RunTurn() error message = %q, want %q", agentErr.Message, procutil.OutputAbandonedMessage)
+	}
+	if result.ExitReason != domain.EventTurnFailed {
+		t.Errorf("RunTurn() ExitReason = %q, want %q", result.ExitReason, domain.EventTurnFailed)
+	}
+
+	stopStart := time.Now()
+	if err := adapter.StopSession(context.Background(), session); err != nil {
+		t.Errorf("StopSession() error = %v, want nil", err)
+	}
+	ceiling := procutil.DefaultStopGrace + 3*procutil.DefaultDrainGrace + teardownReturnOverhead
+	if stopElapsed := time.Since(stopStart); stopElapsed >= ceiling {
+		t.Errorf("StopSession() took %v, want under %v (the pinned teardown ceiling)", stopElapsed, ceiling)
+	}
+}
