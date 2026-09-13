@@ -21,6 +21,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest/dispositiontest"
 	"github.com/sortie-ai/sortie/internal/agent/jsonrpc"
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
@@ -1667,31 +1668,83 @@ func TestStopSession_NilState(t *testing.T) {
 	}
 }
 
+// TestStopSession_WithActiveReaderGoroutine pins that StopSession
+// releases a reader parked on the runtime's standard output while that
+// output's write end is still held, as a descendant that inherited the
+// handle holds it. The reader has taken every line before the stop and
+// waits on a live pipe, so only StopSession closing the read end can
+// end it.
 func TestStopSession_WithActiveReaderGoroutine(t *testing.T) {
 	t.Parallel()
 
-	// More messages than a bounded channel used to hold, kept here as
-	// historical framing: the inbox has no capacity to fill, so this
-	// no longer forces the scenario the count once did.
-	line := []byte("{\"method\":\"turn/started\",\"params\":{}}\n")
-	state := makeTestState(t, bytes.Repeat(line, 20))
-	// Simulate the subprocess having already exited so waitCh does not block.
-	closedWaitCh := make(chan struct{})
-	close(closedWaitCh)
-	state.waitCh = closedWaitCh
-
-	adapter, _ := NewCodexAdapter(map[string]any{})
-	err := adapter.StopSession(context.Background(), domain.Session{Internal: state})
+	outRead, outWrite, err := os.Pipe()
 	if err != nil {
-		t.Fatalf("StopSession() error = %v", err)
+		t.Fatalf("os.Pipe() error = %v", err)
+	}
+	errRead, errWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = outWrite.Close()
+		_ = outRead.Close()
+		_ = errWrite.Close()
+		_ = errRead.Close()
+	})
+
+	const lines = 20
+	if _, err := outWrite.Write(bytes.Repeat([]byte("{\"method\":\"turn/started\",\"params\":{}}\n"), lines)); err != nil {
+		t.Fatalf("writing the runtime's output: %v", err)
 	}
 
-	// StopSession waits on readerDone internally; it must be closed on return.
+	// The subprocess has already been reaped, so StopSession's own wait
+	// for it returns at once.
+	reaped := make(chan struct{})
+	close(reaped)
+	state := &sessionState{
+		threadID:   "thread-001",
+		stdin:      nopWriteCloser{},
+		waitCh:     reaped,
+		pipes:      &procutil.OwnedPipes{Stdout: outRead, Stderr: errRead},
+		inbox:      jsonrpc.NewInbox[jsonrpc.Message](),
+		readerDone: make(chan struct{}),
+	}
+	state.conn = jsonrpc.NewConn(nopWriteCloser{}, outRead, jsonrpc.Deliver(state.inbox, identity))
+	go watchTermination(state)
+
+	for i := range lines {
+		select {
+		case <-state.inbox.Ready():
+			if _, ok := state.inbox.Take(); !ok {
+				t.Fatalf("inbox closed after %d of %d lines, want the reader still parked on the live pipe", i, lines)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("reader delivered %d of %d lines within 5s", i, lines)
+		}
+	}
 	select {
 	case <-state.readerDone:
-		// OK
+		t.Fatal("the reader ended before StopSession, so this test would pass without StopSession releasing it")
 	default:
-		t.Error("readerDone should be closed after StopSession")
+	}
+
+	// StopSession gives up on the reader after 2s and releases it only
+	// when it closes the pipes on its way out, so a stop that reaches
+	// that bound has not released the reader itself even though
+	// readerDone is closed by the time it returns.
+	const readerWaitBound = 2 * time.Second
+	start := time.Now()
+	if err := (&CodexAdapter{}).StopSession(context.Background(), domain.Session{Internal: state}); err != nil {
+		t.Fatalf("StopSession() error = %v", err)
+	}
+	if elapsed := time.Since(start); elapsed >= readerWaitBound {
+		t.Errorf("StopSession() took %v, want it to release the reader before its %v wait gives up on it", elapsed, readerWaitBound)
+	}
+
+	select {
+	case <-state.readerDone:
+	default:
+		t.Error("readerDone is still open after StopSession, want StopSession to release the reader parked on the runtime's live output")
 	}
 }
 
