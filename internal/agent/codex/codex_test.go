@@ -1,18 +1,13 @@
-//go:build unix
-
 package codex
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -25,7 +20,6 @@ import (
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest/dispositiontest"
 	"github.com/sortie-ai/sortie/internal/agent/jsonrpc"
-	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
 )
@@ -716,193 +710,12 @@ func TestStopSession_ReturnsWhileWriteParked(t *testing.T) {
 	}
 }
 
-// startFakeCodexProcess writes scriptBody, touching a readiness marker
-// right after its leading trap statement so a caller's subsequent
-// SignalGraceful cannot race the shell installing the trap, starts it
-// in its own process group, and wires a minimal sessionState around it
-// with an already-closed readerDone (this harness has no reader
-// goroutine for StopSession to wait for).
-func startFakeCodexProcess(t *testing.T, scriptBody string, stopGraceMS int) *sessionState {
-	t.Helper()
-
-	dir := t.TempDir()
-	readyPath := filepath.Join(dir, "ready")
-	trapLine, rest, ok := strings.Cut(scriptBody, "\n")
-	if !ok || !strings.HasPrefix(trapLine, "trap ") {
-		t.Fatalf("startFakeCodexProcess: scriptBody must start with a trap statement, got %q", scriptBody)
-	}
-	script := trapLine + "\ntouch '" + readyPath + "'\n" + rest
-	scriptPath := agenttest.WriteScript(t, dir, "agent.sh", script)
-
-	cmd := exec.Command(scriptPath) //nolint:gosec // fixed path under t.TempDir()
-	procutil.SetProcessGroup(cmd)
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("cmd.Start() = %v", err)
-	}
-	t.Cleanup(func() { procutil.KillProcessGroup(cmd.Process.Pid) }) //nolint:errcheck // best-effort cleanup
-
-	readerDone := make(chan struct{})
-	close(readerDone)
-
-	waitCh := make(chan struct{})
-	state := &sessionState{
-		agentConfig: domain.AgentConfig{StopGraceMS: stopGraceMS},
-		proc:        cmd.Process,
-		waitCh:      waitCh,
-		readerDone:  readerDone,
-	}
-	go func() {
-		cmd.Wait() //nolint:errcheck,gosec // best-effort reap; exit state is irrelevant here
-		close(waitCh)
-	}()
-
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(readyPath); err == nil {
-			return state
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatalf("startFakeCodexProcess: readiness marker %q did not appear within 5s", readyPath)
-	return nil
-}
-
-// TestStopSession_ConfiguredGraceBoundsTheWait asserts that a
-// configured agent.stop_grace_ms bounds StopSession's graceful wait,
-// not the built-in five-second default.
-func TestStopSession_ConfiguredGraceBoundsTheWait(t *testing.T) {
-	t.Parallel()
-
-	state := startFakeCodexProcess(t, `trap '' TERM
-while :; do :; done`, 200)
-
-	start := time.Now()
-	err := (&CodexAdapter{}).StopSession(context.Background(), domain.Session{Internal: state})
-	elapsed := time.Since(start)
-
-	if err != nil {
-		t.Errorf("StopSession() = %v, want nil", err)
-	}
-	if elapsed > 2*time.Second {
-		t.Errorf("StopSession() force-terminated after %v, want well under the built-in 5s default (proves the configured 200ms grace bounded the wait, not DefaultStopGrace)", elapsed)
-	}
-}
-
-// TestStopSession_EscalationLogging asserts the escalation records
-// codex's StopSession emits: Debug on an exit inside the grace, and
-// Warn naming the outcome, the configured ceiling and the elapsed wait
-// when the phase ends without one. Both escalation outcomes are
-// reachable here, because StopSession ends the phase on whichever of
-// the grace and the caller's deadline arrives first.
-func TestStopSession_EscalationLogging(t *testing.T) {
-	// No t.Parallel(): installs a global slog default.
-
-	t.Run("exit_inside_grace_emits_debug_and_no_warn", func(t *testing.T) {
-		var buf bytes.Buffer
-		orig := slog.Default()
-		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-		t.Cleanup(func() { slog.SetDefault(orig) })
-
-		// The grace is far longer than this exit needs. The subtest proves
-		// which record the clean-exit path emits, not that the grace bounds
-		// anything, and a tight bound races the runner's scheduler instead
-		// of testing the code.
-		state := startFakeCodexProcess(t, `trap 'exit 0' TERM
-while :; do :; done`, 30000)
-
-		if err := (&CodexAdapter{}).StopSession(context.Background(), domain.Session{Internal: state}); err != nil {
-			t.Errorf("StopSession() = %v, want nil", err)
-		}
-
-		output := buf.String()
-		if !strings.Contains(output, "agent exited during the graceful phase") {
-			t.Errorf("StopSession() did not log the exited-inside-grace Debug record: %s", output)
-		}
-		if !strings.Contains(output, `outcome=exited`) {
-			t.Errorf("StopSession()'s Debug record missing outcome=exited: %s", output)
-		}
-		if strings.Contains(output, "level=WARN") {
-			t.Errorf("StopSession() logged a Warn record for a clean exit, want none: %s", output)
-		}
-	})
-
-	t.Run("grace_elapsed_emits_warn_with_outcome_and_grace", func(t *testing.T) {
-		var buf bytes.Buffer
-		orig := slog.Default()
-		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-		t.Cleanup(func() { slog.SetDefault(orig) })
-
-		state := startFakeCodexProcess(t, `trap '' TERM
-while :; do :; done`, 150)
-
-		if err := (&CodexAdapter{}).StopSession(context.Background(), domain.Session{Internal: state}); err != nil {
-			t.Errorf("StopSession() = %v, want nil", err)
-		}
-
-		output := buf.String()
-		if !strings.Contains(output, "agent did not exit inside the graceful period and was force-terminated") {
-			t.Errorf("StopSession() did not log the grace-elapsed Warn record: %s", output)
-		}
-		if !strings.Contains(output, `outcome="grace elapsed"`) {
-			t.Errorf(`StopSession()'s Warn record missing outcome="grace elapsed": %s`, output)
-		}
-		if !strings.Contains(output, "grace=") {
-			t.Errorf("StopSession()'s Warn record missing the configured grace ceiling: %s", output)
-		}
-		if !strings.Contains(output, "elapsed=") {
-			t.Errorf("StopSession()'s Warn record missing the elapsed wait: %s", output)
-		}
-	})
-
-	t.Run("caller_deadline_ends_the_phase_and_is_reported", func(t *testing.T) {
-		var buf bytes.Buffer
-		orig := slog.Default()
-		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-		t.Cleanup(func() { slog.SetDefault(orig) })
-
-		// The grace is far longer than the deadline, so only a
-		// StopSession that reads its context can end this phase. When
-		// it ignored the context, this arm waited out the whole grace
-		// and then reported success.
-		state := startFakeCodexProcess(t, `trap '' TERM
-while :; do :; done`, 30000)
-
-		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
-		defer cancel()
-
-		start := time.Now()
-		err := (&CodexAdapter{}).StopSession(ctx, domain.Session{Internal: state})
-		elapsed := time.Since(start)
-
-		if !errors.Is(err, context.DeadlineExceeded) {
-			t.Errorf("StopSession() = %v, want context.DeadlineExceeded", err)
-		}
-		if elapsed > 10*time.Second {
-			t.Errorf("StopSession() returned after %v, want the caller's deadline to end the phase far below the 30s grace", elapsed)
-		}
-
-		output := buf.String()
-		if !strings.Contains(output, `outcome="caller deadline"`) {
-			t.Errorf(`StopSession()'s Warn record missing outcome="caller deadline": %s`, output)
-		}
-		if !strings.Contains(output, "grace=30s") {
-			t.Errorf("StopSession()'s Warn record did not report the configured 30s ceiling: %s", output)
-		}
-	})
-}
-
 // handlerParkedOutcome is what a test's own goroutine running RunTurn
 // sends back once that call returns.
 type handlerParkedOutcome struct {
 	result domain.TurnResult
 	err    error
 }
-
-// fakeScenarioEnv names the fake app-server scenario a re-executed copy
-// of this test binary must serve. TestMain switches on it before the
-// package's own tests run, so a protocol fixture needs no external
-// interpreter and stays ordinary, debuggable Go.
-const fakeScenarioEnv = "SORTIE_TEST_CODEX_FAKE_SCENARIO"
 
 const (
 	// scenarioBurstDuringTurnOpening answers the handshake, then on
@@ -912,9 +725,8 @@ const (
 	scenarioBurstDuringTurnOpening = "burst-turn-opening"
 
 	// scenarioBurstBetweenTurns completes one turn normally, then writes
-	// a burst in one write, creates a marker file at the path named by
-	// burstBetweenTurnsMarkerEnv, and waits for the next turn/start
-	// before answering it.
+	// a burst in one write, creates a marker file at its params' Marker
+	// path, and waits for the next turn/start before answering it.
 	scenarioBurstBetweenTurns = "burst-between-turns"
 
 	// scenarioHandshakeBurstLogin writes a burst, then
@@ -931,32 +743,48 @@ const (
 // and it fills every platform's pipe buffer.
 const burstCount = 27000
 
-// burstBetweenTurnsMarkerEnv names the environment variable
-// scenarioBurstBetweenTurns reads the marker file path from. The
-// adapter launches its runtime with the parent's own environment, so
-// setting it in the test process reaches the re-executed fake
-// app-server.
-const burstBetweenTurnsMarkerEnv = "SORTIE_TEST_CODEX_BURST_MARKER_PATH"
-
-func TestMain(m *testing.M) {
-	if scenario := os.Getenv(fakeScenarioEnv); scenario != "" {
-		os.Exit(serveFakeAppServer(scenario, os.Stdin, os.Stdout))
-	}
-	os.Exit(m.Run())
+// fakeScenarios maps every scenario name a fake runtime in this
+// package can serve to the [agenttest.Scenario] that implements it.
+// Files whose scenarios only run on unix add to this map from their
+// own init, since package-level variables are initialized before any
+// init function runs regardless of which file declares them.
+var fakeScenarios = map[string]agenttest.Scenario{
+	scenarioBurstDuringTurnOpening: agenttest.Typed(func(_ []string, _ struct{}) int {
+		return serveBurstDuringTurnOpening(newFakeAppServerScanner(), os.Stdout)
+	}),
+	scenarioBurstBetweenTurns: agenttest.Typed(func(_ []string, params burstBetweenTurnsParams) int {
+		return serveBurstBetweenTurns(newFakeAppServerScanner(), os.Stdout, params.MarkerPath)
+	}),
+	scenarioHandshakeBurstLogin: agenttest.Typed(func(_ []string, _ struct{}) int {
+		return serveHandshakeBurstLogin(newFakeAppServerScanner(), os.Stdout)
+	}),
+	scenarioHandshakeBurstThread: agenttest.Typed(func(_ []string, _ struct{}) int {
+		return serveHandshakeBurstThread(newFakeAppServerScanner(), os.Stdout)
+	}),
 }
 
-// fakeAppServer points the adapter at this test binary, which TestMain
-// re-enters as the named scenario's fake app-server. The scenario
-// travels in the environment because the adapter launches its runtime
-// with the parent's own environment.
+func TestMain(m *testing.M) {
+	agenttest.Main(m, fakeScenarios)
+}
+
+// burstBetweenTurnsParams parameterizes scenarioBurstBetweenTurns.
+type burstBetweenTurnsParams struct {
+	MarkerPath string `json:"markerPath,omitempty"`
+}
+
+// fakeAppServer builds a fake runtime executable serving scenario with
+// no parameters, and returns its path.
 func fakeAppServer(t *testing.T, scenario string) string {
 	t.Helper()
-	self, err := os.Executable()
-	if err != nil {
-		t.Fatalf("os.Executable() error = %v", err)
-	}
-	t.Setenv(fakeScenarioEnv, scenario)
-	return self
+	return agenttest.FakeRuntime(t, t.TempDir(), "codex", scenario, struct{}{})
+}
+
+// newFakeAppServerScanner returns a scanner over this process's own
+// standard input, sized for the notification bursts a scenario writes.
+func newFakeAppServerScanner() *bufio.Scanner {
+	client := bufio.NewScanner(os.Stdin)
+	client.Buffer(make([]byte, 0, 4096), 1024*1024)
+	return client
 }
 
 // fakeFrame is the part of an incoming JSON-RPC frame a scenario acts
@@ -966,27 +794,16 @@ type fakeFrame struct {
 	Method string          `json:"method"`
 }
 
-// serveFakeAppServer runs one scenario against the client on in and out
-// and returns the process exit code. A scenario whose input ends before
-// its sequence completes exits non-zero, which the adapter sees as the
-// runtime dying rather than as silence.
-func serveFakeAppServer(scenario string, in io.Reader, out io.Writer) int {
-	client := bufio.NewScanner(in)
-	client.Buffer(make([]byte, 0, 4096), 1024*1024)
+// rpcResult is a JSON-RPC response frame.
+type rpcResult struct {
+	ID     json.RawMessage `json:"id"`
+	Result any             `json:"result"`
+}
 
-	switch scenario {
-	case scenarioBurstDuringTurnOpening:
-		return serveBurstDuringTurnOpening(client, out)
-	case scenarioBurstBetweenTurns:
-		return serveBurstBetweenTurns(client, out)
-	case scenarioHandshakeBurstLogin:
-		return serveHandshakeBurstLogin(client, out)
-	case scenarioHandshakeBurstThread:
-		return serveHandshakeBurstThread(client, out)
-	default:
-		fmt.Fprintf(os.Stderr, "fake app-server: unknown scenario %q\n", scenario)
-		return 2
-	}
+// rpcNotification is a JSON-RPC notification frame.
+type rpcNotification struct {
+	Method string `json:"method"`
+	Params any    `json:"params,omitempty"`
 }
 
 // nextFrame reports the client's next frame, or false once the client
@@ -1002,10 +819,14 @@ func nextFrame(client *bufio.Scanner) (fakeFrame, bool) {
 	return frame, true
 }
 
-// writeFrame writes one frame to the client, reporting whether the
-// client is still reading it.
-func writeFrame(out io.Writer, format string, args ...any) bool {
-	_, err := fmt.Fprintf(out, format, args...)
+// writeJSON encodes v as one JSON-RPC frame and writes it to out,
+// reporting whether the client is still reading it.
+func writeJSON(out io.Writer, v any) bool {
+	line, err := json.Marshal(v)
+	if err != nil {
+		return false
+	}
+	_, err = out.Write(append(line, '\n'))
 	return err == nil
 }
 
@@ -1017,7 +838,7 @@ func answerPreThreadHandshake(client *bufio.Scanner, out io.Writer) bool {
 	if !ok {
 		return false
 	}
-	if !writeFrame(out, "{\"id\":%s,\"result\":{}}\n", initialize.ID) {
+	if !writeJSON(out, rpcResult{ID: initialize.ID, Result: struct{}{}}) {
 		return false
 	}
 
@@ -1029,7 +850,7 @@ func answerPreThreadHandshake(client *bufio.Scanner, out io.Writer) bool {
 	if !ok {
 		return false
 	}
-	return writeFrame(out, "{\"id\":%s,\"result\":{}}\n", accountRead.ID)
+	return writeJSON(out, rpcResult{ID: accountRead.ID, Result: struct{}{}})
 }
 
 // fillerNotifications returns burstCount notifications as one string,
@@ -1038,7 +859,12 @@ func answerPreThreadHandshake(client *bufio.Scanner, out io.Writer) bool {
 func fillerNotifications() string {
 	var fill strings.Builder
 	for i := range burstCount {
-		fmt.Fprintf(&fill, "{\"method\":\"filler/notification\",\"params\":{\"i\":%d}}\n", i)
+		line, err := json.Marshal(rpcNotification{Method: "filler/notification", Params: map[string]any{"i": i}})
+		if err != nil {
+			continue
+		}
+		fill.Write(line)
+		fill.WriteByte('\n')
 	}
 	return fill.String()
 }
@@ -1056,10 +882,10 @@ func serveBurstDuringTurnOpening(client *bufio.Scanner, out io.Writer) int {
 	if !ok {
 		return 1
 	}
-	if !writeFrame(out, "{\"id\":%s,\"result\":{\"thread\":{\"id\":\"fake-thread-1\"}}}\n", threadStart.ID) {
+	if !writeJSON(out, rpcResult{ID: threadStart.ID, Result: map[string]any{"thread": map[string]any{"id": "fake-thread-1"}}}) {
 		return 1
 	}
-	if !writeFrame(out, "{\"method\":\"thread/started\",\"params\":{}}\n") {
+	if !writeJSON(out, rpcNotification{Method: "thread/started"}) {
 		return 1
 	}
 
@@ -1070,10 +896,10 @@ func serveBurstDuringTurnOpening(client *bufio.Scanner, out io.Writer) int {
 	if _, err := io.WriteString(out, fillerNotifications()); err != nil {
 		return 1
 	}
-	if !writeFrame(out, "{\"id\":%s,\"result\":{\"turn\":{\"id\":\"t1\"}}}\n", turnStart.ID) {
+	if !writeJSON(out, rpcResult{ID: turnStart.ID, Result: map[string]any{"turn": map[string]any{"id": "t1"}}}) {
 		return 1
 	}
-	if !writeFrame(out, "{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"id\":\"t1\",\"status\":\"completed\"}}}\n") {
+	if !writeJSON(out, rpcNotification{Method: "turn/completed", Params: map[string]any{"turn": map[string]any{"id": "t1", "status": "completed"}}}) {
 		return 1
 	}
 
@@ -1084,10 +910,10 @@ func serveBurstDuringTurnOpening(client *bufio.Scanner, out io.Writer) int {
 
 // serveBurstBetweenTurns answers the handshake, thread/start, and one
 // full turn, then writes burstCount notifications in one write,
-// creates a marker file at the path burstBetweenTurnsMarkerEnv names,
-// and waits for the next turn/start before answering it and keeping its
-// own standard input open.
-func serveBurstBetweenTurns(client *bufio.Scanner, out io.Writer) int {
+// creates a marker file at markerPath when non-empty, and waits for
+// the next turn/start before answering it and keeping its own
+// standard input open.
+func serveBurstBetweenTurns(client *bufio.Scanner, out io.Writer, markerPath string) int {
 	if !answerPreThreadHandshake(client, out) {
 		return 1
 	}
@@ -1095,10 +921,10 @@ func serveBurstBetweenTurns(client *bufio.Scanner, out io.Writer) int {
 	if !ok {
 		return 1
 	}
-	if !writeFrame(out, "{\"id\":%s,\"result\":{\"thread\":{\"id\":\"fake-thread-1\"}}}\n", threadStart.ID) {
+	if !writeJSON(out, rpcResult{ID: threadStart.ID, Result: map[string]any{"thread": map[string]any{"id": "fake-thread-1"}}}) {
 		return 1
 	}
-	if !writeFrame(out, "{\"method\":\"thread/started\",\"params\":{}}\n") {
+	if !writeJSON(out, rpcNotification{Method: "thread/started"}) {
 		return 1
 	}
 
@@ -1106,17 +932,17 @@ func serveBurstBetweenTurns(client *bufio.Scanner, out io.Writer) int {
 	if !ok {
 		return 1
 	}
-	if !writeFrame(out, "{\"id\":%s,\"result\":{\"turn\":{\"id\":\"t1\"}}}\n", turnStart1.ID) {
+	if !writeJSON(out, rpcResult{ID: turnStart1.ID, Result: map[string]any{"turn": map[string]any{"id": "t1"}}}) {
 		return 1
 	}
-	if !writeFrame(out, "{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"id\":\"t1\",\"status\":\"completed\"}}}\n") {
+	if !writeJSON(out, rpcNotification{Method: "turn/completed", Params: map[string]any{"turn": map[string]any{"id": "t1", "status": "completed"}}}) {
 		return 1
 	}
 
 	if _, err := io.WriteString(out, fillerNotifications()); err != nil {
 		return 1
 	}
-	if markerPath := os.Getenv(burstBetweenTurnsMarkerEnv); markerPath != "" {
+	if markerPath != "" {
 		if err := os.WriteFile(markerPath, []byte("done"), 0o644); err != nil {
 			return 1
 		}
@@ -1126,10 +952,10 @@ func serveBurstBetweenTurns(client *bufio.Scanner, out io.Writer) int {
 	if !ok {
 		return 1
 	}
-	if !writeFrame(out, "{\"id\":%s,\"result\":{\"turn\":{\"id\":\"t2\"}}}\n", turnStart2.ID) {
+	if !writeJSON(out, rpcResult{ID: turnStart2.ID, Result: map[string]any{"turn": map[string]any{"id": "t2"}}}) {
 		return 1
 	}
-	if !writeFrame(out, "{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"id\":\"t2\",\"status\":\"completed\"}}}\n") {
+	if !writeJSON(out, rpcNotification{Method: "turn/completed", Params: map[string]any{"turn": map[string]any{"id": "t2", "status": "completed"}}}) {
 		return 1
 	}
 
@@ -1153,10 +979,10 @@ func serveHandshakeBurstLogin(client *bufio.Scanner, out io.Writer) int {
 	if _, err := io.WriteString(out, fillerNotifications()); err != nil {
 		return 1
 	}
-	if !writeFrame(out, "{\"method\":\"account/login/completed\",\"params\":{\"success\":true}}\n") {
+	if !writeJSON(out, rpcNotification{Method: "account/login/completed", Params: map[string]any{"success": true}}) {
 		return 1
 	}
-	if !writeFrame(out, "{\"id\":%s,\"result\":{}}\n", loginStart.ID) {
+	if !writeJSON(out, rpcResult{ID: loginStart.ID, Result: struct{}{}}) {
 		return 1
 	}
 
@@ -1164,10 +990,10 @@ func serveHandshakeBurstLogin(client *bufio.Scanner, out io.Writer) int {
 	if !ok {
 		return 1
 	}
-	if !writeFrame(out, "{\"id\":%s,\"result\":{\"thread\":{\"id\":\"fake-thread-1\"}}}\n", threadStart.ID) {
+	if !writeJSON(out, rpcResult{ID: threadStart.ID, Result: map[string]any{"thread": map[string]any{"id": "fake-thread-1"}}}) {
 		return 1
 	}
-	if !writeFrame(out, "{\"method\":\"thread/started\",\"params\":{}}\n") {
+	if !writeJSON(out, rpcNotification{Method: "thread/started"}) {
 		return 1
 	}
 
@@ -1190,10 +1016,10 @@ func serveHandshakeBurstThread(client *bufio.Scanner, out io.Writer) int {
 	if _, err := io.WriteString(out, fillerNotifications()); err != nil {
 		return 1
 	}
-	if !writeFrame(out, "{\"method\":\"thread/started\",\"params\":{}}\n") {
+	if !writeJSON(out, rpcNotification{Method: "thread/started"}) {
 		return 1
 	}
-	if !writeFrame(out, "{\"id\":%s,\"result\":{\"thread\":{\"id\":\"fake-thread-1\"}}}\n", threadStart.ID) {
+	if !writeJSON(out, rpcResult{ID: threadStart.ID, Result: map[string]any{"thread": map[string]any{"id": "fake-thread-1"}}}) {
 		return 1
 	}
 
@@ -1231,8 +1057,9 @@ func countOtherMessages(events []domain.AgentEvent, method string) int {
 // turn/completed. RunTurn must complete rather than wait on the
 // orchestrator's own stall or turn timeout, with the runtime's own
 // process still unreaped throughout.
-// Not run with t.Parallel(): fakeAppServer uses t.Setenv.
 func TestRunTurn_BurstDuringTurnOpeningNoLongerHangs(t *testing.T) {
+	t.Parallel()
+
 	command := fakeAppServer(t, scenarioBurstDuringTurnOpening)
 	adapter := &CodexAdapter{}
 
@@ -1286,13 +1113,12 @@ func TestRunTurn_BurstDuringTurnOpeningNoLongerHangs(t *testing.T) {
 // before waiting for the next turn/start. The marker must appear well
 // before the second turn is even started, and the second turn must then
 // satisfy the same properties as the turn-opening burst.
-// Not run with t.Parallel(): uses t.Setenv and fakeAppServer.
 func TestRunTurn_BurstBetweenTurnsNoLongerHangs(t *testing.T) {
+	t.Parallel()
+
 	dir := t.TempDir()
 	markerPath := filepath.Join(dir, "marker")
-	t.Setenv(burstBetweenTurnsMarkerEnv, markerPath)
-
-	command := fakeAppServer(t, scenarioBurstBetweenTurns)
+	command := agenttest.FakeRuntime(t, t.TempDir(), "codex", scenarioBurstBetweenTurns, burstBetweenTurnsParams{MarkerPath: markerPath})
 	adapter := &CodexAdapter{}
 
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
