@@ -8,13 +8,21 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 )
+
+func init() {
+	fakeScenarios["procutil.group-leader"] = agenttest.Typed(runGroupLeader)
+	fakeScenarios["procutil.group-descendant"] = agenttest.Typed(runGroupDescendant)
+}
 
 func TestSetProcessGroup(t *testing.T) {
 	t.Parallel()
@@ -73,7 +81,7 @@ func TestSignalGraceful_ESRCH(t *testing.T) {
 func TestSignalProcessGroup_LiveProcess(t *testing.T) {
 	t.Parallel()
 
-	cmd := exec.Command("sleep", "3600")
+	cmd := fakeRuntimeCmd(t, agenttest.Output{Hang: true})
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("cmd.Start() = %v", err)
@@ -89,19 +97,6 @@ func TestSignalProcessGroup_LiveProcess(t *testing.T) {
 	if !WasSignaled(err) {
 		t.Errorf("WasSignaled(cmd.Wait()) = false, want true (process should have been terminated by SIGTERM)")
 	}
-}
-
-// writeShellScript writes content to a file under dir and returns its
-// path. The file is never executed directly - callers pass it to
-// /bin/sh as an argument - so it needs no executable bit and cannot hit
-// the ETXTBSY race that direct execution of a just-written file has.
-func writeShellScript(t *testing.T, dir, name, content string) string {
-	t.Helper()
-	path := filepath.Join(dir, name)
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-		t.Fatalf("os.WriteFile(%q) = %v, want nil", path, err)
-	}
-	return path
 }
 
 // pollForPID polls path until it holds a positive integer, returning it.
@@ -132,18 +127,67 @@ func pollForFile(path string, timeout time.Duration) bool {
 	return false
 }
 
+// groupLeaderParams parameterizes the procutil.group-leader scenario: a
+// fake runtime that starts a descendant fake runtime and waits for it,
+// remaining a member of the process group SetGroupCancel places its own
+// launch command into.
+type groupLeaderParams struct {
+	DescendantPath string
+}
+
+func runGroupLeader(_ []string, params groupLeaderParams) int {
+	// Disables the default, uncatchable SIGTERM disposition so the
+	// leader survives long enough to wait for (and so reap) the
+	// descendant, rather than leaving it a zombie for the test's
+	// kill(pid, 0) liveness check to trip over.
+	signal.Notify(make(chan os.Signal, 1), syscall.SIGTERM)
+
+	cmd := exec.Command(params.DescendantPath) //nolint:gosec // fake runtime path under t.TempDir()
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "group leader: start descendant: %v\n", err)
+		return 1
+	}
+	_ = cmd.Wait()
+	return 0
+}
+
+// groupDescendantParams parameterizes the procutil.group-descendant
+// scenario: a fake runtime that records its own PID, then traps a
+// catchable termination signal and records that it caught one.
+type groupDescendantParams struct {
+	Marker  string
+	PIDFile string
+}
+
+func runGroupDescendant(_ []string, params groupDescendantParams) int {
+	if err := os.WriteFile(params.PIDFile, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "group descendant: write pid: %v\n", err)
+		return 1
+	}
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGTERM)
+	<-sig
+
+	if err := os.WriteFile(params.Marker, []byte("terminated"), 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "group descendant: write marker: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
 // TestSetGroupCancel_CancelReachesDescendant verifies that cancelling the
 // context of a command prepared by SetGroupCancel delivers a catchable
 // termination signal to the whole process group, not just to the direct
 // child.
 //
-// The evidence is a marker written by a grandchild from inside its own
+// The evidence is a marker a grandchild writes from inside its own
 // signal handler. A grandchild is reachable only through the group, and
 // it can only run a handler if the signal was catchable, so the marker
 // distinguishes a group-wide graceful signal from os/exec's default of
-// force-killing the direct child alone. The direct child waits for the
-// grandchild before exiting, so cmd.Wait cannot return until the marker
-// is on disk.
+// force-killing the direct child alone. The leader waits for the
+// descendant before exiting, so it is reaped rather than left a zombie,
+// and cmd.Wait cannot return until the marker is on disk.
 func TestSetGroupCancel_CancelReachesDescendant(t *testing.T) {
 	t.Parallel()
 
@@ -151,27 +195,18 @@ func TestSetGroupCancel_CancelReachesDescendant(t *testing.T) {
 	marker := filepath.Join(dir, "descendant.terminated")
 	pidFile := filepath.Join(dir, "descendant.pid")
 
-	descendant := writeShellScript(t, dir, "descendant.sh", fmt.Sprintf(
-		"MARKER='%s'\n"+
-			"PID_FILE='%s'\n"+
-			"trap 'printf terminated > \"$MARKER\"; exit 0' TERM\n"+
-			"printf '%%s\\n' \"$$\" > \"$PID_FILE\"\n"+
-			"while :; do sleep 1; done\n",
-		marker, pidFile,
-	))
-	leader := writeShellScript(t, dir, "leader.sh", fmt.Sprintf(
-		"DESCENDANT='%s'\n"+
-			"/bin/sh \"$DESCENDANT\" &\n"+
-			"DESCENDANT_PID=$!\n"+
-			"trap 'wait \"$DESCENDANT_PID\"; exit 0' TERM\n"+
-			"wait \"$DESCENDANT_PID\"\n",
-		descendant,
-	))
+	descendantPath := agenttest.FakeRuntime(t, dir, "descendant", "procutil.group-descendant", groupDescendantParams{
+		Marker:  marker,
+		PIDFile: pidFile,
+	})
+	leaderPath := agenttest.FakeRuntime(t, dir, "leader", "procutil.group-leader", groupLeaderParams{
+		DescendantPath: descendantPath,
+	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "/bin/sh", leader)
+	cmd := exec.CommandContext(ctx, leaderPath) //nolint:gosec // fake runtime path under t.TempDir()
 	SetGroupCancel(cmd, DefaultStopGrace)
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("cmd.Start() = %v, want nil", err)
