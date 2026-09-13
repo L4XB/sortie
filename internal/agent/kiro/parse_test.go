@@ -1,5 +1,3 @@
-//go:build unix
-
 package kiro
 
 import (
@@ -162,7 +160,7 @@ func TestParseLine_EmitsNotification(t *testing.T) {
 	// stdout is the observed colorized marker; stderr carries the credits
 	// trailer so the turn completes cleanly. Splitting requires a newline so
 	// the skeleton's line scanner reads exactly one stdout line.
-	bin := fakeChatScript(t, t.TempDir(), "\x1b[38;5;141m> \x1b[0mPONG\n", creditsLine, 0)
+	bin := newKiroCLI(t, t.TempDir(), chatParams{Stdout: "\x1b[38;5;141m> \x1b[0mPONG\n", Stderr: creditsLine})
 	adapter, session, state := mustStartSession(t, bin)
 
 	events, _, err := runChatTurn(t, adapter, session, "ping")
@@ -204,7 +202,7 @@ func TestResumePath(t *testing.T) {
 		// t.Setenv is incompatible with t.Parallel.
 		setValidAPIKey(t)
 
-		bin := fakeChatScript(t, t.TempDir(), "answer", creditsLine, 0)
+		bin := newKiroCLI(t, t.TempDir(), chatParams{Stdout: "answer", Stderr: creditsLine})
 		adapter, session, state := mustStartSession(t, bin)
 
 		turn1Args := buildArgs(state, 1, "first", state.passthrough)
@@ -230,7 +228,7 @@ func TestResumePath(t *testing.T) {
 		setValidAPIKey(t)
 
 		// Turn 1 fails (non-zero exit), so resumeRequested must stay false.
-		bin := fakeChatScript(t, t.TempDir(), "", "boom\n", 1)
+		bin := newKiroCLI(t, t.TempDir(), chatParams{Stderr: "boom\n", ExitCode: 1})
 		adapter, session, state := mustStartSession(t, bin)
 
 		_, result, _ := runChatTurn(t, adapter, session, "first")
@@ -334,7 +332,7 @@ func TestParseLine_CommittedStdoutCaptureIsObservedAsAssistantOutput(t *testing.
 		t.Fatalf("turn_stdout.txt ends in a newline, want the runtime's own unterminated final line")
 	}
 
-	bin := fakeChatScript(t, t.TempDir(), string(capture), "a warning with no markers\n", 0)
+	bin := newKiroCLI(t, t.TempDir(), chatParams{Stdout: string(capture), Stderr: "a warning with no markers\n"})
 	adapter, session, _ := mustStartSession(t, bin)
 
 	_, result, err := runChatTurn(t, adapter, session, "ping")
