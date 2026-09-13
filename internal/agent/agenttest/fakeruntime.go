@@ -37,17 +37,47 @@ type fakeConfig struct {
 	Params   json.RawMessage
 }
 
+// staged is the copy of the test binary every fake runtime links to,
+// created by [Main] before the package's tests run.
+var staged string
+
 // Main is the whole TestMain body of a package whose tests call
 // [FakeRuntime]. A process started from a fake runtime executable runs
 // its scenario from scenarios and exits; any other process runs the
 // package's tests.
 func Main(m *testing.M, scenarios map[string]Scenario) {
-	if exe, err := os.Executable(); err == nil {
-		if config, err := os.ReadFile(configPath(exe)); err == nil {
+	exe, err := os.Executable()
+	if err == nil {
+		if config, readErr := os.ReadFile(configPath(exe)); readErr == nil {
 			os.Exit(runScenario(config, scenarios))
 		}
 	}
-	os.Exit(m.Run())
+
+	// Every fake runtime is a link to this staged copy rather than to the
+	// test binary itself: Windows refuses to delete any name of a running
+	// image, so a link to the test binary would survive t.TempDir cleanup
+	// and fail the test that made it. Copying here, before m.Run starts a
+	// goroutine that can fork, also keeps the copy clear of the ETXTBSY
+	// race a freshly written executable meets on Linux (golang/go#22315).
+	var stagedDir string
+	if err == nil {
+		if dir, mkErr := os.MkdirTemp("", "agenttest-fakeruntime"); mkErr == nil {
+			stagedDir = dir
+			staged = filepath.Join(dir, "runtime")
+			if runtime.GOOS == "windows" {
+				staged += ".exe"
+			}
+			if copyErr := copyExecutable(exe, staged); copyErr != nil {
+				staged = ""
+			}
+		}
+	}
+
+	code := m.Run()
+	if stagedDir != "" {
+		_ = os.RemoveAll(stagedDir)
+	}
+	os.Exit(code)
 }
 
 // Typed adapts run into a [Scenario] whose parameters decode into P.
@@ -107,9 +137,8 @@ func FakeRuntime(t testing.TB, dir, name, scenario string, params any) string {
 		t.Fatalf("FakeRuntime: encode config: %v", err)
 	}
 
-	self, err := os.Executable()
-	if err != nil {
-		t.Fatalf("FakeRuntime: %v", err)
+	if staged == "" {
+		t.Fatal("FakeRuntime: TestMain must call agenttest.Main")
 	}
 	path := filepath.Join(dir, name)
 	if runtime.GOOS == "windows" {
@@ -121,10 +150,10 @@ func FakeRuntime(t testing.TB, dir, name, scenario string, params any) string {
 
 	// A hard link never opens the executable for writing, so it cannot
 	// hit the ETXTBSY race a freshly written executable meets when another
-	// goroutine forks (golang/go#22315). The copy covers a test binary
-	// that sits on another file system.
-	if err := os.Link(self, path); err != nil {
-		if err := copyExecutable(self, path); err != nil {
+	// goroutine forks (golang/go#22315). The copy covers a staged binary
+	// that sits on another file system than dir.
+	if err := os.Link(staged, path); err != nil {
+		if err := copyExecutable(staged, path); err != nil {
 			t.Fatalf("FakeRuntime: %v", err)
 		}
 	}
