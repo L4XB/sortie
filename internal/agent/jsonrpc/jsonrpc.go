@@ -172,11 +172,26 @@ type wireRequest struct {
 	Params  any    `json:"params,omitempty"`
 }
 
-// enqueue appends line to the outbox for the writer goroutine to send,
-// and reports ErrClosed after [Conn.Close] or the write-failure error
-// after a prior write has failed, in either case without touching the
-// outbox at all.
+// enqueue appends line to the outbox for the writer goroutine to send.
+// It reports ErrClosed after [Conn.Close], or the write-failure error
+// after a write has failed, whether that is seen before the append or
+// through the outbox refusing it.
 func (c *Conn) enqueue(line []byte) error {
+	if err := c.sendErr(); err != nil {
+		return err
+	}
+	if !c.outbox.Put(outboxItem{line: line}) {
+		return c.sendErr()
+	}
+	return nil
+}
+
+// sendErr reports why the connection accepts no further lines:
+// ErrClosed after Close, the write-failure error after a failed write,
+// or nil while it still accepts them. Close and failWrite each close
+// their channel before the outbox, so an append the outbox refuses
+// always finds a non-nil error here.
+func (c *Conn) sendErr() error {
 	select {
 	case <-c.closed:
 		return ErrClosed
@@ -186,9 +201,8 @@ func (c *Conn) enqueue(line []byte) error {
 	case <-c.writeFailedCh:
 		return fmt.Errorf("write failed: %w", c.writeErr)
 	default:
+		return nil
 	}
-	c.outbox.Put(outboxItem{line: line})
-	return nil
 }
 
 func (c *Conn) marshalAndWriteRequest(method string, id int64, params any) error {
@@ -520,12 +534,14 @@ func (c *Conn) writeLoop() {
 }
 
 // failWrite records err as the connection's terminal write failure,
-// exactly once, and fails every pending call with it. Later calls to
-// enqueue observe writeFailedCh closed and fail without attempting a
-// write.
+// exactly once, and fails every pending call with it. It closes the
+// outbox after writeFailedCh, so a line appended once the writer
+// goroutine has exited is refused with the write-failure error rather
+// than accepted into a queue nothing drains.
 func (c *Conn) failWrite(err error) {
 	c.writeErr = err
 	close(c.writeFailedCh)
+	c.outbox.Close()
 	for id, ch := range c.drainPending() {
 		ch <- callResult{err: &writeFailedCallError{id: id, err: err}}
 	}

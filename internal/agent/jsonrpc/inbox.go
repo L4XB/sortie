@@ -30,15 +30,18 @@ func NewInbox[T any]() *Inbox[T] {
 	return &Inbox[T]{ready: make(chan struct{}, 1)}
 }
 
-// Put appends v behind every item already queued and returns without
-// waiting. After [Inbox.Close] it discards v instead.
-func (b *Inbox[T]) Put(v T) {
+// Put appends v behind every item already queued, returns without
+// waiting, and reports true. After [Inbox.Close] it discards v and
+// reports false.
+func (b *Inbox[T]) Put(v T) bool {
 	b.mu.Lock()
-	if !b.closed {
-		b.items = append(b.items, v)
+	defer b.mu.Unlock()
+	if b.closed {
+		return false
 	}
+	b.items = append(b.items, v)
 	b.settle()
-	b.mu.Unlock()
+	return true
 }
 
 // Close marks the end of input. It is idempotent. Items queued before
