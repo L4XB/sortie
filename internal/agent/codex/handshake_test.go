@@ -232,7 +232,7 @@ func TestAuthenticateIfNeeded_LoginSuccess(t *testing.T) {
 
 	// id=1: account/read → null account
 	// id=2: account/login/start → success response
-	// then: login/completed notification
+	// notification: login/completed
 	state := handshakeState(t,
 		`{"id":1,"result":{"account":null}}`,
 		`{"id":2,"result":{}}`,

@@ -66,7 +66,6 @@ func TestPopulateRetries(t *testing.T) {
 			t.Fatalf("Claimed count = %d, want 3", len(state.Claimed))
 		}
 
-		// Verify entry fields.
 		for _, pending := range entries {
 			e := pending.Entry
 			got, ok := state.RetryAttempts[e.IssueID]
@@ -97,7 +96,6 @@ func TestPopulateRetries(t *testing.T) {
 			}
 		}
 
-		// Verify error field handling.
 		if state.RetryAttempts["id-1"].Error != errMsg {
 			t.Errorf("id-1 Error = %q, want %q", state.RetryAttempts["id-1"].Error, errMsg)
 		}

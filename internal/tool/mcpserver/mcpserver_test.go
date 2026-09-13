@@ -467,7 +467,6 @@ func TestServe_MultipleMessages(t *testing.T) {
 		t.Fatalf("response count = %d, want 3", len(resps))
 	}
 
-	// Verify responses correspond to the right request IDs.
 	for i, wantID := range []float64{1, 2, 3} {
 		gotID, ok := resps[i]["id"].(float64)
 		if !ok || gotID != wantID {
@@ -504,7 +503,6 @@ func TestServe_ContextCancellation(t *testing.T) {
 		done <- srv.Serve(ctx)
 	}()
 
-	// Write one valid request, then cancel.
 	line := buildRequest(t, "initialize", 1, nil)
 	if _, err := pw.Write([]byte(line)); err != nil {
 		t.Fatalf("pipe write: %v", err)

@@ -264,7 +264,6 @@ func TestRunDatabaseRelativePath(t *testing.T) {
 
 	writeIssuesFixture(t, workflowDir)
 
-	// Create the subdirectory inside the workflow directory.
 	subdir := filepath.Join(workflowDir, "data")
 	if err := os.Mkdir(subdir, 0o755); err != nil {
 		t.Fatal(err)

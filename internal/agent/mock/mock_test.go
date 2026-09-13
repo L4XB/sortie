@@ -256,7 +256,6 @@ func TestRunTurn_DefaultSuccess(t *testing.T) {
 		t.Fatalf("RunTurn() error = %v", err)
 	}
 
-	// Verify result.
 	if result.ExitReason != domain.EventTurnCompleted {
 		t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnCompleted)
 	}
@@ -614,7 +613,6 @@ func TestRunTurn_InputRequired(t *testing.T) {
 		t.Errorf("AgentError.Kind = %q, want %q", ae.Kind, domain.ErrTurnInputRequired)
 	}
 
-	// Verify terminal event.
 	last := (*events)[len(*events)-1]
 	if last.Type != domain.EventTurnInputRequired {
 		t.Errorf("last event = %q, want %q", last.Type, domain.EventTurnInputRequired)

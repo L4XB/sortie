@@ -179,7 +179,6 @@ func TestStartSession_NewSession(t *testing.T) {
 		t.Error("isContinuation = true, want false")
 	}
 
-	// Verify UUID format.
 	uuidRe := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 	if !uuidRe.MatchString(session.ID) {
 		t.Errorf("session ID %q does not match UUID v4 format", session.ID)

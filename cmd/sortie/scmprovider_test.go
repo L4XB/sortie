@@ -270,7 +270,6 @@ func TestScmProviderConflict(t *testing.T) {
 					tt.kinds, gotConflict, tt.wantConflict, gotProviders)
 			}
 
-			// Verify active kinds list length and content.
 			if len(gotKinds) != len(tt.wantActiveKinds) {
 				t.Errorf("scmProviderConflict(%v) activeKinds = %v, want %v",
 					tt.kinds, gotKinds, tt.wantActiveKinds)
@@ -283,7 +282,6 @@ func TestScmProviderConflict(t *testing.T) {
 				}
 			}
 
-			// Verify distinct providers list length and content.
 			if len(gotProviders) != len(tt.wantDistinctProviders) {
 				t.Errorf("scmProviderConflict(%v) distinctProviders = %v, want %v",
 					tt.kinds, gotProviders, tt.wantDistinctProviders)

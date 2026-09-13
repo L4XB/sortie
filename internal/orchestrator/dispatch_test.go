@@ -987,7 +987,6 @@ func TestDispatchIssue(t *testing.T) {
 			t.Errorf("len(Running) = %d, want 1", got)
 		}
 
-		// Verify initial fields.
 		if entry.Identifier != issue.Identifier {
 			t.Errorf("RunningEntry.Identifier = %q, want %q", entry.Identifier, issue.Identifier)
 		}

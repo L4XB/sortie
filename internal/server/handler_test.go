@@ -2044,7 +2044,6 @@ func TestStateResponseJSON(t *testing.T) {
 		t.Fatalf("json.Unmarshal: %v", err)
 	}
 
-	// Verify required top-level keys exist.
 	for _, key := range []string{"generated_at", "counts", "running", "retrying", "agent_totals", "rate_limits"} {
 		if _, ok := m[key]; !ok {
 			t.Errorf("missing JSON key %q", key)

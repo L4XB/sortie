@@ -52,7 +52,6 @@ func TestSCMAdapter_MergeFlow_Integration(t *testing.T) {
 
 	restClient := newMergeFlowAPIClient(t)
 
-	// Create a unique throwaway branch name guaranteed to be unique per run.
 	branch := fmt.Sprintf("auto-merge-adapter-test-%d-%s",
 		time.Now().UnixNano(), mfRandomHex(4))
 
@@ -355,7 +354,6 @@ func (c *mergeFlowAPIClient) createMergeFlowBranchAndPR(t *testing.T, owner, rep
 		t.Fatalf("could not resolve HEAD SHA for %s/%s", repoInfo.DefaultBranch, repo)
 	}
 
-	// Create the new branch from the default branch tip.
 	refsPath := fmt.Sprintf("/repos/%s/%s/git/refs", owner, repo)
 	c.doMFRequest(t, "POST", refsPath, map[string]any{
 		"ref": "refs/heads/" + branch,
@@ -373,7 +371,6 @@ func (c *mergeFlowAPIClient) createMergeFlowBranchAndPR(t *testing.T, owner, rep
 	})
 	t.Logf("pushed sentinel commit to branch %q", branch)
 
-	// Open a PR from branch → default branch.
 	prsPath := fmt.Sprintf("/repos/%s/%s/pulls", owner, repo)
 	prResp := c.doMFRequest(t, "POST", prsPath, map[string]any{
 		"title": prTitle,

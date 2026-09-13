@@ -309,7 +309,6 @@ func TestFetchCandidateIssues_SinglePage(t *testing.T) {
 		t.Errorf("HTTP request count = %d, want 1 (no per-issue blocker fan-out)", got)
 	}
 
-	// Verify normalization on first issue
 	if issues[0].Identifier != "PROJ-1" {
 		t.Errorf("issues[0].Identifier = %q", issues[0].Identifier)
 	}
@@ -320,7 +319,6 @@ func TestFetchCandidateIssues_SinglePage(t *testing.T) {
 		t.Error("Comments should be nil for search results")
 	}
 
-	// Verify second issue
 	if issues[1].Identifier != "PROJ-2" {
 		t.Errorf("issues[1].Identifier = %q", issues[1].Identifier)
 	}
@@ -331,7 +329,6 @@ func TestFetchCandidateIssues_SinglePage(t *testing.T) {
 	adaptertest.AssertIssueNormalized(t, issues[0])
 	adaptertest.AssertIssueNormalized(t, issues[1])
 
-	// Verify JQL
 	if !strings.Contains(receivedJQL, "ORDER BY priority ASC, created ASC") {
 		t.Errorf("JQL missing ORDER BY: %q", receivedJQL)
 	}
@@ -988,7 +985,6 @@ func TestFetchIssueStatesByIdentifiers_SingleBatch(t *testing.T) {
 		t.Error("PROJ-3 should be absent from result")
 	}
 
-	// Verify JQL uses key IN.
 	if !strings.Contains(receivedJQL, "key IN") {
 		t.Errorf("JQL = %q, should use key IN", receivedJQL)
 	}
@@ -1179,7 +1175,6 @@ func TestAdapterLifecycle(t *testing.T) {
 	if len(candidates) != 2 {
 		t.Fatalf("candidates len = %d, want 2", len(candidates))
 	}
-	// Verify normalization invariants
 	for _, c := range candidates {
 		if c.Labels == nil {
 			t.Errorf("issue %s: Labels is nil", c.Identifier)
@@ -1194,11 +1189,10 @@ func TestAdapterLifecycle(t *testing.T) {
 			t.Errorf("issue %s: URL is empty", c.Identifier)
 		}
 	}
-	// Verify label lowercasing on issue 1
 	if candidates[0].Labels[0] != "feature" {
 		t.Errorf("label not lowercased: %v", candidates[0].Labels)
 	}
-	// Verify blocker on issue 1 (only inward "Blocks")
+	// BlockedBy includes only inward "Blocks" links.
 	if len(candidates[0].BlockedBy) != 1 {
 		t.Errorf("BlockedBy len = %d, want 1", len(candidates[0].BlockedBy))
 	}
@@ -1276,7 +1270,6 @@ func TestTransitionIssue_Success(t *testing.T) {
 		t.Fatalf("TransitionIssue() unexpected error: %v", err)
 	}
 
-	// Verify POST body contains transition.id "31"
 	var req struct {
 		Transition struct {
 			ID string `json:"id"`
@@ -1289,7 +1282,6 @@ func TestTransitionIssue_Success(t *testing.T) {
 		t.Errorf("POST transition.id = %q, want %q", req.Transition.ID, "31")
 	}
 
-	// Verify request paths (test case 13)
 	wantPath := "/rest/api/3/issue/PROJ-123/transitions"
 	if getPath != wantPath {
 		t.Errorf("GET path = %q, want %q", getPath, wantPath)

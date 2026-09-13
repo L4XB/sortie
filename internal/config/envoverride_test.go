@@ -396,7 +396,6 @@ func TestApplyEnvOverrides(t *testing.T) {
 		// Setting the var to "" means the env var is present but empty,
 		// and applyEnvOverrides skips it (val == "").
 		// To override to empty list requires a non-empty env mechanism; skip here.
-		// This test verifies that an empty env var value is a no-op.
 		t.Setenv("SORTIE_TRACKER_ACTIVE_STATES", "")
 		t.Setenv("SORTIE_ENV_FILE", "") // no dotenv fallback
 

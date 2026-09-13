@@ -1090,7 +1090,6 @@ func TestRunWorkerAttempt(t *testing.T) {
 			t.Errorf("ExitKind = %q, want %q", result.ExitKind, WorkerExitCancelled)
 		}
 
-		// Wait for StopSession to be called.
 		select {
 		case <-stopCalled:
 		case <-time.After(3 * time.Second):
@@ -2393,7 +2392,6 @@ func TestStopSessionBestEffort(t *testing.T) {
 			},
 		}
 
-		// Create an already-cancelled context.
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 
@@ -3440,7 +3438,6 @@ func TestRunWorkerAttempt_MCPConfig(t *testing.T) {
 			t.Errorf("MCPConfigPath = %q, want suffix %q", got, filepath.Join(".sortie", "mcp.json"))
 		}
 
-		// Confirm the file actually exists on disk.
 		if _, err := os.Stat(got); err != nil {
 			t.Errorf("mcp.json not found at %q: %v", got, err)
 		}

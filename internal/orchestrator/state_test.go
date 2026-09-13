@@ -324,7 +324,6 @@ func TestRuntimeSnapshot(t *testing.T) {
 
 		byID := runningSnapshotMap(t, result.Running)
 
-		// Verify entry A fields
 		a := byID["issue-a"]
 		if a.Identifier != "MT-100" {
 			t.Errorf("entry A Identifier = %q, want %q", a.Identifier, "MT-100")
@@ -360,7 +359,6 @@ func TestRuntimeSnapshot(t *testing.T) {
 			t.Errorf("entry A AgentTotalTokens = %d, want %d", a.AgentTotalTokens, 150)
 		}
 
-		// Verify entry B fields
 		b := byID["issue-b"]
 		if b.Identifier != "MT-200" {
 			t.Errorf("entry B Identifier = %q, want %q", b.Identifier, "MT-200")
@@ -372,13 +370,11 @@ func TestRuntimeSnapshot(t *testing.T) {
 			t.Errorf("entry B AgentTotalTokens = %d, want %d", b.AgentTotalTokens, 550)
 		}
 
-		// Verify computed seconds_running: 100.0 + 60.0 + 120.0 = 280.0
 		wantSeconds := 100.0 + 60.0 + 120.0
 		if math.Abs(result.AgentTotals.SecondsRunning-wantSeconds) > 0.001 {
 			t.Errorf("AgentTotals.SecondsRunning = %f, want %f", result.AgentTotals.SecondsRunning, wantSeconds)
 		}
 
-		// Verify aggregate token fields are copied
 		if result.AgentTotals.InputTokens != 500 {
 			t.Errorf("AgentTotals.InputTokens = %d, want %d", result.AgentTotals.InputTokens, 500)
 		}

@@ -784,7 +784,6 @@ func TestOrchestratorShutdown(t *testing.T) {
 
 	select {
 	case <-done:
-		// Run returned as expected.
 	case <-time.After(3 * time.Second):
 		t.Fatal("Run did not return within 3 seconds of context cancellation")
 	}
@@ -860,7 +859,6 @@ func TestMakeWorkerFn(t *testing.T) {
 			t.Error("OnEvent was not invoked")
 		}
 
-		// Verify event was delivered to the channel.
 		select {
 		case msg := <-o.agentEventCh:
 			if msg.IssueID != issue.ID {
@@ -904,7 +902,6 @@ func TestMakeWorkerFn(t *testing.T) {
 			close(exitDone)
 		}()
 
-		// Verify exit result was delivered.
 		select {
 		case result := <-o.workerExitCh:
 			if result.IssueID != issue.ID {
@@ -1309,7 +1306,6 @@ func TestOrchestratorDynamicConfig(t *testing.T) {
 
 	ctx := context.Background()
 
-	// First tick with MaxConcurrentAgents=2.
 	o.handleTick(ctx)
 	if state.MaxConcurrentAgents != 2 {
 		t.Errorf("after first tick MaxConcurrentAgents = %d, want 2", state.MaxConcurrentAgents)
@@ -1788,19 +1784,16 @@ func TestOrchestratorLifecycle(t *testing.T) {
 
 	// After Run returns, the event loop is stopped and state is safe to read.
 
-	// Verify all 3 issues completed.
 	for _, issue := range lifecycleIssues() {
 		if _, ok := state.Completed[issue.ID]; !ok {
 			t.Errorf("issue %s not in Completed set", issue.Identifier)
 		}
 	}
 
-	// Verify no issues still running.
 	if len(state.Running) != 0 {
 		t.Errorf("Running count = %d, want 0", len(state.Running))
 	}
 
-	// Verify run history was persisted for all 3 issues.
 	store.mu.Lock()
 	historyCount := len(store.runHistories)
 	store.mu.Unlock()
@@ -2222,7 +2215,6 @@ func TestDispatchLoopPerStateExhaustion(t *testing.T) {
 func TestOrchestratorDynamicConfigReload(t *testing.T) {
 	t.Parallel()
 
-	// Test Case A: polling interval change propagates to state.
 	t.Run("polling_interval_change", func(t *testing.T) {
 		t.Parallel()
 
@@ -2276,7 +2268,6 @@ func TestOrchestratorDynamicConfigReload(t *testing.T) {
 		}
 	})
 
-	// Test Case B: concurrency limit change affects dispatch capacity.
 	t.Run("concurrency_limit_change", func(t *testing.T) {
 		t.Parallel()
 
@@ -2385,7 +2376,7 @@ func TestOrchestratorDynamicConfigReload(t *testing.T) {
 		}
 	})
 
-	// Test Case C: active state change makes previously-ineligible issues
+	// Active state change makes previously-ineligible issues
 	// dispatchable.
 	t.Run("active_states_change", func(t *testing.T) {
 		t.Parallel()
@@ -2475,8 +2466,6 @@ func TestOrchestratorDynamicConfigReload(t *testing.T) {
 		}
 	})
 
-	// Test Case D: reconciliation uses fresh terminal states after reload.
-	// Reconciliation runs with post-reload config.
 	t.Run("reconcile_fresh_terminal_states", func(t *testing.T) {
 		t.Parallel()
 
@@ -2552,7 +2541,7 @@ func TestOrchestratorDynamicConfigReload(t *testing.T) {
 			t.Fatal("CancelFunc not called for non-active non-terminal issue")
 		}
 
-		// Now add "Archived" to terminal states and tick again.
+		// Add "Archived" to terminal states and tick again.
 		// Reset the cancel tracker since the entry was already cancelled.
 		cancelCalled.Store(false)
 		entry.CancelFunc = func() { cancelCalled.Store(true) }
@@ -2571,7 +2560,7 @@ func TestOrchestratorDynamicConfigReload(t *testing.T) {
 		}
 	})
 
-	// Test Case E: prompt template change applies to new workers.
+	// Prompt template change applies to new workers.
 	t.Run("prompt_template_change", func(t *testing.T) {
 		t.Parallel()
 
@@ -2706,7 +2695,6 @@ func TestOrchestratorDynamicConfigReload(t *testing.T) {
 		}
 	})
 
-	// Test Case F: in-flight sessions are not restarted on config change.
 	t.Run("inflight_not_restarted", func(t *testing.T) {
 		t.Parallel()
 
@@ -2814,7 +2802,6 @@ func TestOrchestratorDynamicConfigReload(t *testing.T) {
 		}
 	})
 
-	// Test Case G: state fields update even on preflight failure.
 	// Dispatch is skipped but reconciliation remains active.
 	t.Run("state_updates_on_preflight_failure", func(t *testing.T) {
 		t.Parallel()
@@ -2899,7 +2886,7 @@ func TestOrchestratorDynamicConfigReload(t *testing.T) {
 		}
 	})
 
-	// Test Case: agent.max_consecutive_absences takes effect on the next
+	// agent.max_consecutive_absences takes effect on the next
 	// poll tick, the next retry timer fire, and the next worker exit
 	// with no restart. The retry-timer and worker-exit lanes are driven
 	// directly rather than through the running event loop, reading
@@ -2991,7 +2978,7 @@ func TestOrchestratorDynamicConfigReload(t *testing.T) {
 		}
 	})
 
-	// Test Case: a reload whose agent.max_consecutive_absences fails
+	// A reload whose agent.max_consecutive_absences fails
 	// validation retains the previously loaded value and reports the
 	// failure through LastLoadError(), the same fail-safe path the
 	// sibling agent.turn_timeout_ms field already relies on.
@@ -3075,7 +3062,7 @@ do {{ .issue.identifier }}
 		}
 	})
 
-	// Test Case C: reactions.ci_failure.watch_window_ms takes effect on
+	// reactions.ci_failure.watch_window_ms takes effect on
 	// the next reconcile tick without a process restart, since
 	// cfg.CIFeedback is rebuilt from o.workflowManager.Config() every
 	// tick.
@@ -3158,7 +3145,7 @@ do {{ .issue.identifier }}
 		}
 	})
 
-	// Test Case H: the ci_failure triage block is frozen at construction,
+	// The ci_failure triage block is frozen at construction,
 	// unlike every other ci_failure field, which the tick above already
 	// shows takes effect live.
 	t.Run("ci_triage_frozen_at_construction", func(t *testing.T) {

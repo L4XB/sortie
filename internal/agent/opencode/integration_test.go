@@ -162,7 +162,6 @@ func TestIntegration_SessionResume(t *testing.T) {
 	session := mustStartIntegrationSessionIn(t, a, "", workspace)
 	t.Cleanup(func() { _ = a.StopSession(context.Background(), session) })
 
-	// First turn.
 	_, result1 := collectAllEvents(t, a, session, "Say: turn one")
 	if result1.ExitReason != domain.EventTurnCompleted {
 		t.Fatalf("turn 1 ExitReason = %q, want completed", result1.ExitReason)

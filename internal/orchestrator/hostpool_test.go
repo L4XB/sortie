@@ -174,7 +174,6 @@ func TestUpdate(t *testing.T) {
 	hp := NewHostPool([]string{"a"}, 1)
 	hp.AcquireHost("ISS-1", "")
 
-	// Update to new hosts and cap.
 	hp.Update([]string{"a", "b"}, 3)
 
 	if !hp.HasCapacity() {
@@ -497,7 +496,6 @@ func TestAcquireHost_PreferredNotConfigured(t *testing.T) {
 	// Load "a" so it is not empty.
 	hp.AcquireHost("ISS-0", "a")
 
-	// Remove "b" from the configured host list.
 	hp.Update([]string{"a"}, 2)
 
 	// Prefer "b", but it is no longer configured → fall back to "a".

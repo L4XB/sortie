@@ -33,7 +33,6 @@ func TestToTemplateMap_FullyPopulated(t *testing.T) {
 
 	m := iss.ToTemplateMap()
 
-	// Verify all 16 keys exist.
 	expectedKeys := []string{
 		"id", "identifier", "title", "description", "priority", "state",
 		"branch_name", "url", "labels", "assignee", "issue_type", "parent",

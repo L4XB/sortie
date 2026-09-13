@@ -203,7 +203,6 @@ func TestGitHubIntegration_FullDispatchCycle(t *testing.T) {
 
 	ghClient := newGitHubAPIClient(t)
 
-	// Create a test issue with the "backlog" label.
 	issueTitle := fmt.Sprintf("sortie-e2e-%d", time.Now().UnixNano())
 	issueNumber := ghClient.createTestIssue(t, issueTitle, []string{"backlog"})
 	t.Cleanup(func() { ghClient.restoreIssueState(t, issueNumber) })
@@ -348,7 +347,6 @@ func TestGitHubIntegration_FullDispatchCycle(t *testing.T) {
 		time.Sleep(2 * time.Second)
 	}
 
-	// Stop the orchestrator.
 	orchCancel()
 	select {
 	case <-done:

@@ -257,7 +257,6 @@ func TestHandleRetryTimer(t *testing.T) {
 	tests := []struct {
 		name    string
 		issueID string
-		// setup
 		state   func(t *testing.T, issueID string) *State
 		store   func() *mockRetryStore
 		tracker func(issueID string) *mockRetryTracker

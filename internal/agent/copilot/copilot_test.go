@@ -107,7 +107,6 @@ func TestNewCopilotAdapter(t *testing.T) {
 func TestRegistration(t *testing.T) {
 	t.Parallel()
 
-	// Verify "copilot-cli" kind is registered.
 	factory, err := registry.Agents.Get("copilot-cli")
 	if err != nil {
 		t.Fatalf("registry.Agents.Get(\"copilot-cli\") error = %v", err)
@@ -120,7 +119,6 @@ func TestRegistration(t *testing.T) {
 		t.Errorf("factory() type = %T, want *CopilotAdapter", adapter)
 	}
 
-	// Verify RequiresCommand metadata is set.
 	meta, ok := registry.Agents.Meta("copilot-cli")
 	if !ok {
 		t.Fatal(`registry.Agents.Meta("copilot-cli") reported not registered`)

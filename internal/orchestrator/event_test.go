@@ -299,7 +299,6 @@ func TestHandleAgentEvent_FullSequence(t *testing.T) {
 		Timestamp: ts,
 	}, slog.Default(), nil)
 
-	// Assert all final field values.
 	if entry.SessionID != "sess-1" {
 		t.Errorf("SessionID = %q, want %q", entry.SessionID, "sess-1")
 	}

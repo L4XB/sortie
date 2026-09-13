@@ -209,7 +209,6 @@ func (c *autoMergeAPIClient) createAutoMergeBranchAndPR(t *testing.T, owner, rep
 		t.Fatalf("could not resolve HEAD SHA for %s/%s", repoInfo.DefaultBranch, repo)
 	}
 
-	// Create the new branch.
 	refsPath := fmt.Sprintf("/repos/%s/%s/git/refs", owner, repo)
 	c.doAMRequest(t, "POST", refsPath, map[string]any{
 		"ref": "refs/heads/" + branch,
@@ -231,7 +230,6 @@ func (c *autoMergeAPIClient) createAutoMergeBranchAndPR(t *testing.T, owner, rep
 	})
 	t.Logf("pushed sentinel commit to branch %q", branch)
 
-	// Open a PR from branch → default branch.
 	prsPath := fmt.Sprintf("/repos/%s/%s/pulls", owner, repo)
 	prResp := c.doAMRequest(t, "POST", prsPath, map[string]any{
 		"title": prTitle,
@@ -443,7 +441,6 @@ func TestReconcileAutoMerge_LiveAPI_E2E(t *testing.T) {
 
 	ghClient := newAutoMergeAPIClient(t)
 
-	// Create a fresh throwaway branch name guaranteed to be unique per run.
 	branch := fmt.Sprintf("auto-merge-test-%d-%s", time.Now().UnixNano(), randomHex())
 	prTitle := fmt.Sprintf("sortie-e2e-auto-merge %s", branch)
 	issueTitle := fmt.Sprintf("sortie-e2e-auto-merge-issue %s", branch)
@@ -451,7 +448,6 @@ func TestReconcileAutoMerge_LiveAPI_E2E(t *testing.T) {
 	// Create a test issue to receive the post-merge comment.
 	issueNumber, issueID := ghClient.createAutoMergeTestIssue(t, owner, repo, issueTitle)
 
-	// Open a PR from the throwaway branch.
 	prNumber := ghClient.createAutoMergeBranchAndPR(t, owner, repo, branch, prTitle)
 
 	// Register cleanup before any assertions that could call t.Fatal.
@@ -492,7 +488,6 @@ func TestReconcileAutoMerge_LiveAPI_E2E(t *testing.T) {
 	// Metrics stub that counts "merged" calls.
 	metrics := newAutoMergeMetricsCounter()
 
-	// Build the reconcile state with one PendingReaction for the new PR.
 	state := NewState(5000, 4, 0, nil, AgentTotals{})
 	rkey := ReactionKey(issueID, ReactionKindAutoMerge)
 	state.PendingReactions[rkey] = &PendingReaction{
@@ -558,13 +553,11 @@ func TestReconcileAutoMerge_LiveAPI_E2E(t *testing.T) {
 		time.Sleep(2 * time.Second)
 	}
 
-	// Verify: PR is merged.
 	pr := ghClient.fetchPRState(t, owner, repo, prNumber)
 	if !pr.Merged {
 		t.Errorf("fetchPRState(PR #%d).Merged = false, want true", prNumber)
 	}
 
-	// Verify: source branch is deleted.
 	if ghClient.branchExists(owner, repo, branch) {
 		t.Errorf("branch %q still exists after merge with delete_branch=true", branch)
 	}
@@ -585,7 +578,6 @@ func TestReconcileAutoMerge_LiveAPI_E2E(t *testing.T) {
 		t.Errorf("issue #%d has no comment containing %q", issueNumber, commentSubstring)
 	}
 
-	// Verify: metrics stub recorded IncAutoMergeReactions("merged") exactly once.
 	if got := metrics.mergedCount(); got != 1 {
 		t.Errorf("IncAutoMergeReactions(\"merged\") call count = %d, want 1", got)
 	}

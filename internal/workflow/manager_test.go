@@ -461,7 +461,6 @@ func TestManager_WatchInvalidRetainsGood(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	// Write invalid YAML.
 	writeWorkflow(t, path, []byte("---\n[[[bad yaml\n---\nprompt\n"))
 
 	// Wait until the reload actually fired; confirmed by LastLoadError becoming
@@ -558,7 +557,6 @@ func TestManager_DebounceCoalescence(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	// Wait for debounce + reload.
 	ok := pollUntil(func() bool {
 		return mgr.Config().Polling.IntervalMS == 6000
 	})
@@ -689,7 +687,6 @@ func TestManager_RecoverAfterInvalidReload(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	// Write invalid content.
 	writeWorkflow(t, path, []byte("---\n[[[bad\n---\nprompt\n"))
 	time.Sleep(300 * time.Millisecond)
 
@@ -698,7 +695,7 @@ func TestManager_RecoverAfterInvalidReload(t *testing.T) {
 			mgr.Config().Polling.IntervalMS)
 	}
 
-	// Now write valid content again; watcher should recover.
+	// Write valid content again; the watcher should recover.
 	writeWorkflow(t, path, validWorkflow(7777))
 
 	ok := pollUntil(func() bool {

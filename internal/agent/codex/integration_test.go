@@ -452,7 +452,6 @@ func TestIntegration_MultiTurn(t *testing.T) {
 	}
 	assertContainsEventType(t, collected1(), domain.EventSessionStarted)
 
-	// Verify internal turn counter after turn 1.
 	if state.turnCount != 1 {
 		t.Errorf("state.turnCount after turn 1 = %d, want 1", state.turnCount)
 	}
@@ -486,7 +485,6 @@ func TestIntegration_MultiTurn(t *testing.T) {
 	assertNoEventType(t, events2, domain.EventSessionStarted)
 	assertContainsEventType(t, events2, domain.EventTurnCompleted)
 
-	// Verify internal turn counter after turn 2.
 	if state.turnCount != 2 {
 		t.Errorf("state.turnCount after turn 2 = %d, want 2", state.turnCount)
 	}

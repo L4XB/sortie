@@ -55,7 +55,6 @@ func TestOpen_WALEnabled(t *testing.T) {
 
 // TestOpen_BasicCRUD is a smoke test for the modernc.org/sqlite driver.
 // It verifies that basic SQL operations work through the configured connection.
-// This test will be superseded by CRUD method tests in tasks 2.3–2.5.
 func TestOpen_BasicCRUD(t *testing.T) {
 	t.Parallel()
 
@@ -67,7 +66,6 @@ func TestOpen_BasicCRUD(t *testing.T) {
 	}
 	defer closeStore(t, s)
 
-	// Create.
 	if _, err := s.db.ExecContext(ctx, `CREATE TABLE test_items (
 		id   INTEGER PRIMARY KEY,
 		name TEXT NOT NULL
@@ -90,7 +88,6 @@ func TestOpen_BasicCRUD(t *testing.T) {
 		t.Fatalf("got (%d, %q), want (1, %q)", id, name, "alpha")
 	}
 
-	// Delete.
 	res, err := s.db.ExecContext(ctx, `DELETE FROM test_items WHERE id = 1`)
 	if err != nil {
 		t.Fatalf("DELETE: %v", err)
@@ -2389,7 +2386,6 @@ func TestOpenReadOnly_RejectWrite(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
 
-	// Create and migrate a file-backed database.
 	s, err := Open(ctx, dbPath)
 	if err != nil {
 		t.Fatalf("Open(%q): %v", dbPath, err)
@@ -2426,7 +2422,6 @@ func TestOpenReadOnly_ReadsExistingData(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
 
-	// Create, migrate, insert one row, then close.
 	s, err := Open(ctx, dbPath)
 	if err != nil {
 		t.Fatalf("Open(%q): %v", dbPath, err)
@@ -2440,7 +2435,6 @@ func TestOpenReadOnly_ReadsExistingData(t *testing.T) {
 	}
 	closeStore(t, s)
 
-	// Re-open read-only and verify the inserted row is visible.
 	ro, err := OpenReadOnly(ctx, dbPath)
 	if err != nil {
 		t.Fatalf("OpenReadOnly(%q): %v", dbPath, err)
