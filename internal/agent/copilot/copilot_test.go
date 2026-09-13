@@ -1,5 +1,3 @@
-//go:build unix
-
 package copilot
 
 import (
@@ -7,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -22,11 +21,54 @@ import (
 	"github.com/sortie-ai/sortie/internal/registry"
 )
 
-// fakeCopilotBinary creates a minimal shell script at a temp path that
-// exits 0 for any invocation (including the --version canary check).
+// turnCounterScenario names the fake runtime scenario that answers its
+// first invocation with a fixed stdout payload and every later
+// invocation with nothing, tracked by a marker file's existence. It
+// pins a per-turn signal that a session's second turn must not inherit
+// from its first.
+const turnCounterScenario = "copilot.turn-counter"
+
+// turnCounterOutput parameterizes turnCounterScenario.
+type turnCounterOutput struct {
+	CounterFile string
+	Stdout      string
+}
+
+func TestMain(m *testing.M) {
+	agenttest.Main(m, map[string]agenttest.Scenario{
+		turnCounterScenario: agenttest.Typed(runTurnCounterScenario),
+	})
+}
+
+func runTurnCounterScenario(_ []string, params turnCounterOutput) int {
+	if _, err := os.Stat(params.CounterFile); err == nil {
+		return 0
+	}
+	if err := os.WriteFile(params.CounterFile, nil, 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "turn counter: create marker: %v\n", err)
+		return 1
+	}
+	_, _ = io.WriteString(os.Stdout, params.Stdout)
+	return 0
+}
+
+// firstTurnOnlyBinary returns a fake copilot runtime that writes stdout
+// on its first invocation and produces no output on every later
+// invocation.
+func firstTurnOnlyBinary(t *testing.T, stdout string) string {
+	t.Helper()
+	dir := t.TempDir()
+	return agenttest.FakeRuntime(t, dir, "copilot", turnCounterScenario, turnCounterOutput{
+		CounterFile: filepath.Join(dir, "turn-count"),
+		Stdout:      stdout,
+	})
+}
+
+// fakeCopilotBinary creates a fake copilot runtime that exits 0 for any
+// invocation (including the --version canary check).
 func fakeCopilotBinary(t *testing.T) string {
 	t.Helper()
-	return agenttest.WriteScript(t, t.TempDir(), "copilot", "exit 0")
+	return agenttest.FakeRuntime(t, t.TempDir(), "copilot", agenttest.OutputScenario, agenttest.Output{})
 }
 
 // requireAgentError asserts err is a *domain.AgentError with the given Kind.
@@ -337,18 +379,13 @@ func TestStartSession_SSHMode(t *testing.T) {
 	// Auth check is skipped in SSH mode.
 }
 
-// fakeGhBinaryDir creates a fake "gh" binary that exits non-zero (simulating
-// an unauthenticated host) and returns the directory containing it, ready for
-// use as the sole PATH entry.
+// fakeGhBinaryDir creates a fake "gh" runtime that exits non-zero
+// (simulating an unauthenticated host) and returns the directory
+// containing it, ready for use as the sole PATH entry.
 func fakeGhBinaryDir(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	if err := os.WriteFile(
-		filepath.Join(dir, "gh"),
-		[]byte("#!/bin/sh\nexit 1\n"), 0o755,
-	); err != nil {
-		t.Fatalf("creating fake gh binary: %v", err)
-	}
+	agenttest.FakeRuntime(t, dir, "gh", agenttest.OutputScenario, agenttest.Output{ExitCode: 1})
 	return dir
 }
 
@@ -417,16 +454,14 @@ func TestCheckAuth_WhitespaceOnlyToken(t *testing.T) {
 	requireAgentError(t, err, domain.ErrAgentNotFound)
 }
 
-// fakeCopilotBinaryWithOutput creates a fake copilot binary that writes content
-// to stdout and exits with the given exit code.
+// fakeCopilotBinaryWithOutput creates a fake copilot runtime that
+// writes content to stdout and exits with the given exit code.
 func fakeCopilotBinaryWithOutput(t *testing.T, content string, exitCode int) string {
 	t.Helper()
-	dir := t.TempDir()
-	outFile := filepath.Join(dir, "out.txt")
-	if err := os.WriteFile(outFile, []byte(content), 0o644); err != nil {
-		t.Fatalf("writing run turn output file: %v", err)
-	}
-	return agenttest.WriteScript(t, dir, "copilot", fmt.Sprintf("cat '%s'\nexit %d", outFile, exitCode))
+	return agenttest.FakeRuntime(t, t.TempDir(), "copilot", agenttest.OutputScenario, agenttest.Output{
+		Stdout:   content,
+		ExitCode: exitCode,
+	})
 }
 
 // newTestSession starts a session backed by fakeCopilotBinary.
@@ -755,21 +790,7 @@ func TestRunTurn_SecondTurnFailsAfterFirstTurnBothSignals(t *testing.T) {
 
 	adapter, session := newTestSession(t, t.TempDir())
 	state := session.Internal.(*sessionState)
-
-	tmpDir := t.TempDir()
-	counterFile := filepath.Join(tmpDir, "turn-count")
-	outFile := filepath.Join(tmpDir, "out.jsonl")
-	if err := os.WriteFile(outFile, []byte(loadTestFixture(t, "tool_use_no_output_tokens_no_result.jsonl")), 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-	state.target.Command = agenttest.WriteScript(t, tmpDir, "copilot", fmt.Sprintf(`
-if [ -f '%s' ]; then
-  exit 0
-fi
-touch '%s'
-cat '%s'
-exit 0
-`, counterFile, counterFile, outFile))
+	state.target.Command = firstTurnOnlyBinary(t, loadTestFixture(t, "tool_use_no_output_tokens_no_result.jsonl"))
 
 	result1, err := adapter.RunTurn(context.Background(), session, domain.RunTurnParams{
 		OnEvent: func(domain.AgentEvent) {},
@@ -1118,13 +1139,12 @@ func TestStopSession_TerminatesProcess(t *testing.T) {
 	// t.Setenv is incompatible with t.Parallel.
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 
-	// Fake binary that blocks until it receives a signal.
-	dir := t.TempDir()
-	sleepBin := agenttest.WriteScript(t, dir, "copilot", "exec sleep 60")
+	// Fake runtime that blocks until it is killed.
+	hangBin := agenttest.FakeRuntime(t, t.TempDir(), "copilot", agenttest.OutputScenario, agenttest.Output{Hang: true})
 
 	adapter, session := newTestSession(t, t.TempDir())
 	state := session.Internal.(*sessionState)
-	state.target.Command = sleepBin
+	state.target.Command = hangBin
 
 	processStarted := make(chan struct{}, 1)
 	runDone := make(chan struct{})
@@ -1161,17 +1181,14 @@ func TestStopSession_TerminatesProcess(t *testing.T) {
 	}
 }
 
-// fakeCopilotBinaryWithStderrAndExit creates a fake copilot binary that
-// writes stderrLine to stderr and exits with exitCode.
+// fakeCopilotBinaryWithStderrAndExit creates a fake copilot runtime
+// that writes stderrLine to stderr and exits with exitCode.
 func fakeCopilotBinaryWithStderrAndExit(t *testing.T, stderrLine string, exitCode int) string {
 	t.Helper()
-	dir := t.TempDir()
-	errFile := filepath.Join(dir, "err.txt")
-	if err := os.WriteFile(errFile, []byte(stderrLine+"\n"), 0o644); err != nil {
-		t.Fatalf("fakeCopilotBinaryWithStderrAndExit: writing stderr file: %v", err)
-	}
-	return agenttest.WriteScript(t, dir, "copilot",
-		fmt.Sprintf("cat '%s' >&2\nexit %d", errFile, exitCode))
+	return agenttest.FakeRuntime(t, t.TempDir(), "copilot", agenttest.OutputScenario, agenttest.Output{
+		Stderr:   stderrLine + "\n",
+		ExitCode: exitCode,
+	})
 }
 
 // TestRunTurn_StderrWarnOnExitCode127 verifies that when the subprocess
@@ -1244,19 +1261,12 @@ func TestRunTurn_StderrNoWarnOnSuccess(t *testing.T) {
 	adapter, session := newTestSession(t, t.TempDir())
 	state := session.Internal.(*sessionState)
 
-	dir := t.TempDir()
-	errFile := filepath.Join(dir, "err.txt")
-	if err := os.WriteFile(errFile, []byte("minor diagnostic\n"), 0o644); err != nil {
-		t.Fatalf("writing stderr file: %v", err)
-	}
-	outFile := filepath.Join(dir, "out.txt")
 	const successJSONL = `{"type":"session.task_complete","data":{"summary":"done","success":true}}
 {"type":"result","timestamp":"2026-03-30T22:19:28.097Z","sessionId":"no-warn-success-sess","exitCode":0,"usage":{"premiumRequests":0,"totalApiDurationMs":0,"sessionDurationMs":0}}`
-	if err := os.WriteFile(outFile, []byte(successJSONL+"\n"), 0o644); err != nil {
-		t.Fatalf("writing stdout file: %v", err)
-	}
-	state.target.Command = agenttest.WriteScript(t, dir, "copilot",
-		fmt.Sprintf("cat '%s' >&2\ncat '%s'", errFile, outFile))
+	state.target.Command = agenttest.FakeRuntime(t, t.TempDir(), "copilot", agenttest.OutputScenario, agenttest.Output{
+		Stdout: successJSONL + "\n",
+		Stderr: "minor diagnostic\n",
+	})
 
 	result, err := adapter.RunTurn(context.Background(), session, domain.RunTurnParams{
 		Prompt:  "do the thing",
@@ -1790,21 +1800,8 @@ func TestRunTurn_WorkPredicateIsPerTurn(t *testing.T) {
 	adapter, session := newTestSession(t, t.TempDir())
 	state := session.Internal.(*sessionState)
 
-	tmpDir := t.TempDir()
-	counterFile := filepath.Join(tmpDir, "turn-count")
-	outFile := filepath.Join(tmpDir, "out.jsonl")
 	const outputJSONL = `{"type":"assistant.message","timestamp":"2026-04-08T00:00:00Z","data":{"role":"assistant","content":"hello","outputTokens":10}}` + "\n"
-	if err := os.WriteFile(outFile, []byte(outputJSONL), 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-	state.target.Command = agenttest.WriteScript(t, tmpDir, "copilot", fmt.Sprintf(`
-if [ -f '%s' ]; then
-  exit 0
-fi
-touch '%s'
-cat '%s'
-exit 0
-`, counterFile, counterFile, outFile))
+	state.target.Command = firstTurnOnlyBinary(t, outputJSONL)
 
 	result1, err := adapter.RunTurn(context.Background(), session, domain.RunTurnParams{
 		OnEvent: func(domain.AgentEvent) {},
