@@ -21,6 +21,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest/dispositiontest"
 	"github.com/sortie-ai/sortie/internal/agent/jsonrpc"
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
@@ -206,13 +207,13 @@ func splitFixtureSegments(fixtureData []byte) []fixtureSegment {
 // never closes inPw on its own once exhausted; it keeps draining
 // outPr so a later fire-and-forget write (e.g. a Respond to a
 // server-initiated request) is never left to block forever on the
-// unbuffered pipe, and it leaves closing the connection, or ending
-// state.msgCh, to the test; closing eagerly right after a scripted
+// unbuffered pipe, and it leaves closing the connection, or closing
+// state.inbox, to the test; closing eagerly right after a scripted
 // response would race jsonrpc.Conn.Call's own select between that
 // response and the connection's termination signal, which Go resolves
 // pseudo-randomly when both are ready. A test that needs the
 // connection to appear to end after some exchange achieves that by
-// controlling state.msgCh (or state.conn.Close, for a call with no
+// controlling state.inbox (or state.conn.Close, for a call with no
 // scripted response to race) directly instead.
 func startFixturePeer(t *testing.T, outPr *io.PipeReader, inPw *io.PipeWriter, segments []fixtureSegment) {
 	t.Helper()
@@ -267,10 +268,9 @@ func startFixturePeer(t *testing.T, outPr *io.PipeReader, inPw *io.PipeWriter, s
 
 // makeTestState builds a sessionState wired to a real jsonrpc.Conn
 // whose peer replays fixtureData, safe for use in RunTurn unit tests
-// that do not launch a real subprocess. The session starts in the
-// turn phase: every fixture here represents a session already past
-// the handshake, the point at which StartSession itself calls
-// beginTurnPhase.
+// that do not launch a real subprocess. Every fixture here represents
+// a session already past the handshake, the point at which
+// StartSession calls drainHandshakeMessages.
 func makeTestState(t *testing.T, fixtureData []byte) *sessionState {
 	t.Helper()
 	return makeTestStateWithStdin(t, fixtureData, nil)
@@ -305,14 +305,12 @@ func makeTestStateWithStdin(t *testing.T, fixtureData []byte, recorder *capturin
 		threadID:   "thread-001",
 		target:     agentcore.LaunchTarget{WorkspacePath: "/tmp"},
 		waitCh:     make(chan struct{}),
-		msgCh:      make(chan jsonrpc.Message, 16),
+		inbox:      jsonrpc.NewInbox[jsonrpc.Message](),
 		readerDone: make(chan struct{}),
-		stopCh:     make(chan struct{}),
 		acc:        agentcore.NewRunUsage(),
 	}
-	state.conn = jsonrpc.NewConn(w, inPr, sessionHandler(state))
+	state.conn = jsonrpc.NewConn(w, inPr, jsonrpc.Deliver(state.inbox, identity))
 	go watchTermination(state)
-	state.turnPhase.Store(true)
 
 	startFixturePeer(t, outPr, inPw, splitFixtureSegments(fixtureData))
 
@@ -338,14 +336,12 @@ func makeTestStateWithMalformedBeforeResponse(t *testing.T, malformed, response 
 		threadID:   "thread-001",
 		target:     agentcore.LaunchTarget{WorkspacePath: "/tmp"},
 		waitCh:     make(chan struct{}),
-		msgCh:      make(chan jsonrpc.Message, 16),
+		inbox:      jsonrpc.NewInbox[jsonrpc.Message](),
 		readerDone: make(chan struct{}),
-		stopCh:     make(chan struct{}),
 		acc:        agentcore.NewRunUsage(),
 	}
-	state.conn = jsonrpc.NewConn(sig, inPr, sessionHandler(state))
+	state.conn = jsonrpc.NewConn(sig, inPr, jsonrpc.Deliver(state.inbox, identity))
 	go watchTermination(state)
-	state.turnPhase.Store(true)
 
 	go func() {
 		<-sig.done
@@ -358,12 +354,11 @@ func makeTestStateWithMalformedBeforeResponse(t *testing.T, malformed, response 
 
 // gatedTurnStartState builds a sessionState whose jsonrpc.Conn answers
 // exactly one turn/start call with response once its peer observes
-// codex write it, with a no-op handler. Every other message the test
-// needs is delivered by pushing directly onto state.msgCh, including
-// closing it: since the handler is a no-op, the connection never
-// contends for state.msgCh, so a test can end a turn's message stream
-// deterministically instead of racing jsonrpc.Conn.Call's own select
-// between a scripted response and a connection-termination signal.
+// codex write it. Every other message the test needs is delivered by
+// putting it directly onto state.inbox, including closing it, which
+// lets a test end a turn's message stream deterministically instead of
+// racing jsonrpc.Conn.Call's own select between a scripted response
+// and a connection-termination signal.
 func gatedTurnStartState(t *testing.T, response string) *sessionState {
 	t.Helper()
 
@@ -378,12 +373,10 @@ func gatedTurnStartState(t *testing.T, response string) *sessionState {
 		threadID: "thread-001",
 		target:   agentcore.LaunchTarget{WorkspacePath: "/tmp"},
 		waitCh:   make(chan struct{}),
-		msgCh:    make(chan jsonrpc.Message, 16),
-		stopCh:   make(chan struct{}),
+		inbox:    jsonrpc.NewInbox[jsonrpc.Message](),
 		acc:      agentcore.NewRunUsage(),
 	}
-	state.conn = jsonrpc.NewConn(sig, inPr, func(jsonrpc.Message) {})
-	state.turnPhase.Store(true)
+	state.conn = jsonrpc.NewConn(sig, inPr, jsonrpc.Deliver(state.inbox, identity))
 
 	go func() {
 		<-sig.done
@@ -906,7 +899,7 @@ func TestRunTurn_FailedTurnContextWindowExceeded(t *testing.T) {
 func TestRunTurn_StdoutClosedBeforeTurnCompleted(t *testing.T) {
 	t.Parallel()
 
-	// Only the turn/start response, no turn/completed, so state.msgCh
+	// Only the turn/start response, no turn/completed, so state.inbox
 	// is closed directly, right after turn/started, before turn/completed
 	// would arrive.
 	state := gatedTurnStartState(t, `{"id":1,"result":{"turn":{"id":"turn-001","status":"starting"}}}`)
@@ -926,8 +919,8 @@ func TestRunTurn_StdoutClosedBeforeTurnCompleted(t *testing.T) {
 		outcomeCh <- outcome{result, err}
 	}()
 
-	state.msgCh <- jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "turn/started"}
-	close(state.msgCh)
+	state.inbox.Put(jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "turn/started"})
+	state.inbox.Close()
 
 	got := <-outcomeCh
 	result, err := got.result, got.err
@@ -951,7 +944,7 @@ func TestRunTurn_StdoutClosedBeforeTurnCompleted(t *testing.T) {
 func TestRunTurn_StdoutEOFBeforeTurnStartResponse(t *testing.T) {
 	t.Parallel()
 
-	// Empty fixture: msgCh closes before any turn/start response arrives.
+	// Empty fixture: the inbox closes before any turn/start response arrives.
 	// Tests the !ok path in the session-scoped response-wait loop.
 	state := makeTestState(t, nil)
 	adapter, _ := NewCodexAdapter(map[string]any{})
@@ -1037,13 +1030,14 @@ func TestRunTurn_CancelledMainLoopWaitsForCompletion(t *testing.T) {
 	}
 	outcomeCh := make(chan outcome, 1)
 	finished := make(chan struct{})
+	started := make(chan struct{})
 
 	adapter, _ := NewCodexAdapter(map[string]any{})
 	go func() {
 		defer close(finished)
 		result, err := adapter.RunTurn(ctx, fakeSession(state), domain.RunTurnParams{
 			Prompt:  "go",
-			OnEvent: func(domain.AgentEvent) {},
+			OnEvent: onEventSignalingSessionStarted(func(domain.AgentEvent) {}, started),
 		})
 		outcomeCh <- outcome{result: result, err: err}
 	}()
@@ -1055,10 +1049,8 @@ func TestRunTurn_CancelledMainLoopWaitsForCompletion(t *testing.T) {
 		}
 	})
 
-	// The unbuffered send returns only once RunTurn has received it,
-	// which proves its main event loop is running (rather than still
-	// inside the turn/start call) before cancellation.
-	state.msgCh <- jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "turn/started", Params: json.RawMessage(`{"turnId":"turn-001"}`)}
+	state.inbox.Put(jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "turn/started", Params: json.RawMessage(`{"turnId":"turn-001"}`)})
+	waitForSessionStarted(t, started)
 
 	cancel()
 	select {
@@ -1078,11 +1070,7 @@ func TestRunTurn_CancelledMainLoopWaitsForCompletion(t *testing.T) {
 
 	// A terminal event must still be received and mapped after cancellation.
 	turnCompletedMsg := jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "turn/completed", Params: json.RawMessage(`{"turn":{"id":"turn-001","status":"interrupted"}}`)}
-	select {
-	case state.msgCh <- turnCompletedMsg:
-	case <-time.After(time.Second):
-		t.Fatal("RunTurn did not wait for turn/completed after cancellation")
-	}
+	state.inbox.Put(turnCompletedMsg)
 
 	select {
 	case got := <-outcomeCh:
@@ -1117,6 +1105,7 @@ func TestRunTurn_CancelledMainLoopReportsCancelledDespiteCompletedStatus(t *test
 	}
 	outcomeCh := make(chan outcome, 1)
 	finished := make(chan struct{})
+	started := make(chan struct{})
 
 	var events []domain.AgentEvent
 	adapter, _ := NewCodexAdapter(map[string]any{})
@@ -1124,7 +1113,7 @@ func TestRunTurn_CancelledMainLoopReportsCancelledDespiteCompletedStatus(t *test
 		defer close(finished)
 		result, err := adapter.RunTurn(ctx, fakeSession(state), domain.RunTurnParams{
 			Prompt:  "go",
-			OnEvent: collectEvents(&events),
+			OnEvent: onEventSignalingSessionStarted(collectEvents(&events), started),
 		})
 		outcomeCh <- outcome{result: result, err: err}
 	}()
@@ -1136,10 +1125,8 @@ func TestRunTurn_CancelledMainLoopReportsCancelledDespiteCompletedStatus(t *test
 		}
 	})
 
-	// The unbuffered send returns only once RunTurn has received it,
-	// which proves its main event loop is running (rather than still
-	// inside the turn/start call) before cancellation.
-	state.msgCh <- jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "turn/started", Params: json.RawMessage(`{"turnId":"turn-001"}`)}
+	state.inbox.Put(jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "turn/started", Params: json.RawMessage(`{"turnId":"turn-001"}`)})
+	waitForSessionStarted(t, started)
 
 	cancel()
 	select {
@@ -1152,11 +1139,7 @@ func TestRunTurn_CancelledMainLoopReportsCancelledDespiteCompletedStatus(t *test
 	}
 
 	turnCompletedMsg := jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "turn/completed", Params: json.RawMessage(`{"turn":{"id":"turn-001","status":"completed"}}`)}
-	select {
-	case state.msgCh <- turnCompletedMsg:
-	case <-time.After(time.Second):
-		t.Fatal("RunTurn did not wait for turn/completed after cancellation")
-	}
+	state.inbox.Put(turnCompletedMsg)
 
 	select {
 	case got := <-outcomeCh:
@@ -1355,6 +1338,9 @@ func TestRunTurn_PermissionRequestDeniedContinues(t *testing.T) {
 			if result.ExitReason != domain.EventTurnCompleted {
 				t.Errorf("ExitReason = %q, want %q (turn must continue past the refusal)", result.ExitReason, domain.EventTurnCompleted)
 			}
+			if err := state.conn.Flush(context.Background()); err != nil {
+				t.Fatalf("Flush() error = %v", err)
+			}
 
 			write, ok := stdin.find(fmt.Sprintf(`{"id":%d,`, tt.requestID))
 			if !ok {
@@ -1401,6 +1387,9 @@ func TestRunTurn_LegacyPermissionRequestDeniedContinues(t *testing.T) {
 			}
 			if result.ExitReason != domain.EventTurnCompleted {
 				t.Errorf("ExitReason = %q, want %q (turn must continue past the refusal)", result.ExitReason, domain.EventTurnCompleted)
+			}
+			if err := state.conn.Flush(context.Background()); err != nil {
+				t.Fatalf("Flush() error = %v", err)
 			}
 
 			write, ok := stdin.find(fmt.Sprintf(`{"id":%d,`, tt.requestID))
@@ -1500,6 +1489,9 @@ func TestRunTurn_HumanInputRequestEndsAttempt(t *testing.T) {
 
 			dispositiontest.AssertDispositionContract(t, agentcore.HumanInputEvidence(tt.detail), result, err)
 
+			if err := state.conn.Flush(context.Background()); err != nil {
+				t.Fatalf("Flush() error = %v", err)
+			}
 			write, ok := stdin.find(fmt.Sprintf(`{"id":%d,`, tt.requestID))
 			if !ok {
 				t.Fatalf("no response written for request id %d", tt.requestID)
@@ -1532,13 +1524,14 @@ func TestRunTurn_CancelledReturnsWithinBoundWhenTurnCompletedNeverArrives(t *tes
 	}
 	outcomeCh := make(chan outcome, 1)
 	finished := make(chan struct{})
+	started := make(chan struct{})
 
 	adapter, _ := NewCodexAdapter(map[string]any{})
 	go func() {
 		defer close(finished)
 		result, err := adapter.RunTurn(ctx, fakeSession(state), domain.RunTurnParams{
 			Prompt:  "go",
-			OnEvent: func(domain.AgentEvent) {},
+			OnEvent: onEventSignalingSessionStarted(func(domain.AgentEvent) {}, started),
 		})
 		outcomeCh <- outcome{result: result, err: err}
 	}()
@@ -1550,10 +1543,8 @@ func TestRunTurn_CancelledReturnsWithinBoundWhenTurnCompletedNeverArrives(t *tes
 		}
 	})
 
-	// The unbuffered send returns only once RunTurn has received it,
-	// which proves its main event loop is running (rather than still
-	// inside the turn/start call) before cancellation.
-	state.msgCh <- jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "turn/started", Params: json.RawMessage(`{"turnId":"turn-001"}`)}
+	state.inbox.Put(jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "turn/started", Params: json.RawMessage(`{"turnId":"turn-001"}`)})
+	waitForSessionStarted(t, started)
 
 	start := time.Now()
 	cancel()
@@ -1632,7 +1623,7 @@ func TestRunTurn_MultiTurnNoRace(t *testing.T) {
 func TestRunTurn_StdoutEOFBetweenTurns(t *testing.T) {
 	t.Parallel()
 
-	// One complete turn, pushed directly onto state.msgCh once the
+	// One complete turn, put directly onto state.inbox once the
 	// gated turn/start call resolves. After the first turn returns,
 	// the connection is closed directly: the second turn's call can
 	// only resolve via that closed connection, since no response was
@@ -1641,9 +1632,9 @@ func TestRunTurn_StdoutEOFBetweenTurns(t *testing.T) {
 	adapter, _ := NewCodexAdapter(map[string]any{})
 	session := fakeSession(state)
 
-	state.msgCh <- jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "turn/started", Params: json.RawMessage(`{"turnId":"turn-001"}`)}
-	state.msgCh <- jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "thread/tokenUsage/updated", Params: json.RawMessage(`{"threadId":"thread-001","turnId":"turn-001","tokenUsage":{"last":{"totalTokens":15,"inputTokens":10,"cachedInputTokens":0,"outputTokens":5,"reasoningOutputTokens":0},"total":{"totalTokens":15,"inputTokens":10,"cachedInputTokens":0,"outputTokens":5,"reasoningOutputTokens":0}}}`)}
-	state.msgCh <- jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "turn/completed", Params: json.RawMessage(`{"turn":{"id":"turn-001","status":"completed"}}`)}
+	state.inbox.Put(jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "turn/started", Params: json.RawMessage(`{"turnId":"turn-001"}`)})
+	state.inbox.Put(jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "thread/tokenUsage/updated", Params: json.RawMessage(`{"threadId":"thread-001","turnId":"turn-001","tokenUsage":{"last":{"totalTokens":15,"inputTokens":10,"cachedInputTokens":0,"outputTokens":5,"reasoningOutputTokens":0},"total":{"totalTokens":15,"inputTokens":10,"cachedInputTokens":0,"outputTokens":5,"reasoningOutputTokens":0}}}`)})
+	state.inbox.Put(jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "turn/completed", Params: json.RawMessage(`{"turn":{"id":"turn-001","status":"completed"}}`)})
 
 	if _, err := adapter.RunTurn(context.Background(), session, domain.RunTurnParams{
 		Prompt:  "first turn",
@@ -1677,41 +1668,94 @@ func TestStopSession_NilState(t *testing.T) {
 	}
 }
 
+// TestStopSession_WithActiveReaderGoroutine pins that StopSession
+// releases a reader parked on the runtime's standard output while that
+// output's write end is still held, as a descendant that inherited the
+// handle holds it. The reader has taken every line before the stop and
+// waits on a live pipe, so only StopSession closing the read end can
+// end it.
 func TestStopSession_WithActiveReaderGoroutine(t *testing.T) {
 	t.Parallel()
 
-	// Provide more messages than the channel buffer (16) so the reader
-	// goroutine is blocked on a channel send when StopSession closes stopCh.
-	line := []byte("{\"method\":\"turn/started\",\"params\":{}}\n")
-	state := makeTestState(t, bytes.Repeat(line, 20))
-	// Simulate the subprocess having already exited so waitCh does not block.
-	closedWaitCh := make(chan struct{})
-	close(closedWaitCh)
-	state.waitCh = closedWaitCh
-
-	adapter, _ := NewCodexAdapter(map[string]any{})
-	err := adapter.StopSession(context.Background(), domain.Session{Internal: state})
+	outRead, outWrite, err := os.Pipe()
 	if err != nil {
-		t.Fatalf("StopSession() error = %v", err)
+		t.Fatalf("os.Pipe() error = %v", err)
+	}
+	errRead, errWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = outWrite.Close()
+		_ = outRead.Close()
+		_ = errWrite.Close()
+		_ = errRead.Close()
+	})
+
+	const lines = 20
+	if _, err := outWrite.Write(bytes.Repeat([]byte("{\"method\":\"turn/started\",\"params\":{}}\n"), lines)); err != nil {
+		t.Fatalf("writing the runtime's output: %v", err)
 	}
 
-	// StopSession waits on readerDone internally; it must be closed on return.
+	// The subprocess has already been reaped, so StopSession's own wait
+	// for it returns at once.
+	reaped := make(chan struct{})
+	close(reaped)
+	state := &sessionState{
+		threadID:   "thread-001",
+		stdin:      nopWriteCloser{},
+		waitCh:     reaped,
+		pipes:      &procutil.OwnedPipes{Stdout: outRead, Stderr: errRead},
+		inbox:      jsonrpc.NewInbox[jsonrpc.Message](),
+		readerDone: make(chan struct{}),
+	}
+	state.conn = jsonrpc.NewConn(nopWriteCloser{}, outRead, jsonrpc.Deliver(state.inbox, identity))
+	go watchTermination(state)
+
+	for i := range lines {
+		select {
+		case <-state.inbox.Ready():
+			if _, ok := state.inbox.Take(); !ok {
+				t.Fatalf("inbox closed after %d of %d lines, want the reader still parked on the live pipe", i, lines)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("reader delivered %d of %d lines within 5s", i, lines)
+		}
+	}
 	select {
 	case <-state.readerDone:
-		// OK
+		t.Fatal("the reader ended before StopSession, so this test would pass without StopSession releasing it")
 	default:
-		t.Error("readerDone should be closed after StopSession")
+	}
+
+	// StopSession gives up on the reader after 2s and releases it only
+	// when it closes the pipes on its way out, so a stop that reaches
+	// that bound has not released the reader itself even though
+	// readerDone is closed by the time it returns.
+	const readerWaitBound = 2 * time.Second
+	start := time.Now()
+	if err := (&CodexAdapter{}).StopSession(context.Background(), domain.Session{Internal: state}); err != nil {
+		t.Fatalf("StopSession() error = %v", err)
+	}
+	if elapsed := time.Since(start); elapsed >= readerWaitBound {
+		t.Errorf("StopSession() took %v, want it to release the reader before its %v wait gives up on it", elapsed, readerWaitBound)
+	}
+
+	select {
+	case <-state.readerDone:
+	default:
+		t.Error("readerDone is still open after StopSession, want StopSession to release the reader parked on the runtime's live output")
 	}
 }
 
 // TestHandshakeIsolation_PreTurnMessagesDoNotReachFirstTurn drives one
 // jsonrpc.Conn through initializeHandshake, authenticateIfNeeded, and
-// startThread, then reproduces what the handshake-phase handler
-// queues before the turn phase begins: a notification and a line
-// that fails to parse, and calls beginTurnPhase before running one
-// turn on the same connection. It asserts the turn completes normally
-// and the pre-turn messages produce no event and do not fail the
-// turn.
+// startThread, then reproduces what the handshake phase leaves queued
+// in the inbox before the turn phase begins: a notification and a line
+// that fails to parse, and calls drainHandshakeMessages before
+// running one turn on the same connection. It asserts the turn
+// completes normally and the pre-turn messages produce no event and do
+// not fail the turn.
 func TestHandshakeIsolation_PreTurnMessagesDoNotReachFirstTurn(t *testing.T) {
 	t.Parallel()
 
@@ -1727,23 +1771,23 @@ func TestHandshakeIsolation_PreTurnMessagesDoNotReachFirstTurn(t *testing.T) {
 	if err := initializeHandshake(context.Background(), state); err != nil {
 		t.Fatalf("initializeHandshake() error = %v", err)
 	}
-	if err := authenticateIfNeeded(context.Background(), state); err != nil {
+	if err := authenticateIfNeeded(context.Background(), state, discardTestLogger()); err != nil {
 		t.Fatalf("authenticateIfNeeded() error = %v", err)
 	}
-	threadID, _, err := startThread(context.Background(), state, passthroughConfig{})
+	threadID, _, err := startThread(context.Background(), state, passthroughConfig{}, discardTestLogger())
 	if err != nil {
 		t.Fatalf("startThread() error = %v", err)
 	}
 	state.threadID = threadID
 
-	// Reproduce what the handshake-phase handler queues before the
-	// turn phase begins: a notification and a line that fails to
-	// parse, the same shapes the app-server might send between the
-	// handshake and the first turn.
-	state.msgCh <- jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "some/unsolicited"}
-	state.msgCh <- jsonrpc.Message{Kind: jsonrpc.KindMalformed, Err: errors.New("malformed")}
+	// Reproduce what the handshake phase leaves queued in the inbox
+	// before the turn phase begins: a notification and a line that
+	// fails to parse, the same shapes the app-server might send
+	// between the handshake and the first turn.
+	state.inbox.Put(jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "some/unsolicited"})
+	state.inbox.Put(jsonrpc.Message{Kind: jsonrpc.KindMalformed, Err: errors.New("malformed")})
 
-	beginTurnPhase(state)
+	drainHandshakeMessages(state, discardTestLogger())
 
 	adapter, _ := NewCodexAdapter(map[string]any{})
 	var events []domain.AgentEvent
@@ -1821,13 +1865,13 @@ func TestAuthenticateIfNeeded_LoginWaitEOF(t *testing.T) {
 	}
 
 	done := make(chan error, 1)
-	go func() { done <- authenticateIfNeeded(context.Background(), state) }()
+	go func() { done <- authenticateIfNeeded(context.Background(), state, discardTestLogger()) }()
 
-	// authenticateIfNeeded only reads state.msgCh once
-	// account/login/start has already returned, and Call never reads
-	// state.msgCh at all, so closing it here cannot race Call's own
-	// resolution on the connection.
-	close(state.msgCh)
+	// authenticateIfNeeded only takes from state.inbox once
+	// account/login/start has already returned, and Call never takes
+	// from state.inbox at all, so closing it here cannot race Call's
+	// own resolution on the connection.
+	state.inbox.Close()
 
 	select {
 	case err := <-done:
@@ -1854,9 +1898,9 @@ func TestAuthenticateIfNeeded_LoginWaitReadError(t *testing.T) {
 	})
 
 	done := make(chan error, 1)
-	go func() { done <- authenticateIfNeeded(context.Background(), state) }()
+	go func() { done <- authenticateIfNeeded(context.Background(), state, discardTestLogger()) }()
 
-	state.msgCh <- jsonrpc.Message{Kind: jsonrpc.KindStreamEnd, Err: wantErr}
+	state.inbox.Put(jsonrpc.Message{Kind: jsonrpc.KindStreamEnd, Err: wantErr})
 
 	select {
 	case err := <-done:
@@ -1886,11 +1930,11 @@ func TestStartThread_NotificationWaitEOF(t *testing.T) {
 	}
 	done := make(chan outcome, 1)
 	go func() {
-		threadID, _, err := startThread(context.Background(), state, passthroughConfig{})
+		threadID, _, err := startThread(context.Background(), state, passthroughConfig{}, discardTestLogger())
 		done <- outcome{threadID, err}
 	}()
 
-	close(state.msgCh)
+	state.inbox.Close()
 
 	select {
 	case got := <-done:
@@ -1937,6 +1981,9 @@ func TestRunTurn_NullIDApprovalRequestIsNotAnswered(t *testing.T) {
 	if result.ExitReason != domain.EventTurnCompleted {
 		t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnCompleted)
 	}
+	if err := state.conn.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
 
 	if _, ok := stdin.find(`"id":null`); ok {
 		t.Error("a reply was written for a null-id request, which the reply path refuses and the peer cannot match")
@@ -1975,6 +2022,7 @@ func TestRunTurn_CancelledApprovalRequestReportsCancelled(t *testing.T) {
 	}
 	outcomeCh := make(chan outcome, 1)
 	finished := make(chan struct{})
+	started := make(chan struct{})
 
 	var events []domain.AgentEvent
 	adapter, _ := NewCodexAdapter(map[string]any{})
@@ -1982,7 +2030,7 @@ func TestRunTurn_CancelledApprovalRequestReportsCancelled(t *testing.T) {
 		defer close(finished)
 		result, err := adapter.RunTurn(ctx, fakeSession(state), domain.RunTurnParams{
 			Prompt:  "go",
-			OnEvent: collectEvents(&events),
+			OnEvent: onEventSignalingSessionStarted(collectEvents(&events), started),
 		})
 		outcomeCh <- outcome{result: result, err: err}
 	}()
@@ -1994,9 +2042,8 @@ func TestRunTurn_CancelledApprovalRequestReportsCancelled(t *testing.T) {
 		}
 	})
 
-	// The unbuffered send returns only once RunTurn has received it,
-	// which proves its main event loop is running before cancellation.
-	state.msgCh <- jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "turn/started", Params: json.RawMessage(`{"turnId":"turn-001"}`)}
+	state.inbox.Put(jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "turn/started", Params: json.RawMessage(`{"turnId":"turn-001"}`)})
+	waitForSessionStarted(t, started)
 
 	cancel()
 	select {
@@ -2011,11 +2058,7 @@ func TestRunTurn_CancelledApprovalRequestReportsCancelled(t *testing.T) {
 		Method: "item/commandExecution/requestApproval",
 		Params: json.RawMessage(`{}`),
 	}
-	select {
-	case state.msgCh <- approvalMsg:
-	case <-time.After(time.Second):
-		t.Fatal("RunTurn did not accept the pending approval request after cancellation")
-	}
+	state.inbox.Put(approvalMsg)
 
 	select {
 	case got := <-outcomeCh:
@@ -2027,6 +2070,9 @@ func TestRunTurn_CancelledApprovalRequestReportsCancelled(t *testing.T) {
 		t.Fatal("RunTurn did not return after the approval request arrived")
 	}
 
+	if err := state.conn.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
 	if _, ok := recorder.find(`{"id":99`); ok {
 		t.Error("a reply was written for the pending approval request, want the cancellation path to skip answering it")
 	}

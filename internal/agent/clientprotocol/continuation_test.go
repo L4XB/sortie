@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sortie-ai/sortie/internal/agent/jsonrpc"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
@@ -176,10 +177,10 @@ func TestResolveSessionLoadUnimplementedLowersAndFallsBack(t *testing.T) {
 	outcomeCh := runResolveSessionAsync(context.Background(), state, "prior-session", capsAdvertisingLoad())
 
 	probeID := out.awaitMethod(t, negativeControlMethod)
-	respondErrorLine(t, inPw, probeID, jsonrpcMethodNotFound, "method not found")
+	respondErrorLine(t, inPw, probeID, jsonrpc.MethodNotFoundCode, "method not found")
 
 	loadID := out.awaitMethod(t, methodSessionLoad)
-	respondErrorLine(t, inPw, loadID, jsonrpcMethodNotFound, "method not found")
+	respondErrorLine(t, inPw, loadID, jsonrpc.MethodNotFoundCode, "method not found")
 
 	newID := out.awaitMethod(t, methodSessionNew)
 	respondLine(t, inPw, newID, newSessionResponse{SessionID: sessionId("fallback-session")})
@@ -210,7 +211,7 @@ func TestResolveSessionLoadRealFailureLowersAndFallsBack(t *testing.T) {
 	outcomeCh := runResolveSessionAsync(context.Background(), state, "prior-session", capsAdvertisingLoad())
 
 	probeID := out.awaitMethod(t, negativeControlMethod)
-	respondErrorLine(t, inPw, probeID, jsonrpcMethodNotFound, "method not found")
+	respondErrorLine(t, inPw, probeID, jsonrpc.MethodNotFoundCode, "method not found")
 
 	loadID := out.awaitMethod(t, methodSessionLoad)
 	respondErrorLine(t, inPw, loadID, -32000, "session store unavailable")
@@ -245,7 +246,7 @@ func TestResolveSessionLoadSuccessNoReplayLowersAndFallsBack(t *testing.T) {
 	outcomeCh := runResolveSessionAsync(context.Background(), state, "prior-session", capsAdvertisingLoad())
 
 	probeID := out.awaitMethod(t, negativeControlMethod)
-	respondErrorLine(t, inPw, probeID, jsonrpcMethodNotFound, "method not found")
+	respondErrorLine(t, inPw, probeID, jsonrpc.MethodNotFoundCode, "method not found")
 
 	loadID := out.awaitMethod(t, methodSessionLoad)
 	respondLine(t, inPw, loadID, loadSessionResponse{})
@@ -290,7 +291,7 @@ func TestResolveSessionLoadEarlyChunkDoesNotConfirmReplay(t *testing.T) {
 
 	probeID := out.awaitMethod(t, negativeControlMethod)
 	sendLine(t, inPw, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"prior-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"arrived before the load call was even sent"}}}}`)
-	respondErrorLine(t, inPw, probeID, jsonrpcMethodNotFound, "method not found")
+	respondErrorLine(t, inPw, probeID, jsonrpc.MethodNotFoundCode, "method not found")
 
 	loadID := out.awaitMethod(t, methodSessionLoad)
 	respondLine(t, inPw, loadID, loadSessionResponse{})
@@ -325,7 +326,7 @@ func TestResolveSessionLoadSuccessWithReplayConfirms(t *testing.T) {
 	outcomeCh := runResolveSessionAsync(context.Background(), state, "prior-session", capsAdvertisingLoad())
 
 	probeID := out.awaitMethod(t, negativeControlMethod)
-	respondErrorLine(t, inPw, probeID, jsonrpcMethodNotFound, "method not found")
+	respondErrorLine(t, inPw, probeID, jsonrpc.MethodNotFoundCode, "method not found")
 
 	loadID := out.awaitMethod(t, methodSessionLoad)
 	sendLine(t, inPw, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"prior-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"replayed from history"}}}}`)
@@ -355,7 +356,7 @@ func TestResolveSessionResumeSuccessConfirmsWithoutReplay(t *testing.T) {
 	outcomeCh := runResolveSessionAsync(context.Background(), state, "prior-session", capsAdvertisingResume())
 
 	probeID := out.awaitMethod(t, negativeControlMethod)
-	respondErrorLine(t, inPw, probeID, jsonrpcMethodNotFound, "method not found")
+	respondErrorLine(t, inPw, probeID, jsonrpc.MethodNotFoundCode, "method not found")
 
 	resumeID := out.awaitMethod(t, methodSessionResume)
 	respondLine(t, inPw, resumeID, resumeSessionResponse{})
@@ -383,10 +384,10 @@ func TestResolveSessionResumeFailureLowersAndFallsBack(t *testing.T) {
 	outcomeCh := runResolveSessionAsync(context.Background(), state, "prior-session", capsAdvertisingResume())
 
 	probeID := out.awaitMethod(t, negativeControlMethod)
-	respondErrorLine(t, inPw, probeID, jsonrpcMethodNotFound, "method not found")
+	respondErrorLine(t, inPw, probeID, jsonrpc.MethodNotFoundCode, "method not found")
 
 	resumeID := out.awaitMethod(t, methodSessionResume)
-	respondErrorLine(t, inPw, resumeID, jsonrpcMethodNotFound, "method not found")
+	respondErrorLine(t, inPw, resumeID, jsonrpc.MethodNotFoundCode, "method not found")
 
 	newID := out.awaitMethod(t, methodSessionNew)
 	respondLine(t, inPw, newID, newSessionResponse{SessionID: sessionId("fallback-session")})
@@ -463,7 +464,7 @@ func TestResolveSessionCallTimeoutFallsBack(t *testing.T) {
 
 			probeID := out.awaitMethod(t, negativeControlMethod)
 			if tt.answerProbe {
-				respondErrorLine(t, inPw, probeID, jsonrpcMethodNotFound, "method not found")
+				respondErrorLine(t, inPw, probeID, jsonrpc.MethodNotFoundCode, "method not found")
 				out.awaitMethod(t, tt.continuationMethod)
 			}
 
@@ -502,10 +503,10 @@ func TestUnconfirmedLoadClearsProvisionalSessionIDForFallbackUpdate(t *testing.T
 	outcomeCh := runResolveSessionAsync(context.Background(), state, "prior-session", capsAdvertisingLoad())
 
 	probeID := out.awaitMethod(t, negativeControlMethod)
-	respondErrorLine(t, inPw, probeID, jsonrpcMethodNotFound, "method not found")
+	respondErrorLine(t, inPw, probeID, jsonrpc.MethodNotFoundCode, "method not found")
 
 	loadID := out.awaitMethod(t, methodSessionLoad)
-	respondErrorLine(t, inPw, loadID, jsonrpcMethodNotFound, "method not found")
+	respondErrorLine(t, inPw, loadID, jsonrpc.MethodNotFoundCode, "method not found")
 
 	newID := out.awaitMethod(t, methodSessionNew)
 	sendLine(t, inPw, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fallback-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"`+replayedMessage+`"}}}}`)
@@ -519,7 +520,7 @@ func TestUnconfirmedLoadClearsProvisionalSessionIDForFallbackUpdate(t *testing.T
 		t.Fatalf("resolveSession() session id = %q, want %q", outcome.sessionID, "fallback-session")
 	}
 
-	state.itemCh <- pumpItem{control: &pumpControl{sessionID: outcome.sessionID}}
+	state.inbox.Put(pumpItem{control: &pumpControl{sessionID: outcome.sessionID}})
 
 	var events []domain.AgentEvent
 	turnCh := runTurnAsync(state, domain.RunTurnParams{Prompt: "go", OnEvent: collectEvents(&events)})
@@ -558,7 +559,7 @@ func TestUnconfirmedLoadSuccessNoReplayClearsProvisionalSessionIDForFallbackUpda
 	outcomeCh := runResolveSessionAsync(context.Background(), state, "prior-session", capsAdvertisingLoad())
 
 	probeID := out.awaitMethod(t, negativeControlMethod)
-	respondErrorLine(t, inPw, probeID, jsonrpcMethodNotFound, "method not found")
+	respondErrorLine(t, inPw, probeID, jsonrpc.MethodNotFoundCode, "method not found")
 
 	loadID := out.awaitMethod(t, methodSessionLoad)
 	respondLine(t, inPw, loadID, loadSessionResponse{})
@@ -575,7 +576,7 @@ func TestUnconfirmedLoadSuccessNoReplayClearsProvisionalSessionIDForFallbackUpda
 		t.Fatalf("resolveSession() session id = %q, want %q", outcome.sessionID, "fallback-session")
 	}
 
-	state.itemCh <- pumpItem{control: &pumpControl{sessionID: outcome.sessionID}}
+	state.inbox.Put(pumpItem{control: &pumpControl{sessionID: outcome.sessionID}})
 
 	var events []domain.AgentEvent
 	turnCh := runTurnAsync(state, domain.RunTurnParams{Prompt: "go", OnEvent: collectEvents(&events)})
@@ -623,7 +624,7 @@ func TestResolveLoadDefersUntilCreationMinuteElapses(t *testing.T) {
 	outcomeCh := runResolveSessionAsync(context.Background(), state, "prior-session", capsAdvertisingLoad())
 
 	probeID := out.awaitMethod(t, negativeControlMethod)
-	respondErrorLine(t, inPw, probeID, jsonrpcMethodNotFound, "method not found")
+	respondErrorLine(t, inPw, probeID, jsonrpc.MethodNotFoundCode, "method not found")
 
 	select {
 	case line := <-out.ch:
@@ -667,10 +668,10 @@ func TestResolveLoadDeferralLogsDebugRecord(t *testing.T) {
 	outcomeCh := runResolveSessionAsync(context.Background(), state, "prior-session", capsAdvertisingLoad())
 
 	probeID := out.awaitMethod(t, negativeControlMethod)
-	respondErrorLine(t, inPw, probeID, jsonrpcMethodNotFound, "method not found")
+	respondErrorLine(t, inPw, probeID, jsonrpc.MethodNotFoundCode, "method not found")
 
 	loadID := out.awaitMethod(t, methodSessionLoad)
-	respondErrorLine(t, inPw, loadID, jsonrpcMethodNotFound, "method not found")
+	respondErrorLine(t, inPw, loadID, jsonrpc.MethodNotFoundCode, "method not found")
 
 	newID := out.awaitMethod(t, methodSessionNew)
 	respondLine(t, inPw, newID, newSessionResponse{SessionID: sessionId("fallback-session")})
@@ -731,7 +732,7 @@ func TestResolveLoadNoDeferralWhenNotInCreationMinute(t *testing.T) {
 			outcomeCh := runResolveSessionAsync(context.Background(), state, "prior-session", capsAdvertisingLoad())
 
 			probeID := out.awaitMethod(t, negativeControlMethod)
-			respondErrorLine(t, inPw, probeID, jsonrpcMethodNotFound, "method not found")
+			respondErrorLine(t, inPw, probeID, jsonrpc.MethodNotFoundCode, "method not found")
 
 			start := time.Now()
 			line := out.next(t)
@@ -778,7 +779,7 @@ func TestResolveResumeIgnoresCreationLedger(t *testing.T) {
 	outcomeCh := runResolveSessionAsync(context.Background(), state, "prior-session", capsAdvertisingResume())
 
 	probeID := out.awaitMethod(t, negativeControlMethod)
-	respondErrorLine(t, inPw, probeID, jsonrpcMethodNotFound, "method not found")
+	respondErrorLine(t, inPw, probeID, jsonrpc.MethodNotFoundCode, "method not found")
 
 	start := time.Now()
 	resumeID := out.awaitMethod(t, methodSessionResume)
@@ -820,7 +821,7 @@ func TestResolveLoadContextCancelDuringDeferralReturnsPortExit(t *testing.T) {
 	}()
 
 	probeID := out.awaitMethod(t, negativeControlMethod)
-	respondErrorLine(t, inPw, probeID, jsonrpcMethodNotFound, "method not found")
+	respondErrorLine(t, inPw, probeID, jsonrpc.MethodNotFoundCode, "method not found")
 
 	cancel()
 
@@ -863,10 +864,10 @@ func TestFallbackSessionRecordedIsGuardedOnLaterLoad(t *testing.T) {
 	firstOutcomeCh := runResolveSessionAsync(context.Background(), firstState, "prior-session", capsAdvertisingLoad())
 
 	firstProbeID := firstOut.awaitMethod(t, negativeControlMethod)
-	respondErrorLine(t, firstInPw, firstProbeID, jsonrpcMethodNotFound, "method not found")
+	respondErrorLine(t, firstInPw, firstProbeID, jsonrpc.MethodNotFoundCode, "method not found")
 
 	firstLoadID := firstOut.awaitMethod(t, methodSessionLoad)
-	respondErrorLine(t, firstInPw, firstLoadID, jsonrpcMethodNotFound, "method not found")
+	respondErrorLine(t, firstInPw, firstLoadID, jsonrpc.MethodNotFoundCode, "method not found")
 
 	firstNewID := firstOut.awaitMethod(t, methodSessionNew)
 	respondLine(t, firstInPw, firstNewID, newSessionResponse{SessionID: sessionId("fallback-session")})
@@ -894,7 +895,7 @@ func TestFallbackSessionRecordedIsGuardedOnLaterLoad(t *testing.T) {
 	secondOutcomeCh := runResolveSessionAsync(context.Background(), secondState, "fallback-session", capsAdvertisingLoad())
 
 	secondProbeID := secondOut.awaitMethod(t, negativeControlMethod)
-	respondErrorLine(t, secondInPw, secondProbeID, jsonrpcMethodNotFound, "method not found")
+	respondErrorLine(t, secondInPw, secondProbeID, jsonrpc.MethodNotFoundCode, "method not found")
 
 	select {
 	case line := <-secondOut.ch:

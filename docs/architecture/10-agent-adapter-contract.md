@@ -698,6 +698,20 @@ Standard-output and standard-error ownership:
   succeeded, because a trailer read before the bound expired may belong to output whose remainder
   never arrived. The turn then falls to the shared disposition the exit code and the observed work
   decide, which reports a turn that produced nothing as failed.
+- An adapter whose runtime answers requests over its standard output reads that stream on a
+  reader that never waits on the session's consumer. When the adapter waits on a request's
+  response directly, the reader hands that response to the waiting request as soon as it reads
+  it. Every other message, including a response the adapter chose to receive in arrival order
+  behind the messages that preceded it, is queued for the consumer in arrival order, without a
+  size limit and without loss. No interval in a session, whether a request awaiting its response,
+  a callback in progress, or the gap between two turns, leaves the runtime's output unread while
+  the runtime is alive. A message that arrives outside a turn, during the handshake or between
+  turns, is processed rather than discarded, and every request the runtime sends receives exactly
+  one reply, in every phase of the session.
+- Writing to the runtime is symmetric with reading it: a send returns once its line is queued for
+  delivery, never once the runtime has read it, so no send waits on the runtime's own pace at
+  reading standard input. A request's wait for its own response is bounded by the caller that
+  issued it, not by that pace either.
 
 Per-family teardown totals, at default configuration:
 

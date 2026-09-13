@@ -139,7 +139,7 @@ func TestHandshakeLoweringPersistsAcrossTurns(t *testing.T) {
 	state, outPr, inPw := newTestSession(t, domain.AgentConfig{}, clientProtocolMaxLineBytes)
 	out := newOutboundReader(outPr)
 
-	state.itemCh <- pumpItem{control: &pumpControl{handshake: &handshakeFacts{agentInfoPresent: false}}}
+	state.inbox.Put(pumpItem{control: &pumpControl{handshake: &handshakeFacts{agentInfoPresent: false}}})
 	markSessionKnown(state)
 
 	var firstTurnEvents []domain.AgentEvent
@@ -644,10 +644,10 @@ func TestCapabilityGapNoticeOncePerSession(t *testing.T) {
 	// A local launch's stage-one record already carries tokenCounts and
 	// sessionContinuation at gap; this handshake lowers the two
 	// remaining entries so the notice lists all four labels.
-	state.itemCh <- pumpItem{control: &pumpControl{handshake: &handshakeFacts{
+	state.inbox.Put(pumpItem{control: &pumpControl{handshake: &handshakeFacts{
 		agentInfoPresent:    false,
 		toolServersWithheld: true,
-	}}}
+	}}})
 	markSessionKnown(state)
 
 	var firstTurnEvents []domain.AgentEvent
@@ -710,8 +710,8 @@ func runOneTurnAndCaptureNotice(t *testing.T, sessionID string, facts *handshake
 	state, outPr, inPw := newTestSession(t, domain.AgentConfig{}, clientProtocolMaxLineBytes)
 	out := newOutboundReader(outPr)
 
-	state.itemCh <- pumpItem{control: &pumpControl{handshake: facts}}
-	state.itemCh <- pumpItem{control: &pumpControl{sessionID: sessionID}}
+	state.inbox.Put(pumpItem{control: &pumpControl{handshake: facts}})
+	state.inbox.Put(pumpItem{control: &pumpControl{sessionID: sessionID}})
 
 	var events []domain.AgentEvent
 	outcomeCh := runTurnAsync(state, domain.RunTurnParams{Prompt: "go", OnEvent: collectEvents(&events)})

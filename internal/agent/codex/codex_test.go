@@ -15,7 +15,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -268,14 +267,8 @@ func (c atomicErrContext) Err() error {
 // jsonrpc.Conn over an io.Pipe, whose peer answers the turn/start call
 // only once it observes codex write it (required so the response
 // cannot be misrouted as unmatched, ahead of Call's own pending-map
-// registration), and whose msgCh is unbuffered so the test driving it
-// can set the cancellation flag at the exact point before the
-// turn/completed notification: an unbuffered send only returns once
-// RunTurn's own goroutine has received it, and the Go memory model
-// guarantees everything the test did before that receive (including
-// setting the cancellation flag) happened before the send returns.
-// stdin, when non-nil, receives every line codex writes, including
-// the turn/start request itself.
+// registration). stdin, when non-nil, receives every line codex
+// writes, including the turn/start request itself.
 func newInterruptedStatusState(t *testing.T, stdin io.Writer) *sessionState {
 	t.Helper()
 
@@ -290,14 +283,12 @@ func newInterruptedStatusState(t *testing.T, stdin io.Writer) *sessionState {
 		threadID:   "thread-001",
 		target:     agentcore.LaunchTarget{WorkspacePath: "/tmp"},
 		waitCh:     make(chan struct{}),
-		msgCh:      make(chan jsonrpc.Message),
+		inbox:      jsonrpc.NewInbox[jsonrpc.Message](),
 		readerDone: make(chan struct{}),
-		stopCh:     make(chan struct{}),
 		acc:        agentcore.NewRunUsage(),
 	}
-	state.conn = jsonrpc.NewConn(sig, inPr, sessionHandler(state))
+	state.conn = jsonrpc.NewConn(sig, inPr, jsonrpc.Deliver(state.inbox, identity))
 	go watchTermination(state)
-	state.turnPhase.Store(true)
 
 	go func() {
 		<-sig.done
@@ -305,6 +296,34 @@ func newInterruptedStatusState(t *testing.T, stdin io.Writer) *sessionState {
 	}()
 
 	return state
+}
+
+// waitForSessionStarted blocks until state's turn emits its
+// domain.EventSessionStarted event, which RunTurn's loop can only
+// reach after its initial turn/start Call has returned: this is the
+// test's proof that RunTurn has moved past that call and into its main
+// loop, so a real context cancellation that follows lands on the
+// loop's own arm rather than aborting the call itself.
+func waitForSessionStarted(t *testing.T, started <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunTurn did not emit domain.EventSessionStarted within 2s, want it past the initial turn/start call")
+	}
+}
+
+// onEventSignalingSessionStarted wraps onEvent so it closes started
+// the first time it observes domain.EventSessionStarted, in addition
+// to forwarding every event to onEvent unchanged.
+func onEventSignalingSessionStarted(onEvent func(domain.AgentEvent), started chan<- struct{}) func(domain.AgentEvent) {
+	var once sync.Once
+	return func(e domain.AgentEvent) {
+		if e.Type == domain.EventSessionStarted {
+			once.Do(func() { close(started) })
+		}
+		onEvent(e)
+	}
 }
 
 // TestRunTurn_InterruptedStatus pins the context-gated mapping for a
@@ -366,11 +385,12 @@ func TestRunTurn_InterruptedStatus(t *testing.T) {
 				cancelled.Store(true)
 			}
 
-			// This send returns only once RunTurn's main loop is ready to
-			// receive it, which happens strictly after the turn/start call
-			// has returned and after the ctx.Err() fast-path check that
-			// follows it.
-			state.msgCh <- jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "turn/completed", Params: json.RawMessage(`{"turn":{"id":"turn-001","status":"interrupted"}}`)}
+			// Put and the RunTurn loop's Take are both serialized through
+			// the inbox's own mutex, so everything the test did above,
+			// including setting the cancellation flag, is visible once
+			// RunTurn takes this item and reads ctx.Err() while handling
+			// it.
+			state.inbox.Put(jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "turn/completed", Params: json.RawMessage(`{"turn":{"id":"turn-001","status":"interrupted"}}`)})
 
 			got := <-outcomeCh
 			result, err := got.result, got.err
@@ -446,11 +466,12 @@ func TestRunTurn_CompletedNotificationUnderCancelledContext(t *testing.T) {
 
 			cancelled.Store(true)
 
-			// This send returns only once RunTurn's main loop is ready to
-			// receive it, which happens strictly after the turn/start call
-			// has returned and after the ctx.Err() fast-path check that
-			// follows it.
-			state.msgCh <- jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "turn/completed", Params: json.RawMessage(tt.params)}
+			// Put and the RunTurn loop's Take are both serialized through
+			// the inbox's own mutex, so everything the test did above,
+			// including setting the cancellation flag, is visible once
+			// RunTurn takes this item and reads ctx.Err() while handling
+			// it.
+			state.inbox.Put(jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "turn/completed", Params: json.RawMessage(tt.params)})
 
 			got := <-outcomeCh
 			result, err := got.result, got.err
@@ -639,9 +660,9 @@ func (s *entrySignalingWriter) Write(p []byte) (int, error) {
 
 // TestStopSession_ReturnsWhileWriteParked checks that StopSession
 // returns while another goroutine is parked writing on the session's
-// connection, proving that closeConnAndStop's call to conn.Close does
-// not wait for that write. The fixture leaves no process handle and
-// no wait channel, and readerDone already closed, so no other bounded
+// connection, proving that closeConn's call to conn.Close does not
+// wait for that write. The fixture leaves no process handle and no
+// wait channel, and readerDone already closed, so no other bounded
 // wait in StopSession can substitute for that proof.
 func TestStopSession_ReturnsWhileWriteParked(t *testing.T) {
 	t.Parallel()
@@ -653,11 +674,10 @@ func TestStopSession_ReturnsWhileWriteParked(t *testing.T) {
 	close(readerDone)
 
 	state := &sessionState{
-		msgCh:      make(chan jsonrpc.Message),
+		inbox:      jsonrpc.NewInbox[jsonrpc.Message](),
 		readerDone: readerDone,
-		stopCh:     make(chan struct{}),
 	}
-	state.conn = jsonrpc.NewConn(sig, strings.NewReader(""), sessionHandler(state))
+	state.conn = jsonrpc.NewConn(sig, strings.NewReader(""), jsonrpc.Deliver(state.inbox, identity))
 
 	writeErr := make(chan error, 1)
 	go func() {
@@ -730,7 +750,6 @@ func startFakeCodexProcess(t *testing.T, scriptBody string, stopGraceMS int) *se
 		proc:        cmd.Process,
 		waitCh:      waitCh,
 		readerDone:  readerDone,
-		stopCh:      make(chan struct{}),
 	}
 	go func() {
 		cmd.Wait() //nolint:errcheck,gosec // best-effort reap; exit state is irrelevant here
@@ -872,182 +891,8 @@ while :; do :; done`, 30000)
 	})
 }
 
-// writeFakeAppServerScriptTerminalParked creates a script that fakes the
-// codex app-server handshake exactly as writeFakeAppServerScript does,
-// then reads a decimal fill count from its own standard input, writes
-// that many filler notifications as a single write, and only after a
-// second line arrives on its standard input does it write the terminal
-// turn/completed notification and exit. Properties P10 and P11 drive
-// state.msgCh directly against this script rather than through RunTurn,
-// because a draining consumer cannot hold the reader parked and a
-// parked reader cannot deliver turn/start's own response in the first
-// place.
-func writeFakeAppServerScriptTerminalParked(t *testing.T) string {
-	t.Helper()
-	dir := t.TempDir()
-	content := `read -r _init_req
-printf '{"id":1,"result":{}}\n'
-read -r _initialized_notif
-read -r _account_read_req
-printf '{"id":2,"result":{}}\n'
-read -r _thread_start_req
-printf '{"id":3,"result":{"thread":{"id":"fake-thread-1"}}}\n'
-printf '{"method":"thread/started","params":{}}\n'
-read -r COUNT
-i=0
-FILL=""
-while [ "$i" -lt "$COUNT" ]; do
-  FILL="${FILL}{\"method\":\"filler/notification\",\"params\":{\"i\":$i}}
-"
-  i=$((i+1))
-done
-printf '%s' "$FILL"
-read -r _go
-printf '{"method":"turn/completed","params":{"turn":{"id":"t1","status":"completed"}}}\n'
-`
-	return agenttest.WriteScript(t, dir, "fake-codex-app-server-terminal-parked", content)
-}
-
-// runTerminalMessageFixture drives writeFakeAppServerScriptTerminalParked
-// through the five-step sequence properties P10 and P11 share: it fills
-// state.msgCh to capacity plus one so the connection's reader is parked
-// delivering the last filler message, waits for that to be observed,
-// signals the script to write its terminal message and exit, waits for
-// state.waitCh (Reaper.Done) so the reap is observed before the reader
-// can resume, and only then drains state.msgCh until it closes.
-//
-// closeStdoutAfterReap reproduces, locally in this test's own wiring,
-// the truncation exec.Cmd.Wait used to perform before the ownership
-// move: closing the standard-output read end at the instant the reap is
-// observed. It is never applied in production code. Property P10 calls
-// this with false; P11, the negative control, calls it with true and
-// expects the terminal message to be lost.
-//
-// It returns whether a turn/completed notification was among the
-// messages drained.
-func runTerminalMessageFixture(t *testing.T, closeStdoutAfterReap bool) bool {
-	t.Helper()
-	t.Setenv("CODEX_API_KEY", "")
-
-	script := writeFakeAppServerScriptTerminalParked(t)
-
-	adapter := &CodexAdapter{drainGrace: 10 * time.Second}
-	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
-		WorkspacePath: t.TempDir(),
-		AgentConfig:   domain.AgentConfig{Command: script},
-	})
-	if err != nil {
-		t.Fatalf("StartSession() error = %v", err)
-	}
-	state, ok := session.Internal.(*sessionState)
-	if !ok {
-		t.Fatalf("session.Internal type = %T, want *sessionState", session.Internal)
-	}
-	t.Cleanup(func() {
-		_ = adapter.StopSession(context.Background(), session)
-	})
-
-	// The capacity travels over the wire rather than as a literal: a
-	// second copy of codex.go's make(chan jsonrpc.Message, 16) would
-	// silently stop exercising the park if that capacity ever changes.
-	capacity := cap(state.msgCh)
-	if _, err := fmt.Fprintf(state.stdin, "%d\n", capacity+1); err != nil {
-		t.Fatalf("write fill count: %v", err)
-	}
-
-	deadline := time.Now().Add(5 * time.Second)
-	for len(state.msgCh) < capacity {
-		if time.Now().After(deadline) {
-			t.Fatalf("len(state.msgCh) = %d, want %d within 5s (the reader must be parked delivering the fill)", len(state.msgCh), capacity)
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-
-	if _, err := fmt.Fprintln(state.stdin, "go"); err != nil {
-		t.Fatalf("write go signal: %v", err)
-	}
-
-	select {
-	case <-state.waitCh:
-	case <-time.After(5 * time.Second):
-		t.Fatal("state.waitCh (Reaper.Done) did not close within 5s")
-	}
-
-	if closeStdoutAfterReap {
-		if state.pipes == nil {
-			t.Fatal("state.pipes is nil at the reap, want the pipes still owned by the session")
-		}
-		if err := state.pipes.CloseStdout(); err != nil {
-			t.Fatalf("CloseStdout() = %v", err)
-		}
-	}
-
-	var sawCompleted bool
-	drainDeadline := time.After(5 * time.Second)
-drain:
-	for {
-		select {
-		case msg, ok := <-state.msgCh:
-			if !ok {
-				break drain
-			}
-			if msg.Kind == jsonrpc.KindNotification && msg.Method == "turn/completed" {
-				sawCompleted = true
-			}
-		case <-drainDeadline:
-			t.Fatal("draining state.msgCh did not finish within 5s")
-		}
-	}
-
-	return sawCompleted
-}
-
-// TestStartSession_TerminalMessageDeliveredWhileReaderParked covers
-// property P10: a session whose runtime writes a terminal message and
-// exits while the connection's reader is parked mid-dispatch still
-// delivers that message to state.msgCh, because the reap no longer
-// closes the read end out from under it.
-func TestStartSession_TerminalMessageDeliveredWhileReaderParked(t *testing.T) {
-	if !runTerminalMessageFixture(t, false) {
-		t.Error("turn/completed was not delivered to state.msgCh, want it recovered once the reader resumed")
-	}
-}
-
-// TestStartSession_ReapClosingStdoutTruncatesTerminalMessage is
-// property P11, the negative control for P10: closing the standard-
-// output read end at the instant the reap is observed, which is where
-// exec.Cmd.Wait closed it before this change, loses the terminal
-// message P10 recovers. A green result here means the fixture never
-// parked the reader in the first place, and the fixture rather than the
-// production change would be what to fix.
-func TestStartSession_ReapClosingStdoutTruncatesTerminalMessage(t *testing.T) {
-	if runTerminalMessageFixture(t, true) {
-		t.Error("turn/completed was delivered despite closing the read end at the reap, want it lost (negative control did not reproduce the truncation)")
-	}
-}
-
-// syncBuffer is a lock-protected byte buffer, safe as a slog handler
-// destination when the code under test logs from a goroutine other than
-// the one asserting on the captured output.
-type syncBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *syncBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *syncBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
-}
-
-// handlerParkedOutcome is what runHandlerParkedFixture's caller receives
-// once the RunTurn it started internally returns.
+// handlerParkedOutcome is what a test's own goroutine running RunTurn
+// sends back once that call returns.
 type handlerParkedOutcome struct {
 	result domain.TurnResult
 	err    error
@@ -1060,16 +905,38 @@ type handlerParkedOutcome struct {
 const fakeScenarioEnv = "SORTIE_TEST_CODEX_FAKE_SCENARIO"
 
 const (
-	// scenarioHandlerParked answers the handshake, then bursts more
-	// notifications than the client's message channel holds while a
-	// turn/start call is still in flight.
-	scenarioHandlerParked = "handler-parked"
+	// scenarioBurstDuringTurnOpening answers the handshake, then on
+	// turn/start writes a burst in one write, the turn/start response,
+	// and turn/completed, and keeps reading its own standard input: the
+	// runtime stays alive and healthy throughout.
+	scenarioBurstDuringTurnOpening = "burst-turn-opening"
 
-	// scenarioHandshakeOverflow bursts the same way before thread/start
-	// is answered, while the pre-turn handler still drops on a full
-	// channel rather than parking.
-	scenarioHandshakeOverflow = "handshake-overflow"
+	// scenarioBurstBetweenTurns completes one turn normally, then writes
+	// a burst in one write, creates a marker file at the path named by
+	// burstBetweenTurnsMarkerEnv, and waits for the next turn/start
+	// before answering it.
+	scenarioBurstBetweenTurns = "burst-between-turns"
+
+	// scenarioHandshakeBurstLogin writes a burst, then
+	// account/login/completed, before ever answering account/login/start.
+	scenarioHandshakeBurstLogin = "handshake-burst-login"
+
+	// scenarioHandshakeBurstThread writes a burst, then thread/started,
+	// before ever answering thread/start.
+	scenarioHandshakeBurstThread = "handshake-burst-thread"
 )
+
+// burstCount is a burst of at least 4096 notifications totaling at
+// least 1 MiB, written in one write. Any bounded hand-off parks on it,
+// and it fills every platform's pipe buffer.
+const burstCount = 27000
+
+// burstBetweenTurnsMarkerEnv names the environment variable
+// scenarioBurstBetweenTurns reads the marker file path from. The
+// adapter launches its runtime with the parent's own environment, so
+// setting it in the test process reaches the re-executed fake
+// app-server.
+const burstBetweenTurnsMarkerEnv = "SORTIE_TEST_CODEX_BURST_MARKER_PATH"
 
 func TestMain(m *testing.M) {
 	if scenario := os.Getenv(fakeScenarioEnv); scenario != "" {
@@ -1108,10 +975,14 @@ func serveFakeAppServer(scenario string, in io.Reader, out io.Writer) int {
 	client.Buffer(make([]byte, 0, 4096), 1024*1024)
 
 	switch scenario {
-	case scenarioHandlerParked:
-		return serveHandlerParked(client, out)
-	case scenarioHandshakeOverflow:
-		return serveHandshakeOverflow(client, out)
+	case scenarioBurstDuringTurnOpening:
+		return serveBurstDuringTurnOpening(client, out)
+	case scenarioBurstBetweenTurns:
+		return serveBurstBetweenTurns(client, out)
+	case scenarioHandshakeBurstLogin:
+		return serveHandshakeBurstLogin(client, out)
+	case scenarioHandshakeBurstThread:
+		return serveHandshakeBurstThread(client, out)
 	default:
 		fmt.Fprintf(os.Stderr, "fake app-server: unknown scenario %q\n", scenario)
 		return 2
@@ -1161,25 +1032,131 @@ func answerPreThreadHandshake(client *bufio.Scanner, out io.Writer) bool {
 	return writeFrame(out, "{\"id\":%s,\"result\":{}}\n", accountRead.ID)
 }
 
-// fillerNotifications returns count notifications as one string, so a
-// caller delivers the whole burst in a single write the way a runtime
-// flooding its output does.
-func fillerNotifications(count int) string {
+// fillerNotifications returns burstCount notifications as one string,
+// so a caller delivers the whole burst in a single write the way a
+// runtime flooding its output does.
+func fillerNotifications() string {
 	var fill strings.Builder
-	for i := range count {
+	for i := range burstCount {
 		fmt.Fprintf(&fill, "{\"method\":\"filler/notification\",\"params\":{\"i\":%d}}\n", i)
 	}
 	return fill.String()
 }
 
-// serveHandlerParked answers the handshake, reads the fill count the
-// driver puts on the wire ahead of the turn, then reads turn/start
-// without answering it and bursts that many notifications. That burst
-// is what parks the client's reader inside its handler while the call
-// is in flight. It waits for the driver's wake-up line before exiting,
-// so the test rather than the fixture decides when the runtime dies.
-func serveHandlerParked(client *bufio.Scanner, out io.Writer) int {
+// serveBurstDuringTurnOpening answers the handshake and thread/start,
+// then on the turn/start call writes burstCount notifications in one
+// write, followed by the turn/start response and turn/completed, and
+// keeps reading its own standard input rather than exiting: the
+// runtime stays alive and healthy for the whole exchange.
+func serveBurstDuringTurnOpening(client *bufio.Scanner, out io.Writer) int {
 	if !answerPreThreadHandshake(client, out) {
+		return 1
+	}
+	threadStart, ok := nextFrame(client)
+	if !ok {
+		return 1
+	}
+	if !writeFrame(out, "{\"id\":%s,\"result\":{\"thread\":{\"id\":\"fake-thread-1\"}}}\n", threadStart.ID) {
+		return 1
+	}
+	if !writeFrame(out, "{\"method\":\"thread/started\",\"params\":{}}\n") {
+		return 1
+	}
+
+	turnStart, ok := nextFrame(client)
+	if !ok {
+		return 1
+	}
+	if _, err := io.WriteString(out, fillerNotifications()); err != nil {
+		return 1
+	}
+	if !writeFrame(out, "{\"id\":%s,\"result\":{\"turn\":{\"id\":\"t1\"}}}\n", turnStart.ID) {
+		return 1
+	}
+	if !writeFrame(out, "{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"id\":\"t1\",\"status\":\"completed\"}}}\n") {
+		return 1
+	}
+
+	for client.Scan() {
+	}
+	return 0
+}
+
+// serveBurstBetweenTurns answers the handshake, thread/start, and one
+// full turn, then writes burstCount notifications in one write,
+// creates a marker file at the path burstBetweenTurnsMarkerEnv names,
+// and waits for the next turn/start before answering it and keeping its
+// own standard input open.
+func serveBurstBetweenTurns(client *bufio.Scanner, out io.Writer) int {
+	if !answerPreThreadHandshake(client, out) {
+		return 1
+	}
+	threadStart, ok := nextFrame(client)
+	if !ok {
+		return 1
+	}
+	if !writeFrame(out, "{\"id\":%s,\"result\":{\"thread\":{\"id\":\"fake-thread-1\"}}}\n", threadStart.ID) {
+		return 1
+	}
+	if !writeFrame(out, "{\"method\":\"thread/started\",\"params\":{}}\n") {
+		return 1
+	}
+
+	turnStart1, ok := nextFrame(client)
+	if !ok {
+		return 1
+	}
+	if !writeFrame(out, "{\"id\":%s,\"result\":{\"turn\":{\"id\":\"t1\"}}}\n", turnStart1.ID) {
+		return 1
+	}
+	if !writeFrame(out, "{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"id\":\"t1\",\"status\":\"completed\"}}}\n") {
+		return 1
+	}
+
+	if _, err := io.WriteString(out, fillerNotifications()); err != nil {
+		return 1
+	}
+	if markerPath := os.Getenv(burstBetweenTurnsMarkerEnv); markerPath != "" {
+		if err := os.WriteFile(markerPath, []byte("done"), 0o644); err != nil {
+			return 1
+		}
+	}
+
+	turnStart2, ok := nextFrame(client)
+	if !ok {
+		return 1
+	}
+	if !writeFrame(out, "{\"id\":%s,\"result\":{\"turn\":{\"id\":\"t2\"}}}\n", turnStart2.ID) {
+		return 1
+	}
+	if !writeFrame(out, "{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"id\":\"t2\",\"status\":\"completed\"}}}\n") {
+		return 1
+	}
+
+	for client.Scan() {
+	}
+	return 0
+}
+
+// serveHandshakeBurstLogin answers initialize and account/read, then on
+// account/login/start writes burstCount notifications in one write,
+// followed by account/login/completed reporting success, and only then
+// answers the account/login/start call itself.
+func serveHandshakeBurstLogin(client *bufio.Scanner, out io.Writer) int {
+	if !answerPreThreadHandshake(client, out) {
+		return 1
+	}
+	loginStart, ok := nextFrame(client)
+	if !ok {
+		return 1
+	}
+	if _, err := io.WriteString(out, fillerNotifications()); err != nil {
+		return 1
+	}
+	if !writeFrame(out, "{\"method\":\"account/login/completed\",\"params\":{\"success\":true}}\n") {
+		return 1
+	}
+	if !writeFrame(out, "{\"id\":%s,\"result\":{}}\n", loginStart.ID) {
 		return 1
 	}
 
@@ -1194,59 +1171,70 @@ func serveHandlerParked(client *bufio.Scanner, out io.Writer) int {
 		return 1
 	}
 
-	if !client.Scan() {
-		return 1
+	for client.Scan() {
 	}
-	count, err := strconv.Atoi(strings.TrimSpace(client.Text()))
-	if err != nil {
-		return 1
-	}
-
-	if _, ok := nextFrame(client); !ok {
-		return 1
-	}
-	if _, err := io.WriteString(out, fillerNotifications(count)); err != nil {
-		return 1
-	}
-
-	client.Scan()
 	return 0
 }
 
-// handshakeOverflowFill exceeds any message-channel capacity this
-// adapter uses, so the burst cannot fit however that capacity changes.
-const handshakeOverflowFill = 64
-
-// serveHandshakeOverflow bursts past the channel's capacity while the
-// session is still in its handshake, then reads thread/start without
-// answering it and exits.
-func serveHandshakeOverflow(client *bufio.Scanner, out io.Writer) int {
+// serveHandshakeBurstThread answers the handshake, then on thread/start
+// writes burstCount notifications in one write, followed by
+// thread/started, and only then answers the thread/start call itself.
+func serveHandshakeBurstThread(client *bufio.Scanner, out io.Writer) int {
 	if !answerPreThreadHandshake(client, out) {
 		return 1
 	}
-	if _, err := io.WriteString(out, fillerNotifications(handshakeOverflowFill)); err != nil {
+	threadStart, ok := nextFrame(client)
+	if !ok {
 		return 1
 	}
-	client.Scan()
+	if _, err := io.WriteString(out, fillerNotifications()); err != nil {
+		return 1
+	}
+	if !writeFrame(out, "{\"method\":\"thread/started\",\"params\":{}}\n") {
+		return 1
+	}
+	if !writeFrame(out, "{\"id\":%s,\"result\":{\"thread\":{\"id\":\"fake-thread-1\"}}}\n", threadStart.ID) {
+		return 1
+	}
+
+	for client.Scan() {
+	}
 	return 0
 }
 
-// runHandlerParkedFixture starts a session against the
-// scenarioHandlerParked fake app-server and drives it through the steps
-// properties P1 and P4 share: it writes the fill count over state.stdin
-// before ever starting RunTurn, so the count is on the wire ahead of the
-// turn/start request the script waits for; starts RunTurn in its own
-// goroutine so the caller can observe whether and when it returns; waits
-// for the reader to be parked delivering the fill, establishing P5's
-// evidence; and only then writes the wake-up line that lets the fake
-// runtime exit. The fill count travels over the wire as cap(state.msgCh)
-// + 1 rather than a literal, so a future change to that capacity cannot
-// silently stop parking the reader.
-func runHandlerParkedFixture(t *testing.T, adapter *CodexAdapter) (*sessionState, <-chan handlerParkedOutcome) {
-	t.Helper()
-	t.Setenv("CODEX_API_KEY", "")
+// waitChOpen reports whether state.waitCh is still open, without
+// blocking.
+func waitChOpen(state *sessionState) bool {
+	select {
+	case <-state.waitCh:
+		return false
+	default:
+		return true
+	}
+}
 
-	command := fakeAppServer(t, scenarioHandlerParked)
+// countOtherMessages reports how many events events carries whose
+// Type is domain.EventOtherMessage and whose Message names method.
+func countOtherMessages(events []domain.AgentEvent, method string) int {
+	var n int
+	for _, e := range events {
+		if e.Type == domain.EventOtherMessage && e.Message == method {
+			n++
+		}
+	}
+	return n
+}
+
+// TestRunTurn_BurstDuringTurnOpeningNoLongerHangs drives a fake runtime
+// that stays alive throughout and, on turn/start, writes burstCount
+// notifications in one write before the turn/start response and
+// turn/completed. RunTurn must complete rather than wait on the
+// orchestrator's own stall or turn timeout, with the runtime's own
+// process still unreaped throughout.
+// Not run with t.Parallel(): fakeAppServer uses t.Setenv.
+func TestRunTurn_BurstDuringTurnOpeningNoLongerHangs(t *testing.T) {
+	command := fakeAppServer(t, scenarioBurstDuringTurnOpening)
+	adapter := &CodexAdapter{}
 
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
 		WorkspacePath: t.TempDir(),
@@ -1259,180 +1247,173 @@ func runHandlerParkedFixture(t *testing.T, adapter *CodexAdapter) (*sessionState
 	if !ok {
 		t.Fatalf("session.Internal type = %T, want *sessionState", session.Internal)
 	}
-	t.Cleanup(func() {
-		_ = adapter.StopSession(context.Background(), session)
-	})
+	t.Cleanup(func() { _ = adapter.StopSession(context.Background(), session) })
 
-	capacity := cap(state.msgCh)
-	if _, err := fmt.Fprintf(state.stdin, "%d\n", capacity+1); err != nil {
-		t.Fatalf("write fill count: %v", err)
-	}
-
+	var events []domain.AgentEvent
 	outcomeCh := make(chan handlerParkedOutcome, 1)
 	go func() {
 		result, runErr := adapter.RunTurn(context.Background(), session, domain.RunTurnParams{
 			Prompt:  "work",
-			OnEvent: func(domain.AgentEvent) {},
+			OnEvent: collectEvents(&events),
 		})
 		outcomeCh <- handlerParkedOutcome{result: result, err: runErr}
 	}()
 
-	deadline := time.Now().Add(5 * time.Second)
-	for len(state.msgCh) < capacity {
+	var got handlerParkedOutcome
+	select {
+	case got = <-outcomeCh:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("RunTurn has not returned after 10s, state.waitCh still open = %v", waitChOpen(state))
+	}
+
+	if got.err != nil {
+		t.Errorf("RunTurn() error = %v, want nil", got.err)
+	}
+	if got.result.ExitReason != domain.EventTurnCompleted {
+		t.Errorf("RunTurn() ExitReason = %q, want %q", got.result.ExitReason, domain.EventTurnCompleted)
+	}
+	if !waitChOpen(state) {
+		t.Error("state.waitCh is closed, want the runtime still alive and unreaped")
+	}
+	if n := countOtherMessages(events, "filler/notification"); n != burstCount {
+		t.Errorf("filler notification events = %d, want %d", n, burstCount)
+	}
+}
+
+// TestRunTurn_BurstBetweenTurnsNoLongerHangs drives a fake runtime that
+// completes one turn normally, then, with no turn in flight, writes
+// burstCount notifications in one write and creates a marker file
+// before waiting for the next turn/start. The marker must appear well
+// before the second turn is even started, and the second turn must then
+// satisfy the same properties as the turn-opening burst.
+// Not run with t.Parallel(): uses t.Setenv and fakeAppServer.
+func TestRunTurn_BurstBetweenTurnsNoLongerHangs(t *testing.T) {
+	dir := t.TempDir()
+	markerPath := filepath.Join(dir, "marker")
+	t.Setenv(burstBetweenTurnsMarkerEnv, markerPath)
+
+	command := fakeAppServer(t, scenarioBurstBetweenTurns)
+	adapter := &CodexAdapter{}
+
+	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
+		WorkspacePath: t.TempDir(),
+		AgentConfig:   domain.AgentConfig{Command: command},
+	})
+	if err != nil {
+		t.Fatalf("StartSession() error = %v", err)
+	}
+	state, ok := session.Internal.(*sessionState)
+	if !ok {
+		t.Fatalf("session.Internal type = %T, want *sessionState", session.Internal)
+	}
+	t.Cleanup(func() { _ = adapter.StopSession(context.Background(), session) })
+
+	result1, err := adapter.RunTurn(context.Background(), session, domain.RunTurnParams{
+		Prompt:  "first",
+		OnEvent: func(domain.AgentEvent) {},
+	})
+	if err != nil {
+		t.Fatalf("RunTurn(1) error = %v", err)
+	}
+	if result1.ExitReason != domain.EventTurnCompleted {
+		t.Fatalf("RunTurn(1) ExitReason = %q, want %q", result1.ExitReason, domain.EventTurnCompleted)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, statErr := os.Stat(markerPath); statErr == nil {
+			break
+		}
 		if time.Now().After(deadline) {
-			t.Fatalf("len(state.msgCh) = %d, want %d within 5s (the reader must be parked delivering the fill)", len(state.msgCh), capacity)
+			t.Fatalf("marker file is absent after 10s, state.waitCh still open = %v", waitChOpen(state))
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	if _, err := fmt.Fprintln(state.stdin, "go"); err != nil {
-		t.Fatalf("write go signal: %v", err)
-	}
-	return state, outcomeCh
-}
-
-// TestRunTurn_BoundedWhenRuntimeExitsWithFullChannel covers properties
-// P1, P2, P3, and P6: a session whose runtime exits while the message
-// channel is full, with the reader parked inside the handler and RunTurn
-// waiting on the turn/start response, returns from RunTurn within a bound
-// derived from the injected drainGrace, names the runtime's exit rather
-// than the transport error text, logs exactly one WARN record naming the
-// bound, and leaves no goroutine of the session running once StopSession
-// completes.
-func TestRunTurn_BoundedWhenRuntimeExitsWithFullChannel(t *testing.T) {
-	// No t.Parallel(): installs a global slog default.
-
-	var buf syncBuffer
-	orig := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(orig) })
-
-	const grace = 300 * time.Millisecond
-	adapter := &CodexAdapter{drainGrace: grace}
-
-	state, outcomeCh := runHandlerParkedFixture(t, adapter)
-
-	// The drain bound starts at the reap, not at the wake-up line: the
-	// stderr drain that precedes the wait is unrelated to the bound and
-	// would otherwise be charged to it, leaving room for a release path
-	// that ignores the bound entirely to still pass.
-	select {
-	case <-state.waitCh:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the runtime was not reaped within 5s, so the drain bound never started")
-	}
-	reaped := time.Now()
+	var events []domain.AgentEvent
+	outcomeCh := make(chan handlerParkedOutcome, 1)
+	go func() {
+		result, runErr := adapter.RunTurn(context.Background(), session, domain.RunTurnParams{
+			Prompt:  "second",
+			OnEvent: collectEvents(&events),
+		})
+		outcomeCh <- handlerParkedOutcome{result: result, err: runErr}
+	}()
 
 	var got handlerParkedOutcome
 	select {
 	case got = <-outcomeCh:
-	case <-time.After(2 * time.Second):
-		t.Fatal("RunTurn did not return within 2s of the reap, want it bounded by the injected drainGrace")
-	}
-	const schedulingMargin = 500 * time.Millisecond
-	if elapsed := time.Since(reaped); elapsed > grace+schedulingMargin {
-		t.Errorf("RunTurn() returned %v after the reap, want within the injected %v drainGrace plus %v of scheduling margin", elapsed, grace, schedulingMargin)
+	case <-time.After(10 * time.Second):
+		t.Fatalf("RunTurn(2) has not returned after 10s, state.waitCh still open = %v", waitChOpen(state))
 	}
 
-	var agentErr *domain.AgentError
-	if !errors.As(got.err, &agentErr) {
-		t.Fatalf("RunTurn() error type = %T, want *domain.AgentError", got.err)
+	if got.err != nil {
+		t.Errorf("RunTurn(2) error = %v, want nil", got.err)
 	}
-	if agentErr.Kind != domain.ErrPortExit {
-		t.Errorf("AgentError.Kind = %q, want %q", agentErr.Kind, domain.ErrPortExit)
+	if got.result.ExitReason != domain.EventTurnCompleted {
+		t.Errorf("RunTurn(2) ExitReason = %q, want %q", got.result.ExitReason, domain.EventTurnCompleted)
 	}
-	if agentErr.Message != outputAbandonedMessage {
-		t.Errorf("AgentError.Message = %q, want %q", agentErr.Message, outputAbandonedMessage)
+	if !waitChOpen(state) {
+		t.Error("state.waitCh is closed, want the runtime still alive and unreaped")
 	}
-
-	const wantWarnMsg = `msg="agent stdout was not fully collected before the session ended"`
-	deadline := time.Now().Add(2 * time.Second)
-	for !strings.Contains(buf.String(), wantWarnMsg) {
-		if time.Now().After(deadline) {
-			t.Fatalf("WARN record with message %q not observed within 2s, log = %s", "agent stdout was not fully collected before the session ended", buf.String())
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-
-	output := buf.String()
-	if n := strings.Count(output, wantWarnMsg); n != 1 {
-		t.Errorf("occurrences of the WARN message = %d, want 1: %s", n, output)
-	}
-	if n := strings.Count(output, "level=WARN"); n != 1 {
-		t.Errorf("level=WARN record count = %d, want 1: %s", n, output)
-	}
-	if !strings.Contains(output, "drain_bound="+grace.String()) {
-		t.Errorf("WARN record missing drain_bound=%s: %s", grace, output)
-	}
-
-	if err := adapter.StopSession(context.Background(), domain.Session{Internal: state}); err != nil {
-		t.Errorf("StopSession() = %v, want nil", err)
-	}
-	select {
-	case <-state.readerDone:
-	default:
-		t.Error("session leak: the connection's reader goroutine is still running after StopSession returned")
+	if n := countOtherMessages(events, "filler/notification"); n != burstCount {
+		t.Errorf("filler notification events = %d, want %d", n, burstCount)
 	}
 }
 
-// TestRunTurn_ControlStaysRunningWithoutDrainBound covers property P4,
-// the control the issue asks for: with drainGrace set longer than this
-// test's own waiting window, the same fixture leaves RunTurn still
-// running when that window elapses, reproducing the pre-fix hang with the
-// injected bound as the only difference from
-// TestRunTurn_BoundedWhenRuntimeExitsWithFullChannel. StopSession then
-// releases the turn so the test strands no goroutine.
-//
-// Not run with t.Parallel(): runHandlerParkedFixture calls t.Setenv.
-func TestRunTurn_ControlStaysRunningWithoutDrainBound(t *testing.T) {
-	adapter := &CodexAdapter{drainGrace: 5 * time.Second}
-	state, outcomeCh := runHandlerParkedFixture(t, adapter)
-
-	select {
-	case got := <-outcomeCh:
-		t.Fatalf("RunTurn returned early with result=%+v err=%v, want it still running because drainGrace exceeds the waiting window", got.result, got.err)
-	case <-time.After(700 * time.Millisecond):
-	}
-
-	if err := adapter.StopSession(context.Background(), domain.Session{Internal: state}); err != nil {
-		t.Errorf("StopSession() = %v, want nil", err)
-	}
-
-	select {
-	case <-outcomeCh:
-	case <-time.After(2 * time.Second):
-		t.Error("RunTurn did not return after StopSession, want it released so this test strands no goroutine")
-	}
-}
-
-// TestStartSession_HandshakeGuardedAgainstFullChannel covers property P7:
-// a runtime that overflows the message channel before thread/start is
-// ever answered, then exits with that call still in flight, fails
-// StartSession within the read-timeout-derived deadline rather than the
-// much longer injected drainGrace. That gap is what proves the failure
-// came from the pre-turn handler's drop-on-full behavior, not from the
-// release path's own bound: a full channel cannot park the reader before
-// beginTurnPhase runs.
-//
-// Not run with t.Parallel(): pins CODEX_API_KEY via t.Setenv.
-func TestStartSession_HandshakeGuardedAgainstFullChannel(t *testing.T) {
-	t.Setenv("CODEX_API_KEY", "")
-
-	command := fakeAppServer(t, scenarioHandshakeOverflow)
-	adapter := &CodexAdapter{drainGrace: 3 * time.Second}
-
-	start := time.Now()
-	_, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
-		WorkspacePath: t.TempDir(),
-		AgentConfig: domain.AgentConfig{
-			Command:       command,
-			ReadTimeoutMS: 200,
+// TestStartSession_HandshakeBurstDoesNotLoseAwaitedNotification drives
+// two fake runtimes, each of which writes burstCount notifications in
+// one write before the notification the handshake waits for: the first
+// answers account/login/start after account/login/completed, with
+// CODEX_API_KEY set; the second answers thread/start after
+// thread/started. Each StartSession must succeed within 2s: the burst
+// must not cost the handshake the notification it is waiting for.
+func TestStartSession_HandshakeBurstDoesNotLoseAwaitedNotification(t *testing.T) {
+	tests := []struct {
+		name     string
+		scenario string
+		apiKey   string
+	}{
+		{
+			name:     "account/login/completed observed despite the burst",
+			scenario: scenarioHandshakeBurstLogin,
+			apiKey:   "test-api-key",
 		},
-	})
-	elapsed := time.Since(start)
+		{
+			name:     "thread/started observed despite the burst",
+			scenario: scenarioHandshakeBurstThread,
+		},
+	}
 
-	requireAgentError(t, err, domain.ErrResponseError)
-	if elapsed > 2*time.Second {
-		t.Errorf("StartSession() took %v, want well under the injected 3s drainGrace (proves the pre-turn drop, not the release path, ended it)", elapsed)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("CODEX_API_KEY", tt.apiKey)
+
+			command := fakeAppServer(t, tt.scenario)
+			adapter := &CodexAdapter{}
+
+			start := time.Now()
+			session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
+				WorkspacePath: t.TempDir(),
+				AgentConfig: domain.AgentConfig{
+					Command:       command,
+					ReadTimeoutMS: 5000,
+				},
+			})
+			elapsed := time.Since(start)
+
+			if err != nil {
+				var agentErr *domain.AgentError
+				if errors.As(err, &agentErr) && agentErr.Kind == domain.ErrResponseError && strings.Contains(agentErr.Message, "account/login/completed") {
+					t.Fatalf("StartSession() lost the awaited notification to the burst and failed authentication: %v", err)
+				}
+				t.Fatalf("StartSession() error = %v, want nil", err)
+			}
+			t.Cleanup(func() { _ = adapter.StopSession(context.Background(), session) })
+
+			if elapsed > 2*time.Second {
+				t.Fatalf("StartSession() took %v past its 2s bound, want the burst to cost it nothing", elapsed)
+			}
+		})
 	}
 }

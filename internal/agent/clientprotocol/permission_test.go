@@ -242,7 +242,7 @@ func TestToolDeliveryReportedOnceThenLatched(t *testing.T) {
 
 	state, outPr, inPw := newTestSession(t, domain.AgentConfig{ReadTimeoutMS: 2000}, clientProtocolMaxLineBytes)
 	out := newOutboundReader(outPr)
-	state.itemCh <- pumpItem{control: &pumpControl{handshake: &handshakeFacts{toolServersDelivered: true}}}
+	state.inbox.Put(pumpItem{control: &pumpControl{handshake: &handshakeFacts{toolServersDelivered: true}}})
 	markSessionKnown(state)
 
 	var events []domain.AgentEvent
@@ -279,7 +279,7 @@ func TestToolDeliveryReportLogsWarnRecord(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	state, outPr, inPw := newTestSessionWithLogger(t, domain.AgentConfig{ReadTimeoutMS: 2000}, clientProtocolMaxLineBytes, logger)
 	out := newOutboundReader(outPr)
-	state.itemCh <- pumpItem{control: &pumpControl{handshake: &handshakeFacts{toolServersDelivered: true}}}
+	state.inbox.Put(pumpItem{control: &pumpControl{handshake: &handshakeFacts{toolServersDelivered: true}}})
 	markSessionKnown(state)
 
 	outcomeCh := runTurnAsync(state, domain.RunTurnParams{Prompt: "do something", OnEvent: func(domain.AgentEvent) {}})
@@ -341,7 +341,7 @@ func TestToolDeliveryReportCoversBothPostureArms(t *testing.T) {
 			logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 			state, outPr, inPw := newTestSessionWithLogger(t, domain.AgentConfig{ReadTimeoutMS: 2000}, clientProtocolMaxLineBytes, logger)
 			out := newOutboundReader(outPr)
-			state.itemCh <- pumpItem{control: &pumpControl{handshake: &handshakeFacts{toolServersDelivered: true}}}
+			state.inbox.Put(pumpItem{control: &pumpControl{handshake: &handshakeFacts{toolServersDelivered: true}}})
 			markSessionKnown(state)
 
 			var events []domain.AgentEvent
@@ -447,7 +447,7 @@ func TestToolDeliveryNoticeOrderAndStemExclusion(t *testing.T) {
 
 		state, outPr, inPw := newTestSession(t, domain.AgentConfig{ReadTimeoutMS: 2000}, clientProtocolMaxLineBytes)
 		out := newOutboundReader(outPr)
-		state.itemCh <- pumpItem{control: &pumpControl{handshake: &handshakeFacts{toolServersDelivered: true}}}
+		state.inbox.Put(pumpItem{control: &pumpControl{handshake: &handshakeFacts{toolServersDelivered: true}}})
 		markSessionKnown(state)
 
 		var events []domain.AgentEvent
@@ -476,7 +476,7 @@ func TestToolDeliveryNoticeOrderAndStemExclusion(t *testing.T) {
 		state, outPr, inPw := newTestSession(t, domain.AgentConfig{}, clientProtocolMaxLineBytes)
 		out := newOutboundReader(outPr)
 		markSessionKnown(state)
-		state.itemCh <- pumpItem{control: &pumpControl{handshake: &handshakeFacts{toolServersDelivered: true}}}
+		state.inbox.Put(pumpItem{control: &pumpControl{handshake: &handshakeFacts{toolServersDelivered: true}}})
 
 		sendLine(t, inPw, permissionRequestLine(`"perm-1"`, `[{"kind":"reject_once","name":"reject","optionId":"reject-id"}]`))
 		out.next(t)

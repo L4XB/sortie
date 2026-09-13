@@ -54,13 +54,13 @@ func newTestSessionWithLogger(t *testing.T, agentConfig domain.AgentConfig, maxL
 	state := &sessionState{
 		agentConfig: agentConfig,
 		caps:        newCapabilityRecord(false),
-		itemCh:      make(chan pumpItem, pumpChannelCapacity),
 		stopCh:      make(chan struct{}),
 		pumpDone:    make(chan struct{}),
 		logger:      logger,
 		origins:     &sessionOrigins{},
 	}
-	state.conn = jsonrpc.NewConn(outPw, inPr, pumpHandler(state.itemCh, state.stopCh),
+	state.inbox = jsonrpc.NewInbox[pumpItem]()
+	state.conn = jsonrpc.NewConn(outPw, inPr, jsonrpc.Deliver(state.inbox, wrapPumpMessage),
 		jsonrpc.WithVersionMember(), jsonrpc.WithMaxLineBytes(maxLineBytes))
 
 	go runPump(state)
@@ -87,7 +87,7 @@ func fakeSession(state *sessionState) domain.Session {
 // p.sessionIDKnown behave as they would in production. Every test in
 // this package that needs a known session ID uses the same one.
 func markSessionKnown(state *sessionState) {
-	state.itemCh <- pumpItem{control: &pumpControl{sessionID: "sess-test"}}
+	state.inbox.Put(pumpItem{control: &pumpControl{sessionID: "sess-test"}})
 }
 
 // collectEvents is an OnEvent callback that appends to a slice under a

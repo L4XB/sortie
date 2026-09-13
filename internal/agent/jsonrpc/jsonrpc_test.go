@@ -52,6 +52,18 @@ type testConn struct {
 	handled chan jsonrpc.Message
 }
 
+// identity returns msg unchanged. It is the wrap every test in this
+// file builds a [jsonrpc.Sink] with, since these tests carry
+// [jsonrpc.Message] values through the inbox with no adaptation.
+func identity(msg jsonrpc.Message) jsonrpc.Message { return msg }
+
+// discardSink returns a [jsonrpc.Sink] backed by an inbox nothing
+// takes from, for a connection whose test never reads a delivered
+// message at all.
+func discardSink() jsonrpc.Sink {
+	return jsonrpc.Deliver(jsonrpc.NewInbox[jsonrpc.Message](), identity)
+}
+
 func newTestConn(t *testing.T, opts ...jsonrpc.Option) *testConn {
 	t.Helper()
 
@@ -65,8 +77,30 @@ func newTestConn(t *testing.T, opts ...jsonrpc.Option) *testConn {
 	})
 
 	tc := &testConn{reqR: reqR, peerW: peerW, handled: make(chan jsonrpc.Message, 16)}
-	tc.conn = jsonrpc.NewConn(reqW, peerR, func(msg jsonrpc.Message) { tc.handled <- msg }, opts...)
+	inbox := jsonrpc.NewInbox[jsonrpc.Message]()
+	tc.conn = jsonrpc.NewConn(reqW, peerR, jsonrpc.Deliver(inbox, identity), opts...)
+	t.Cleanup(tc.conn.Close)
+	go func() {
+		<-tc.conn.Done()
+		inbox.Close()
+	}()
+	go relayInbox(inbox, tc.handled)
 	return tc
+}
+
+// relayInbox takes every item inbox ever delivers and forwards it to
+// ch, so a test can keep reading a plain channel at each of its many
+// call sites while the connection itself delivers through the inbox.
+// It returns once inbox closes and every queued item has been taken.
+func relayInbox(inbox *jsonrpc.Inbox[jsonrpc.Message], ch chan<- jsonrpc.Message) {
+	for {
+		<-inbox.Ready()
+		msg, ok := inbox.Take()
+		if !ok {
+			return
+		}
+		ch <- msg
+	}
 }
 
 // startCall launches Call on its own goroutine, since Call blocks
@@ -122,7 +156,7 @@ func extractID(t *testing.T, line []byte) int64 {
 // TestConn_RoutesEveryNonMatchingMessageWhileCallInFlight checks that a
 // notification, an unmatched response, a malformed line, and a
 // server-initiated request that arrive while a Call is in flight each
-// reach the handler in order and with the right classification, and
+// reach the sink in order and with the right classification, and
 // the Call still receives its own response.
 func TestConn_RoutesEveryNonMatchingMessageWhileCallInFlight(t *testing.T) {
 	t.Parallel()
@@ -147,16 +181,16 @@ func TestConn_RoutesEveryNonMatchingMessageWhileCallInFlight(t *testing.T) {
 		select {
 		case msg := <-tc.handled:
 			if msg.Kind != want {
-				t.Errorf("handler message %d Kind = %v, want %v", i, msg.Kind, want)
+				t.Errorf("delivered message %d Kind = %v, want %v", i, msg.Kind, want)
 			}
 			if want == jsonrpc.KindMalformed && msg.Err == nil {
-				t.Errorf("handler message %d Err = nil, want non-nil", i)
+				t.Errorf("delivered message %d Err = nil, want non-nil", i)
 			}
 			if want == jsonrpc.KindRequest && !msg.ID.Equal(jsonrpc.NumberID(7)) {
-				t.Errorf("handler message %d ID = %s, want %s", i, msg.ID, jsonrpc.NumberID(7))
+				t.Errorf("delivered message %d ID = %s, want %s", i, msg.ID, jsonrpc.NumberID(7))
 			}
 		case <-time.After(2 * time.Second):
-			t.Fatalf("timed out waiting for handler message %d (Kind %v)", i, want)
+			t.Fatalf("timed out waiting for delivered message %d (Kind %v)", i, want)
 		}
 	}
 
@@ -174,16 +208,16 @@ func TestConn_RoutesEveryNonMatchingMessageWhileCallInFlight(t *testing.T) {
 
 	select {
 	case msg := <-tc.handled:
-		t.Errorf("handler received an unexpected extra message: %+v", msg)
+		t.Errorf("sink received an unexpected extra message: %+v", msg)
 	default:
 	}
 }
 
-// TestConn_NotificationBeforeAnyCallReachesHandler checks that a
+// TestConn_NotificationBeforeAnyCallReachesSink checks that a
 // notification delivered before any Call has been issued still
-// reaches the handler. No Call is ever issued in this test, so a
-// router keying on "a call is in flight" would fail it.
-func TestConn_NotificationBeforeAnyCallReachesHandler(t *testing.T) {
+// reaches the sink. No Call is ever issued in this test, so a router
+// keying on "a call is in flight" would fail it.
+func TestConn_NotificationBeforeAnyCallReachesSink(t *testing.T) {
 	t.Parallel()
 
 	tc := newTestConn(t)
@@ -193,13 +227,13 @@ func TestConn_NotificationBeforeAnyCallReachesHandler(t *testing.T) {
 	select {
 	case msg := <-tc.handled:
 		if msg.Kind != jsonrpc.KindNotification {
-			t.Errorf("handler message Kind = %v, want %v", msg.Kind, jsonrpc.KindNotification)
+			t.Errorf("delivered message Kind = %v, want %v", msg.Kind, jsonrpc.KindNotification)
 		}
 		if msg.Method != "thread/started" {
-			t.Errorf("handler message Method = %q, want %q", msg.Method, "thread/started")
+			t.Errorf("delivered message Method = %q, want %q", msg.Method, "thread/started")
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("handler did not receive a notification delivered before any call")
+		t.Fatal("sink did not receive a notification delivered before any call")
 	}
 }
 
@@ -311,10 +345,10 @@ func TestConn_OverLongLineFailsRead(t *testing.T) {
 	select {
 	case msg := <-tc.handled:
 		if msg.Kind != jsonrpc.KindStreamEnd {
-			t.Errorf("handler message Kind = %v, want %v", msg.Kind, jsonrpc.KindStreamEnd)
+			t.Errorf("delivered message Kind = %v, want %v", msg.Kind, jsonrpc.KindStreamEnd)
 		}
 		if !errors.Is(msg.Err, bufio.ErrTooLong) {
-			t.Errorf("handler message Err = %v, want error wrapping bufio.ErrTooLong", msg.Err)
+			t.Errorf("delivered message Err = %v, want error wrapping bufio.ErrTooLong", msg.Err)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for KindStreamEnd on an over-long line")
@@ -342,12 +376,16 @@ func TestConn_RespondError_WritesExactBytes(t *testing.T) {
 	t.Parallel()
 
 	var w captureWriter
-	conn := jsonrpc.NewConn(&w, strings.NewReader(""), func(jsonrpc.Message) {})
+	conn := jsonrpc.NewConn(&w, strings.NewReader(""), discardSink())
+	t.Cleanup(conn.Close)
 
 	err := conn.RespondError(jsonrpc.NumberID(7), -32001, "sortie refuses requests that only a person could answer")
 
 	if err != nil {
 		t.Fatalf("RespondError(7, -32001, ...) error = %v", err)
+	}
+	if err := conn.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush() error = %v", err)
 	}
 	const want = `{"id":7,"error":{"code":-32001,"message":"sortie refuses requests that only a person could answer"}}` + "\n"
 	got := w.String()
@@ -374,7 +412,8 @@ func TestConn_ConcurrentCallsGetUniqueIDsAndCompleteLines(t *testing.T) {
 		_ = peerR.Close()
 		_ = peerW.Close()
 	})
-	conn := jsonrpc.NewConn(reqW, peerR, func(jsonrpc.Message) {})
+	conn := jsonrpc.NewConn(reqW, peerR, discardSink())
+	t.Cleanup(conn.Close)
 
 	var (
 		peerMu    sync.Mutex
@@ -474,7 +513,7 @@ func TestConn_DoneClosesAfterCloseAndReaderClose(t *testing.T) {
 		_ = pr.Close()
 		_ = pw.Close()
 	})
-	conn := jsonrpc.NewConn(io.Discard, pr, func(jsonrpc.Message) {})
+	conn := jsonrpc.NewConn(io.Discard, pr, discardSink())
 
 	conn.Close()
 	if err := pr.Close(); err != nil {
@@ -533,10 +572,14 @@ func TestConn_VersionMember(t *testing.T) {
 			if tt.withVersion {
 				opts = append(opts, jsonrpc.WithVersionMember())
 			}
-			conn := jsonrpc.NewConn(&w, strings.NewReader(""), func(jsonrpc.Message) {}, opts...)
+			conn := jsonrpc.NewConn(&w, strings.NewReader(""), discardSink(), opts...)
+			t.Cleanup(conn.Close)
 
 			if err := tt.write(conn); err != nil {
 				t.Fatalf("%s: %v", tt.name, err)
+			}
+			if err := conn.Flush(context.Background()); err != nil {
+				t.Fatalf("Flush() error = %v", err)
 			}
 
 			got := w.String()
@@ -572,7 +615,7 @@ func TestConn_MaxLineBytesOptionIsPerConnection(t *testing.T) {
 		select {
 		case msg := <-tc.handled:
 			if msg.Kind != jsonrpc.KindNotification {
-				t.Errorf("handler message Kind = %v, want %v", msg.Kind, jsonrpc.KindNotification)
+				t.Errorf("delivered message Kind = %v, want %v", msg.Kind, jsonrpc.KindNotification)
 			}
 		case <-time.After(2 * time.Second):
 			t.Fatal("timed out waiting for a line within the default MaxLineBytes")
@@ -596,10 +639,10 @@ func TestConn_MaxLineBytesOptionIsPerConnection(t *testing.T) {
 		select {
 		case msg := <-tc.handled:
 			if msg.Kind != jsonrpc.KindStreamEnd {
-				t.Errorf("handler message Kind = %v, want %v", msg.Kind, jsonrpc.KindStreamEnd)
+				t.Errorf("delivered message Kind = %v, want %v", msg.Kind, jsonrpc.KindStreamEnd)
 			}
 			if !errors.Is(msg.Err, bufio.ErrTooLong) {
-				t.Errorf("handler message Err = %v, want error wrapping bufio.ErrTooLong", msg.Err)
+				t.Errorf("delivered message Err = %v, want error wrapping bufio.ErrTooLong", msg.Err)
 			}
 		case <-time.After(2 * time.Second):
 			t.Fatal("timed out waiting for KindStreamEnd on a line over the custom bound")
@@ -607,13 +650,13 @@ func TestConn_MaxLineBytesOptionIsPerConnection(t *testing.T) {
 	})
 }
 
-// TestConn_UnmatchedStringIDResponseReachesHandler checks that a
-// response whose id is a JSON string reaches the handler as an
-// unmatched KindResponse: the connection's pending-call table is
-// keyed on the numeric ids it allocates itself, so a string id never
-// matches an entry and the reader routes it to the handler instead of
-// silently dropping it.
-func TestConn_UnmatchedStringIDResponseReachesHandler(t *testing.T) {
+// TestConn_UnmatchedStringIDResponseReachesSink checks that a
+// response whose id is a JSON string reaches the sink as an unmatched
+// KindResponse: the connection's pending-call table is keyed on the
+// numeric ids it allocates itself, so a string id never matches an
+// entry and the reader delivers it into the sink instead of silently
+// dropping it.
+func TestConn_UnmatchedStringIDResponseReachesSink(t *testing.T) {
 	t.Parallel()
 
 	tc := newTestConn(t)
@@ -623,13 +666,13 @@ func TestConn_UnmatchedStringIDResponseReachesHandler(t *testing.T) {
 	select {
 	case msg := <-tc.handled:
 		if msg.Kind != jsonrpc.KindResponse {
-			t.Errorf("handler message Kind = %v, want %v", msg.Kind, jsonrpc.KindResponse)
+			t.Errorf("delivered message Kind = %v, want %v", msg.Kind, jsonrpc.KindResponse)
 		}
 		if _, isNumber := msg.ID.Number(); isNumber {
-			t.Error("handler message ID.Number() reported a number, want a non-numeric id")
+			t.Error("delivered message ID.Number() reported a number, want a non-numeric id")
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for the handler to receive the unmatched string-id response")
+		t.Fatal("timed out waiting for the sink to receive the unmatched string-id response")
 	}
 }
 
@@ -654,11 +697,14 @@ func TestConn_RespondRejectsIDsThatNameNoRequest(t *testing.T) {
 		t.Parallel()
 
 		var w bytes.Buffer
-		conn := jsonrpc.NewConn(&w, strings.NewReader(""), func(jsonrpc.Message) {})
+		conn := jsonrpc.NewConn(&w, strings.NewReader(""), discardSink())
 		t.Cleanup(conn.Close)
 
 		if err := conn.Respond(jsonrpc.NullID(), map[string]any{"ok": true}); err != nil {
 			t.Fatalf("Respond(NullID(), ...) error = %v", err)
+		}
+		if err := conn.Flush(context.Background()); err != nil {
+			t.Fatalf("Flush() error = %v", err)
 		}
 		const want = `{"id":null,"result":{"ok":true}}` + "\n"
 		if got := w.String(); got != want {
@@ -679,11 +725,14 @@ func TestConn_RespondRejectsIDsThatNameNoRequest(t *testing.T) {
 		t.Parallel()
 
 		var w bytes.Buffer
-		conn := jsonrpc.NewConn(&w, strings.NewReader(""), func(jsonrpc.Message) {})
+		conn := jsonrpc.NewConn(&w, strings.NewReader(""), discardSink())
 		t.Cleanup(conn.Close)
 
 		if err := conn.RespondError(jsonrpc.NullID(), -32700, "parse error"); err != nil {
 			t.Fatalf("RespondError(NullID(), ...) error = %v", err)
+		}
+		if err := conn.Flush(context.Background()); err != nil {
+			t.Fatalf("Flush() error = %v", err)
 		}
 		const want = `{"id":null,"error":{"code":-32700,"message":"parse error"}}` + "\n"
 		if got := w.String(); got != want {
@@ -727,12 +776,12 @@ func TestConn_ReadsALineLargerThanTheInitialBuffer(t *testing.T) {
 		case msg := <-tc.handled:
 			assertBigNotification(t, msg)
 		case <-time.After(5 * time.Second):
-			t.Fatal("no message reached the handler for a line above the initial buffer")
+			t.Fatal("no message reached the sink for a line above the initial buffer")
 		}
 	case msg := <-tc.handled:
 		assertBigNotification(t, msg)
 	case <-time.After(5 * time.Second):
-		t.Fatal("no message reached the handler for a line above the initial buffer")
+		t.Fatal("no message reached the sink for a line above the initial buffer")
 	}
 }
 
@@ -756,15 +805,32 @@ func TestNewConn_SkipsNilOptions(t *testing.T) {
 	t.Parallel()
 
 	var w bytes.Buffer
-	conn := jsonrpc.NewConn(&w, strings.NewReader(""), func(jsonrpc.Message) {}, nil, jsonrpc.WithVersionMember(), nil)
+	conn := jsonrpc.NewConn(&w, strings.NewReader(""), discardSink(), nil, jsonrpc.WithVersionMember(), nil)
 	t.Cleanup(conn.Close)
 
 	if err := conn.Notify("ping", nil); err != nil {
 		t.Fatalf("Notify() error = %v", err)
 	}
+	if err := conn.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
 	if got := w.String(); !strings.Contains(got, `"jsonrpc":"2.0"`) {
 		t.Errorf("Notify() wrote %q, want the version member the non-nil option asked for", got)
 	}
+}
+
+// TestNewConn_PanicsOnNilSink checks that a nil sink panics inside the
+// constructor rather than surfacing as a nil-pointer dereference the
+// first time the reader tries to deliver into it.
+func TestNewConn_PanicsOnNilSink(t *testing.T) {
+	t.Parallel()
+
+	defer func() {
+		if recover() == nil {
+			t.Fatal("NewConn(sink=nil) did not panic, want panic")
+		}
+	}()
+	jsonrpc.NewConn(io.Discard, strings.NewReader(""), nil)
 }
 
 // entrySignalingWriter wraps an io.Writer and closes done the instant
@@ -795,7 +861,7 @@ func TestConn_CloseReturnsWithWriteParked(t *testing.T) {
 
 	pr, pw := io.Pipe()
 	sig := newEntrySignalingWriter(pw)
-	conn := jsonrpc.NewConn(sig, strings.NewReader(""), func(jsonrpc.Message) {})
+	conn := jsonrpc.NewConn(sig, strings.NewReader(""), discardSink())
 
 	writeErr := make(chan error, 1)
 	go func() {
@@ -839,7 +905,7 @@ func TestConn_WriteAfterCloseReportsErrClosedWithoutTouchingWriter(t *testing.T)
 	t.Parallel()
 
 	var w captureWriter
-	conn := jsonrpc.NewConn(&w, strings.NewReader(""), func(jsonrpc.Message) {})
+	conn := jsonrpc.NewConn(&w, strings.NewReader(""), discardSink())
 	conn.Close()
 
 	if err := conn.Notify("after/close", nil); !errors.Is(err, jsonrpc.ErrClosed) {

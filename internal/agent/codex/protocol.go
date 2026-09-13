@@ -11,6 +11,7 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/agent/jsonrpc"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/logging"
 )
 
 // initializeHandshake sends the initialize request and initialized
@@ -40,7 +41,9 @@ func initializeHandshake(ctx context.Context, state *sessionState) error {
 		},
 	}
 
-	resp, err := state.conn.Call(ctx, "initialize", params)
+	callCtx, cancel := context.WithTimeout(ctx, readTimeout(state))
+	defer cancel()
+	resp, err := state.conn.Call(callCtx, "initialize", params)
 	if err != nil {
 		return fmt.Errorf("initialize: %w", err)
 	}
@@ -55,9 +58,13 @@ func initializeHandshake(ctx context.Context, state *sessionState) error {
 }
 
 // authenticateIfNeeded checks the app-server auth state and performs
-// API key login if needed.
-func authenticateIfNeeded(ctx context.Context, state *sessionState) error {
-	resp, err := state.conn.Call(ctx, "account/read", map[string]any{"refreshToken": false})
+// API key login if needed. logger reports a message observed while
+// waiting for the login to complete; the thread id is not yet known at
+// this point in the handshake, so logger carries no session scope.
+func authenticateIfNeeded(ctx context.Context, state *sessionState, logger *slog.Logger) error {
+	readCtx, cancel := context.WithTimeout(ctx, readTimeout(state))
+	defer cancel()
+	resp, err := state.conn.Call(readCtx, "account/read", map[string]any{"refreshToken": false})
 	if err != nil {
 		return fmt.Errorf("account/read: %w", err)
 	}
@@ -82,10 +89,12 @@ func authenticateIfNeeded(ctx context.Context, state *sessionState) error {
 		return nil
 	}
 
-	loginResp, err := state.conn.Call(ctx, "account/login/start", map[string]any{
+	loginCtx, loginCancel := context.WithTimeout(ctx, readTimeout(state))
+	loginResp, err := state.conn.Call(loginCtx, "account/login/start", map[string]any{
 		"type":   "apiKey",
 		"apiKey": apiKey,
 	})
+	loginCancel()
 	if err != nil {
 		return fmt.Errorf("account/login/start: %w", err)
 	}
@@ -104,7 +113,8 @@ func authenticateIfNeeded(ctx context.Context, state *sessionState) error {
 			return ctx.Err()
 		case <-deadline:
 			return fmt.Errorf("timeout waiting for account/login/completed")
-		case msg, ok := <-state.msgCh:
+		case <-state.inbox.Ready():
+			msg, ok := state.inbox.Take()
 			if !ok {
 				return fmt.Errorf("unexpected EOF waiting for login")
 			}
@@ -127,6 +137,7 @@ func authenticateIfNeeded(ctx context.Context, state *sessionState) error {
 				}
 				return nil
 			}
+			handleOutOfTurnMessage(state, msg, logger)
 		}
 	}
 }
@@ -134,8 +145,10 @@ func authenticateIfNeeded(ctx context.Context, state *sessionState) error {
 // startThread sends thread/start and waits for the thread/started
 // notification. Returns the thread ID and the effective model the
 // response reported, empty when the response omitted it. An empty
-// model is never an error.
-func startThread(ctx context.Context, state *sessionState, pt passthroughConfig) (threadID string, model string, err error) {
+// model is never an error. logger reports a message observed while
+// waiting for that notification, scoped to the thread id this call
+// resolves.
+func startThread(ctx context.Context, state *sessionState, pt passthroughConfig, logger *slog.Logger) (threadID string, model string, err error) {
 	approvalPolicy := pt.ApprovalPolicy
 	if approvalPolicy == "" {
 		approvalPolicy = "never"
@@ -158,7 +171,9 @@ func startThread(ctx context.Context, state *sessionState, pt passthroughConfig)
 		params["personality"] = pt.Personality
 	}
 
-	resp, callErr := state.conn.Call(ctx, "thread/start", params)
+	callCtx, cancel := context.WithTimeout(ctx, readTimeout(state))
+	resp, callErr := state.conn.Call(callCtx, "thread/start", params)
+	cancel()
 	if callErr != nil {
 		return "", "", fmt.Errorf("thread/start: %w", callErr)
 	}
@@ -174,6 +189,7 @@ func startThread(ctx context.Context, state *sessionState, pt passthroughConfig)
 	if threadID == "" {
 		return "", "", fmt.Errorf("thread/start returned empty thread ID")
 	}
+	threadLogger := logging.WithSession(logger, threadID)
 
 	// Wait for thread/started notification.
 	deadline := time.After(readTimeout(state))
@@ -185,12 +201,13 @@ func startThread(ctx context.Context, state *sessionState, pt passthroughConfig)
 			// Accept the thread ID even without the notification.
 			// Some app-server versions may not emit it.
 			return threadID, result.Model, nil
-		case msg, ok := <-state.msgCh:
+		case <-state.inbox.Ready():
+			msg, ok := state.inbox.Take()
 			if !ok {
 				return threadID, result.Model, nil
 			}
 			if msg.Kind == jsonrpc.KindStreamEnd {
-				slog.Debug("scanner error waiting for thread/started", slog.Any("error", msg.Err))
+				threadLogger.Debug("scanner error waiting for thread/started", slog.Any("error", msg.Err))
 				return threadID, result.Model, nil
 			}
 			if msg.Kind == jsonrpc.KindMalformed {
@@ -199,6 +216,7 @@ func startThread(ctx context.Context, state *sessionState, pt passthroughConfig)
 			if msg.Kind == jsonrpc.KindNotification && msg.Method == "thread/started" {
 				return threadID, result.Model, nil
 			}
+			handleOutOfTurnMessage(state, msg, threadLogger)
 		}
 	}
 }
@@ -208,7 +226,9 @@ func startThread(ctx context.Context, state *sessionState, pt passthroughConfig)
 // fails to unmarshal does not turn a successful resume into a
 // failure: it returns an empty model and a nil error.
 func resumeThread(ctx context.Context, state *sessionState, threadID string) (model string, err error) {
-	resp, callErr := state.conn.Call(ctx, "thread/resume", map[string]any{
+	callCtx, cancel := context.WithTimeout(ctx, readTimeout(state))
+	defer cancel()
+	resp, callErr := state.conn.Call(callCtx, "thread/resume", map[string]any{
 		"threadId": threadID,
 	})
 	if callErr != nil {

@@ -36,13 +36,6 @@ const pinnedProtocolVersion = 1
 // agent.read_timeout_ms is not set.
 const defaultReadTimeout = 30 * time.Second
 
-// pumpChannelCapacity bounds the pump's single input channel. The
-// registered handler's send blocks past this capacity by design: the
-// pump drains it continuously, and the bound only keeps an ordinary
-// burst of updates from serializing one at a time through the
-// scheduler.
-const pumpChannelCapacity = 64
-
 // sessionState is this adapter's own session state, reached through
 // domain.Session.Internal. Fields set once during StartSession, before
 // the pump starts, are read-only afterward from every other goroutine;
@@ -70,7 +63,11 @@ type sessionState struct {
 	stderrCollector *procutil.StderrCollector
 	waitCh          <-chan struct{} // closed once the subprocess has been reaped
 
-	itemCh   chan pumpItem
+	// inbox is where the connection's reader delivers routed messages
+	// and every control publish lands, in one order. runPump is its
+	// only taker; the inbox is never closed, so the pump keeps taking
+	// late controls until stopCh closes.
+	inbox    *jsonrpc.Inbox[pumpItem]
 	stopCh   chan struct{}
 	stopOnce sync.Once
 	pumpDone chan struct{}
@@ -89,8 +86,8 @@ type sessionState struct {
 	origins *sessionOrigins
 }
 
-// pumpItem is either a message routed from the connection's handler or
-// a control message published by StartSession, RunTurn, or teardown.
+// pumpItem is either a message the connection's reader delivered or a
+// control message published by StartSession, RunTurn, or teardown.
 // Exactly one field is set.
 type pumpItem struct {
 	msg     *jsonrpc.Message
@@ -115,8 +112,11 @@ type pumpControl struct {
 	// [replayQuery].
 	query *replayQuery
 
-	startTurn  *turnStart
-	answerOpen bool
+	startTurn *turnStart
+
+	// answerOpen, when non-nil, tells the pump to answer every request
+	// still open; the pump closes it once handleAnswerOpen returns.
+	answerOpen chan struct{}
 }
 
 // replayQuery is the control message a session/load or session/resume
@@ -210,12 +210,12 @@ func startSession(ctx context.Context, origins *sessionOrigins, params domain.St
 	state := &sessionState{
 		target:      target,
 		agentConfig: params.AgentConfig,
-		itemCh:      make(chan pumpItem, pumpChannelCapacity),
 		stopCh:      make(chan struct{}),
 		pumpDone:    make(chan struct{}),
 		logger:      slog.Default().With(slog.String("component", "clientprotocol-adapter")),
 		origins:     origins,
 	}
+	state.inbox = jsonrpc.NewInbox[pumpItem]()
 
 	var cmd *exec.Cmd
 	if remote {
@@ -266,7 +266,7 @@ func startSession(ctx context.Context, origins *sessionOrigins, params domain.St
 	state.pipes = pipes
 	state.stderrCollector = procutil.NewStderrCollector(pipes.Stderr, state.logger)
 
-	state.conn = jsonrpc.NewConn(stdinPipe, pipes.Stdout, pumpHandler(state.itemCh, state.stopCh),
+	state.conn = jsonrpc.NewConn(stdinPipe, pipes.Stdout, jsonrpc.Deliver(state.inbox, wrapPumpMessage),
 		jsonrpc.WithVersionMember(), jsonrpc.WithMaxLineBytes(clientProtocolMaxLineBytes))
 
 	// The reap runs independently of the connection's reader: the pipes
@@ -332,8 +332,8 @@ func startSession(ctx context.Context, origins *sessionOrigins, params domain.St
 		facts.agentInfoPresent = true
 	}
 
-	state.itemCh <- pumpItem{control: &pumpControl{handshake: facts}}
-	state.itemCh <- pumpItem{control: &pumpControl{sessionID: sessionID}}
+	state.inbox.Put(pumpItem{control: &pumpControl{handshake: facts}})
+	state.inbox.Put(pumpItem{control: &pumpControl{sessionID: sessionID}})
 
 	return domain.Session{
 		ID:       sessionID,
@@ -342,19 +342,11 @@ func startSession(ctx context.Context, origins *sessionOrigins, params domain.St
 	}, nil
 }
 
-// pumpHandler returns the jsonrpc.Handler registered on the connection.
-// It does nothing but hand the message to the pump, with a two-arm
-// select against the session's stop channel, so that teardown cannot
-// leave the connection's reader goroutine blocked handing off a message
-// the pump will never drain.
-func pumpHandler(itemCh chan pumpItem, stopCh chan struct{}) jsonrpc.Handler {
-	return func(msg jsonrpc.Message) {
-		m := msg
-		select {
-		case itemCh <- pumpItem{msg: &m}:
-		case <-stopCh:
-		}
-	}
+// wrapPumpMessage wraps msg, over its own copy, as the pump item the
+// connection's reader delivers into the inbox.
+func wrapPumpMessage(msg jsonrpc.Message) pumpItem {
+	m := msg
+	return pumpItem{msg: &m}
 }
 
 // doInitialize sends the initialize request and validates the pinned
@@ -473,22 +465,7 @@ func runTurn(ctx context.Context, session domain.Session, params domain.RunTurnP
 		reply:    make(chan turnVerdict, 1),
 	}
 
-	sendTimer := time.NewTimer(readTimeout(state))
-	select {
-	case state.itemCh <- pumpItem{control: &pumpControl{startTurn: ts}}:
-		sendTimer.Stop()
-	case <-ctx.Done():
-		sendTimer.Stop()
-		close(ts.done)
-		return domain.TurnResult{}, ctx.Err()
-	case <-sendTimer.C:
-		close(ts.done)
-		return domain.TurnResult{}, &domain.AgentError{
-			Kind:    domain.ErrResponseTimeout,
-			Message: "timed out publishing the turn to the agent connection",
-			Err:     context.DeadlineExceeded,
-		}
-	}
+	state.inbox.Put(pumpItem{control: &pumpControl{startTurn: ts}})
 
 	replyTimer := time.NewTimer(readTimeout(state))
 	var verdict turnVerdict
@@ -551,16 +528,10 @@ type closeCallOutcome struct {
 // on graceCtx. It does nothing when no identifier was recorded or the
 // connection is already gone.
 //
-// The call runs on a goroutine the step never joins beyond its own
-// bound: a write already parked on a full standard-input pipe holds
-// the connection's write mutex across the write itself, where no
-// context can reach it, and closing the connection does not release
-// such a write either. The goroutine reads only the connection and the
-// identifier hoisted into its closure, never state, and reports
-// through a buffered channel whose send never blocks. A goroutine
-// still parked on that write is released by close_stdin, which closes
-// the pipe the write is blocked on; the process-group termination
-// later in the order is the backstop if it is not.
+// The call itself enqueues and waits under callCtx: nothing about a
+// runtime that has stopped reading its standard input can hold this
+// step past its own bound, so it runs directly on teardown's goroutine
+// rather than needing one of its own to bound.
 func closeSession(callerCtx, graceCtx context.Context, grace time.Duration) func(state *sessionState) {
 	return func(state *sessionState) {
 		if state.closeSessionID == "" || state.conn == nil {
@@ -581,23 +552,8 @@ func closeSession(callerCtx, graceCtx context.Context, grace time.Duration) func
 		callCtx, cancel := context.WithTimeout(graceCtx, bound)
 		defer cancel()
 
-		outcomeCh := make(chan closeCallOutcome, 1)
-		go func() {
-			resp, err := conn.Call(callCtx, methodSessionClose, closeSessionRequest{SessionID: sessionId(id)})
-			outcomeCh <- closeCallOutcome{resp: resp, err: err}
-		}()
-
-		select {
-		case got := <-outcomeCh:
-			logCloseSessionOutcome(state, got)
-		case <-callCtx.Done():
-			select {
-			case got := <-outcomeCh:
-				logCloseSessionOutcome(state, got)
-			default:
-				logCloseSessionDeadline(state, callerCtx, bound)
-			}
-		}
+		resp, err := conn.Call(callCtx, methodSessionClose, closeSessionRequest{SessionID: sessionId(id)})
+		logCloseSessionOutcome(state, callerCtx, bound, closeCallOutcome{resp: resp, err: err})
 	}
 }
 
@@ -605,11 +561,23 @@ func closeSession(callerCtx, graceCtx context.Context, grace time.Duration) func
 // response with no error member logs at Debug with no fields; a
 // response carrying a JSON-RPC error logs at Warn with the numeric
 // code only, never the peer's message text, matching
-// logContinuationFailure's own precedent; any other call failure
-// (closed connection, stream end, write failure) logs at Debug with no
-// fields, because the process is already going away.
-func logCloseSessionOutcome(state *sessionState, got closeCallOutcome) {
+// logContinuationFailure's own precedent. A call that did not complete
+// because callCtx ended logs at Warn, naming bound and whether it was
+// the step's own bound or callerCtx's own deadline that ended the wait;
+// any other call failure (a closed connection, a stream end, or a
+// write failure) logs at Debug with no fields, because the process is
+// already going away.
+func logCloseSessionOutcome(state *sessionState, callerCtx context.Context, bound time.Duration, got closeCallOutcome) {
 	if got.err != nil {
+		if errors.Is(got.err, context.DeadlineExceeded) || errors.Is(got.err, context.Canceled) {
+			outcome := "bound elapsed"
+			if callerCtx.Err() != nil {
+				outcome = "caller deadline"
+			}
+			state.logger.Warn("session/close did not complete before the wait ended",
+				slog.Duration("bound", bound), slog.String("outcome", outcome))
+			return
+		}
 		state.logger.Debug("session/close call did not complete")
 		return
 	}
@@ -618,19 +586,6 @@ func logCloseSessionOutcome(state *sessionState, got closeCallOutcome) {
 		return
 	}
 	state.logger.Debug("session closed through the protocol")
-}
-
-// logCloseSessionDeadline logs the case where bound elapsed with no
-// outcome observed, distinguishing the step's own bound from
-// callerCtx's own deadline so the record names which one actually
-// ended the wait.
-func logCloseSessionDeadline(state *sessionState, callerCtx context.Context, bound time.Duration) {
-	outcome := "bound elapsed"
-	if callerCtx.Err() != nil {
-		outcome = "caller deadline"
-	}
-	state.logger.Warn("session/close did not complete before the wait ended",
-		slog.Duration("bound", bound), slog.String("outcome", outcome))
 }
 
 // stopSession runs teardown's fixed step order.
@@ -676,24 +631,24 @@ type teardownStep struct {
 // still runs unconditionally after that wait, whatever it observed: it
 // is the backstop for a descendant that escaped the direct child or a
 // runtime that ignored every signal, and it is a no-op against a group
-// that has already exited. Closing standard input ahead of the wait
-// also releases a pump write parked on that pipe, so the agent is never
-// left blocked on us during the graceful phase. The remaining steps are
-// unchanged: close_stdout releases the connection's parked read only
-// after the wait, close_connection and stop_pump follow, and
+// that has already exited. The remaining steps are unchanged:
+// close_stdout releases the connection's parked read only after the
+// wait, close_connection and stop_pump follow, and
 // drain_stderr_and_reap collects diagnostics and reaps. close_pipes runs
-// last: the pipes are caller-owned now, so close_stdout alone no longer
-// fully releases them, and closing the standard-error end has to wait
+// last: the pipes are caller-owned, so close_stdout alone does not
+// fully release them, and closing the standard-error end has to wait
 // until drain_stderr_and_reap has drained or abandoned that collector.
 //
-// A residual: an agent parked on a permission request the pump has not
-// yet answered may not reach its exit path, because close_stdin runs
-// before the pump's answer would be written. Closing that gap needs a
-// synchronization point between teardown and the pump that this order
-// does not add.
+// answer_open itself waits for the pump to answer every request it had
+// open and for the connection to flush those answers, so they reach
+// the agent before close_session's own call and before close_stdin
+// ends its standard input. The flush half shares grace with
+// close_session exactly as close_session shares it with await_exit,
+// so an agent that never reads a queued answer cannot let this step
+// alone consume the graceful window.
 func defaultTeardownOrder(callerCtx, graceCtx context.Context, grace time.Duration) []teardownStep {
 	return []teardownStep{
-		{name: "answer_open", run: signalAnswerOpen},
+		{name: "answer_open", run: awaitAnswerOpen(graceCtx, grace)},
 		{name: "close_session", run: closeSession(callerCtx, graceCtx, grace)},
 		{name: "signal_graceful", run: signalGraceful},
 		{name: "close_stdin", run: closeStdin},
@@ -714,17 +669,58 @@ func runTeardown(state *sessionState, steps []teardownStep) {
 	}
 }
 
-// signalAnswerOpen sends the answerOpen control message with a send
-// that gives up when the channel has no room, and does not wait for the
-// pump to write the reply.
-func signalAnswerOpen(state *sessionState) {
-	if state.itemCh == nil {
-		return
+// signalAnswerOpen puts the answerOpen control message and returns the
+// channel the pump closes once it has answered every request it had
+// open, or nil when there is no inbox to put it on. The put never
+// waits, and this does not wait for the pump to write the reply; a
+// caller that needs to wait for that uses [awaitAnswerOpen] instead.
+func signalAnswerOpen(state *sessionState) chan struct{} {
+	if state.inbox == nil {
+		return nil
 	}
-	select {
-	case state.itemCh <- pumpItem{control: &pumpControl{answerOpen: true}}:
-	default:
-		state.logger.Warn("teardown could not signal the pump to answer any open request: its input channel had no room")
+	done := make(chan struct{})
+	state.inbox.Put(pumpItem{control: &pumpControl{answerOpen: done}})
+	return done
+}
+
+// awaitAnswerOpen returns the answer_open teardown step: it puts the
+// answerOpen control message, then waits, under one bound, both for the
+// pump to finish answering every request it had open and for the
+// connection's writer to flush those answers onto the wire. This is
+// what lets close_session's own call and close_stdin's end of standard
+// input follow only once the answers already reached the agent.
+//
+// The bound shares grace with close_session the same way close_session
+// and await_exit already share it: half of whatever remains on
+// graceCtx, so an agent that never reads a queued answer cannot let
+// this step consume the whole graceful window on its own and starve
+// the signal, the close, and the wait that follow. A pump that does not
+// finish answering in time, or a connection already gone, leaves the
+// rest of teardown to run on schedule instead of blocking it further.
+func awaitAnswerOpen(graceCtx context.Context, grace time.Duration) func(state *sessionState) {
+	return func(state *sessionState) {
+		done := signalAnswerOpen(state)
+		if done == nil {
+			return
+		}
+
+		bound := closeCallBound(grace)
+		if deadline, ok := graceCtx.Deadline(); ok {
+			if remaining := closeCallBound(max(time.Until(deadline), 0)); remaining < bound {
+				bound = remaining
+			}
+		}
+		boundedCtx, cancel := context.WithTimeout(graceCtx, bound)
+		defer cancel()
+
+		select {
+		case <-done:
+		case <-boundedCtx.Done():
+			return
+		}
+		if state.conn != nil {
+			state.conn.Flush(boundedCtx) //nolint:errcheck,gosec // best-effort; teardown proceeds either way
+		}
 	}
 }
 
@@ -789,12 +785,10 @@ func awaitExit(callerCtx, graceCtx context.Context, grace time.Duration) func(st
 }
 
 // closeStdin closes the handle the adapter writes the agent's standard
-// input through. This fails a write the pump has parked on that pipe,
-// letting the pump resume.
+// input through, on its own goroutine so this step itself never waits
+// on that close, however long it takes or whether it ever returns.
 func closeStdin(state *sessionState) {
-	if state.stdinCloser != nil {
-		state.stdinCloser.Close() //nolint:errcheck,gosec // best-effort; unparks a write blocked on this pipe
-	}
+	procutil.CloseWithoutWaiting(state.stdinCloser)
 }
 
 // closeStdout closes the handle the connection reads the agent's
@@ -820,9 +814,10 @@ func closePipes(state *sessionState) {
 }
 
 // closeConnection closes the JSON-RPC connection. Closing the
-// connection does not release a write the pump has parked on standard
-// input, so the handle close and the group termination ahead of it are
-// what release the pump before the step that waits for it.
+// connection does not release a write its own writer goroutine has
+// parked on standard input, so the handle close and the group
+// termination ahead of it are what release that goroutine before the
+// step that waits for the pump.
 func closeConnection(state *sessionState) {
 	if state.conn != nil {
 		state.conn.Close()

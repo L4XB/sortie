@@ -2,6 +2,7 @@ package jsonrpc
 
 import (
 	"encoding/json"
+	"reflect"
 	"testing"
 )
 
@@ -88,9 +89,9 @@ func TestParseMessage_StringIDRequest(t *testing.T) {
 
 // TestParseMessage_UnmatchedStringIDResponse checks that a response
 // carrying a string id classifies as KindResponse rather than
-// KindMalformed, so it can still reach the connection's handler as an
-// unmatched response even though it never satisfies the numeric
-// pending-call correlation.
+// KindMalformed, so it can still reach the sink as an unmatched
+// response even though it never satisfies the numeric pending-call
+// correlation.
 func TestParseMessage_UnmatchedStringIDResponse(t *testing.T) {
 	t.Parallel()
 
@@ -400,5 +401,23 @@ func TestID_String(t *testing.T) {
 				t.Errorf("String() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestSink_ClosedImplementationSet checks that Sink declares exactly
+// one method and that it is unexported, the same closure
+// [testing.TB] documents for its own unexported method: a type
+// declared outside this package cannot supply that method, so Deliver
+// is the only way to build a Sink.
+func TestSink_ClosedImplementationSet(t *testing.T) {
+	t.Parallel()
+
+	sinkType := reflect.TypeFor[Sink]()
+	if got := sinkType.NumMethod(); got != 1 {
+		t.Fatalf("Sink.NumMethod() = %d, want 1", got)
+	}
+	method := sinkType.Method(0)
+	if method.PkgPath == "" {
+		t.Errorf("Sink method %q is exported, want unexported so no other package can implement it", method.Name)
 	}
 }
