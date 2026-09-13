@@ -159,7 +159,6 @@ func newParkedTeardownFixture(t *testing.T, withStderrHolder bool) *parkedTeardo
 	return &parkedTeardownFixture{state: state, release: release}
 }
 
-
 // waitForFile polls for path to exist, failing t if awaitTimeout elapses
 // first. This is a bounded wait for a concrete condition the fake
 // agent script itself establishes, not a sleep standing in for the
