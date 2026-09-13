@@ -5,19 +5,17 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
-// fakeSSHDir writes a no-op executable named "ssh" to a temp directory and
+// fakeSSHDir builds a no-op fake runtime named "ssh" in a temp directory and
 // returns the directory path. The directory should be prepended to PATH via
 // t.Setenv.
 func fakeSSHDir(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	p := filepath.Join(dir, "ssh")
-	if err := os.WriteFile(p, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-		t.Fatalf("fakeSSHDir: %v", err)
-	}
+	agenttest.FakeRuntime(t, dir, "ssh", agenttest.OutputScenario, agenttest.Output{})
 	return dir
 }
 
@@ -43,6 +41,7 @@ func TestResolveLaunchTarget(t *testing.T) {
 	// parallel parent tests. Individual subtests that do not modify env call
 	// t.Parallel() themselves.
 	dir := t.TempDir()
+	binPath := agenttest.FakeRuntime(t, t.TempDir(), "agent", agenttest.OutputScenario, agenttest.Output{})
 
 	tests := []struct {
 		name           string
@@ -56,7 +55,7 @@ func TestResolveLaunchTarget(t *testing.T) {
 	}{
 		{
 			name:           "local mode: binary present and workspace valid",
-			defaultCommand: "sh",
+			defaultCommand: binPath,
 			params:         func(t *testing.T) domain.StartSessionParams { return makeParams(t, dir, "", "") },
 			wantNoErr:      true,
 			check: func(t *testing.T, lt LaunchTarget) {
@@ -74,7 +73,7 @@ func TestResolveLaunchTarget(t *testing.T) {
 		},
 		{
 			name:           "local mode: multi-token command produces Args",
-			defaultCommand: "sh -c",
+			defaultCommand: binPath + " -c",
 			params:         func(t *testing.T) domain.StartSessionParams { return makeParams(t, dir, "", "") },
 			wantNoErr:      true,
 			check: func(t *testing.T, lt LaunchTarget) {
@@ -92,7 +91,7 @@ func TestResolveLaunchTarget(t *testing.T) {
 		},
 		{
 			name:           "local mode: workspace invalid",
-			defaultCommand: "sh",
+			defaultCommand: binPath,
 			params: func(t *testing.T) domain.StartSessionParams {
 				return makeParams(t, filepath.Join(dir, "nope"), "", "")
 			},
@@ -190,7 +189,7 @@ func TestResolveLaunchTarget(t *testing.T) {
 			name:           "params command overrides default",
 			defaultCommand: "sortie-no-such-binary-xyzzy",
 			params: func(t *testing.T) domain.StartSessionParams {
-				return makeParams(t, dir, "", "sh")
+				return makeParams(t, dir, "", binPath)
 			},
 			wantNoErr: true,
 		},

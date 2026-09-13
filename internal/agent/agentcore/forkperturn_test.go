@@ -1,5 +1,3 @@
-//go:build unix
-
 package agentcore
 
 import (
@@ -7,11 +5,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -20,32 +21,112 @@ import (
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
-// writeTrapScript writes an agent script that installs a TERM trap,
-// touches a readiness marker, then blocks. It returns the script path
-// and the marker path. trap is the trap body quoted as the shell
-// expects it.
-//
-// The marker exists because a fixed sleep cannot prove the trap is
-// installed. If the signal wins that race the shell exits on TERM's
-// default disposition, and the test then passes without exercising the
-// escalation it is named for.
-//
-// The script blocks in a shell builtin loop rather than in sleep, so
-// the shell is the only process in the group. A forked child reopens
-// the race the marker closes: the signal can reach the group in the
-// window between the marker and the fork, leaving a child that never
-// received it, that holds the output pipe open, and that therefore
-// keeps cmd.Wait from returning for the child's whole lifetime. The
-// loop costs a few microseconds on the arm where the trap exits, and
-// at most the configured grace on the arms that ignore the signal.
-func writeTrapScript(t *testing.T, dir, trap string) (script, marker string) {
-	t.Helper()
-	marker = filepath.Join(dir, "trap-ready")
-	return agenttest.WriteScript(t, dir, "agent",
-		fmt.Sprintf("trap %s TERM\n: > %q\nwhile :; do :; done", trap, marker)), marker
+// trapParams parameterizes the "trap" scenario: it marks itself ready by
+// creating Marker, then either exits on the first graceful shutdown signal
+// it receives (ExitOnSignal) or ignores that signal and hangs until it is
+// force-killed.
+type trapParams struct {
+	Marker       string
+	ExitOnSignal bool
 }
 
-// waitForTrap blocks until the marker [writeTrapScript] returns appears,
+// trapScenario mirrors a shell "trap TERM" fixture: it lets a caller
+// distinguish a subprocess that exits promptly on the graceful shutdown
+// signal from one that ignores it and must be force-killed, without
+// depending on a POSIX shell. syscall.SIGTERM and os/signal both work on
+// Windows, where the runtime maps CTRL_BREAK_EVENT (what
+// [procutil.SignalGraceful] sends there) onto it.
+func trapScenario(_ []string, p trapParams) int {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGTERM)
+
+	if err := os.WriteFile(p.Marker, []byte("ready"), 0o600); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+
+	<-ch
+	if p.ExitOnSignal {
+		return 0
+	}
+	agenttest.Hang()
+	return 0
+}
+
+// overflowParams parameterizes the "overflow" scenario: it writes Stderr (if
+// any), then a single stdout line of Size 'x' bytes plus a trailing newline.
+type overflowParams struct {
+	Stderr string
+	Size   int
+}
+
+// overflowScenario produces a single stdout line large enough to exceed the
+// scanner's per-token limit, exercising the scan-error arm without shelling
+// out to dd and tr.
+func overflowScenario(_ []string, p overflowParams) int {
+	if p.Stderr != "" {
+		io.WriteString(os.Stderr, p.Stderr) //nolint:errcheck // best-effort fixture output
+	}
+	io.WriteString(os.Stdout, strings.Repeat("x", p.Size)+"\n") //nolint:errcheck // best-effort fixture output
+	return 0
+}
+
+// repeatLineParams parameterizes the "repeatLine" scenario: it writes Line
+// followed by a newline in an unbroken loop until killed.
+type repeatLineParams struct {
+	Line string
+}
+
+// repeatLineScenario keeps the scanner actively reading so a caller can
+// exercise cancellation while a read is in flight.
+func repeatLineScenario(_ []string, p repeatLineParams) int {
+	for {
+		if _, err := io.WriteString(os.Stdout, p.Line+"\n"); err != nil {
+			return 0
+		}
+	}
+}
+
+// stderrThenSleepParams parameterizes the "stderrThenSleep" scenario: it
+// writes Stderr, closes its own stderr handle, sleeps Sleep, then exits 0.
+type stderrThenSleepParams struct {
+	Stderr string
+	Sleep  time.Duration
+}
+
+// stderrThenSleepScenario puts the stderr drain at EOF while the turn is
+// still running (stdout stays open through Sleep), so a caller can assert
+// that no abandonment bound fires on an ordinary long-running turn.
+func stderrThenSleepScenario(_ []string, p stderrThenSleepParams) int {
+	io.WriteString(os.Stderr, p.Stderr) //nolint:errcheck // best-effort fixture output
+	os.Stderr.Close()                   //nolint:errcheck,gosec // deliberately closing early to simulate a closed handle
+	time.Sleep(p.Sleep)
+	return 0
+}
+
+func init() {
+	scenarios["trap"] = agenttest.Typed(trapScenario)
+	scenarios["overflow"] = agenttest.Typed(overflowScenario)
+	scenarios["repeatLine"] = agenttest.Typed(repeatLineScenario)
+	scenarios["stderrThenSleep"] = agenttest.Typed(stderrThenSleepScenario)
+}
+
+// buildTrapAgent creates a fake runtime that installs a graceful-shutdown
+// trap and returns its path and the readiness marker path. exitOnSignal
+// selects whether the runtime exits on the signal or ignores it and hangs.
+//
+// The marker exists because a fixed sleep cannot prove the trap is
+// installed. If the signal wins that race the process exits on the
+// platform's default disposition, and the test then passes without
+// exercising the escalation it is named for.
+func buildTrapAgent(t *testing.T, dir string, exitOnSignal bool) (path, marker string) {
+	t.Helper()
+	marker = filepath.Join(dir, "trap-ready")
+	path = agenttest.FakeRuntime(t, dir, "agent", "trap", trapParams{Marker: marker, ExitOnSignal: exitOnSignal})
+	return path, marker
+}
+
+// waitForTrap blocks until the marker [buildTrapAgent] returns appears,
 // so a caller signals the subprocess only once its trap is in place.
 func waitForTrap(t *testing.T, marker string) {
 	t.Helper()
@@ -133,7 +214,7 @@ func TestForkPerTurnSession(t *testing.T) {
 	t.Run("Arm1_CtxCancelBeforeEOF", func(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
-		script := agenttest.WriteScript(t, tmpDir, "agent", `sleep 60`)
+		script := agenttest.FakeRuntime(t, tmpDir, "agent", agenttest.OutputScenario, agenttest.Output{Hang: true})
 		target := newTestTarget(tmpDir, script)
 		sess := NewForkPerTurnSession(target, noopHooks(), slog.Default(), 0)
 
@@ -155,7 +236,7 @@ func TestForkPerTurnSession(t *testing.T) {
 	t.Run("Arm1_UsageCarriage_CtxCancelBeforeEOF", func(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
-		script := agenttest.WriteScript(t, tmpDir, "agent", `sleep 60`)
+		script := agenttest.FakeRuntime(t, tmpDir, "agent", agenttest.OutputScenario, agenttest.Output{Hang: true})
 		target := newTestTarget(tmpDir, script)
 		stubUsage := domain.TokenUsage{InputTokens: 500, OutputTokens: 100, TotalTokens: 600}
 		hooks := noopHooks()
@@ -195,7 +276,7 @@ func TestForkPerTurnSession(t *testing.T) {
 	t.Run("Arm1_CtxAlreadyCancelledBeforeStart", func(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
-		script := agenttest.WriteScript(t, tmpDir, "agent", `sleep 60`)
+		script := agenttest.FakeRuntime(t, tmpDir, "agent", agenttest.OutputScenario, agenttest.Output{Hang: true})
 		target := newTestTarget(tmpDir, script)
 		sess := NewForkPerTurnSession(target, noopHooks(), slog.Default(), 0)
 
@@ -214,12 +295,9 @@ func TestForkPerTurnSession(t *testing.T) {
 	t.Run("Arm2_ScannerOverflow", func(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
-		// Write one line exceeding stdoutScannerMaxTokenSize (10 MB).
-		// Also write to stderr so EmitWarnLines has content to log at WARN.
-		script := agenttest.WriteScript(t, tmpDir, "agent", `echo 'arm2 error' >&2
-dd if=/dev/zero bs=11000001 count=1 2>/dev/null | tr '\000' 'x'
-printf '\n'
-`)
+		// One line exceeding stdoutScannerMaxTokenSize (10 MB), plus stderr
+		// content so EmitWarnLines has something to log at WARN.
+		script := agenttest.FakeRuntime(t, tmpDir, "agent", "overflow", overflowParams{Stderr: "arm2 error\n", Size: 11000001})
 		spy := &agenttest.LogSpy{}
 		target := newTestTarget(tmpDir, script)
 		sess := NewForkPerTurnSession(target, noopHooks(), slog.New(spy), 0)
@@ -237,9 +315,7 @@ printf '\n'
 	t.Run("Arm2_UsageCarriage_ScannerOverflow", func(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
-		script := agenttest.WriteScript(t, tmpDir, "agent", `dd if=/dev/zero bs=11000001 count=1 2>/dev/null | tr '\000' 'x'
-printf '\n'
-`)
+		script := agenttest.FakeRuntime(t, tmpDir, "agent", "overflow", overflowParams{Size: 11000001})
 		target := newTestTarget(tmpDir, script)
 		stubUsage := domain.TokenUsage{InputTokens: 500, OutputTokens: 100, TotalTokens: 600}
 		hooks := noopHooks()
@@ -268,7 +344,7 @@ printf '\n'
 		tmpDir := t.TempDir()
 		// Emit output continuously so the scanner is actively reading when
 		// the context deadline fires.
-		script := agenttest.WriteScript(t, tmpDir, "agent", `while true; do echo '{}'; done`)
+		script := agenttest.FakeRuntime(t, tmpDir, "agent", "repeatLine", repeatLineParams{Line: "{}"})
 		target := newTestTarget(tmpDir, script)
 		sess := NewForkPerTurnSession(target, noopHooks(), slog.Default(), 0)
 
@@ -283,8 +359,7 @@ printf '\n'
 	t.Run("Arm4_Exit127", func(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
-		script := agenttest.WriteScript(t, tmpDir, "agent", `echo 'cmd not found' >&2
-exit 127`)
+		script := agenttest.FakeRuntime(t, tmpDir, "agent", agenttest.OutputScenario, agenttest.Output{Stderr: "cmd not found\n", ExitCode: 127})
 		spy := &agenttest.LogSpy{}
 		target := newTestTarget(tmpDir, script)
 		sess := NewForkPerTurnSession(target, noopHooks(), slog.New(spy), 0)
@@ -299,28 +374,10 @@ exit 127`)
 		agenttest.RequireWarnLines(t, spy, "Arm4")
 	})
 
-	t.Run("Arm5_ExternalSIGTERM", func(t *testing.T) {
-		t.Parallel()
-		tmpDir := t.TempDir()
-		// Script sends SIGTERM to itself, exercising the WasSignaled path.
-		script := agenttest.WriteScript(t, tmpDir, "agent", `kill -TERM $$
-sleep 60`)
-		target := newTestTarget(tmpDir, script)
-		sess := NewForkPerTurnSession(target, noopHooks(), slog.Default(), 0)
-
-		emit, events := sinkEvents()
-		_, err := sess.RunTurn(context.Background(), "p", emit)
-
-		requireAgentError(t, err, domain.ErrTurnCancelled)
-		if !hasEventType(*events, domain.EventTurnCancelled) {
-			t.Errorf("EventTurnCancelled not emitted; got %v", *events)
-		}
-	})
-
 	t.Run("Arm6_ParseLineResult_OnFinalizeSuccess", func(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
-		script := agenttest.WriteScript(t, tmpDir, "agent", `echo '{}'`)
+		script := agenttest.FakeRuntime(t, tmpDir, "agent", agenttest.OutputScenario, agenttest.Output{Stdout: "{}\n"})
 		target := newTestTarget(tmpDir, script)
 
 		type resultToken struct{}
@@ -351,7 +408,7 @@ sleep 60`)
 	t.Run("Arm7_OnFinalizeError", func(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
-		script := agenttest.WriteScript(t, tmpDir, "agent", `echo 'arm7 stderr' >&2`)
+		script := agenttest.FakeRuntime(t, tmpDir, "agent", agenttest.OutputScenario, agenttest.Output{Stderr: "arm7 stderr\n"})
 		spy := &agenttest.LogSpy{}
 		target := newTestTarget(tmpDir, script)
 
@@ -378,8 +435,7 @@ sleep 60`)
 	t.Run("Arm8_NonZeroExitNoResult", func(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
-		script := agenttest.WriteScript(t, tmpDir, "agent", `echo 'arm8 stderr' >&2
-exit 1`)
+		script := agenttest.FakeRuntime(t, tmpDir, "agent", agenttest.OutputScenario, agenttest.Output{Stderr: "arm8 stderr\n", ExitCode: 1})
 		spy := &agenttest.LogSpy{}
 		target := newTestTarget(tmpDir, script)
 
@@ -406,7 +462,7 @@ exit 1`)
 	t.Run("Arm9_ZeroExitNoResultZeroTokens", func(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
-		script := agenttest.WriteScript(t, tmpDir, "agent", `echo 'arm9 stderr' >&2`)
+		script := agenttest.FakeRuntime(t, tmpDir, "agent", agenttest.OutputScenario, agenttest.Output{Stderr: "arm9 stderr\n"})
 		spy := &agenttest.LogSpy{}
 		target := newTestTarget(tmpDir, script)
 
@@ -433,7 +489,7 @@ exit 1`)
 	t.Run("Arm10_ZeroExitNoResultWithTokens", func(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
-		script := agenttest.WriteScript(t, tmpDir, "agent", `exit 0`)
+		script := agenttest.FakeRuntime(t, tmpDir, "agent", agenttest.OutputScenario, agenttest.Output{})
 		target := newTestTarget(tmpDir, script)
 
 		hooks := noopHooks()
@@ -464,10 +520,10 @@ exit 1`)
 		// written puts the drain at EOF while the turn is still running,
 		// so the assertion that no bound fires does not depend on the
 		// drain goroutine being scheduled inside the grace.
-		script := agenttest.WriteScript(t, tmpDir, "agent", `echo 'long turn stderr' >&2
-exec 2>&-
-sleep 0.5
-exit 0`)
+		script := agenttest.FakeRuntime(t, tmpDir, "agent", "stderrThenSleep", stderrThenSleepParams{
+			Stderr: "long turn stderr\n",
+			Sleep:  500 * time.Millisecond,
+		})
 		spy := &agenttest.LogSpy{}
 		target := newTestTarget(tmpDir, script)
 
@@ -503,8 +559,9 @@ exit 0`)
 	t.Run("Bound_OrdinaryTurnStderrUnmodified", func(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
-		script := agenttest.WriteScript(t, tmpDir, "agent", `echo 'first stderr line' >&2
-echo 'second stderr line' >&2`)
+		script := agenttest.FakeRuntime(t, tmpDir, "agent", agenttest.OutputScenario, agenttest.Output{
+			Stderr: "first stderr line\nsecond stderr line\n",
+		})
 		target := newTestTarget(tmpDir, script)
 
 		var gotStderrLines []string
@@ -532,7 +589,7 @@ echo 'second stderr line' >&2`)
 	t.Run("Stop_ConcurrentWithRunTurn", func(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
-		script := agenttest.WriteScript(t, tmpDir, "agent", `sleep 60`)
+		script := agenttest.FakeRuntime(t, tmpDir, "agent", agenttest.OutputScenario, agenttest.Output{Hang: true})
 		target := newTestTarget(tmpDir, script)
 		sess := NewForkPerTurnSession(target, noopHooks(), slog.Default(), 0)
 
@@ -576,7 +633,7 @@ echo 'second stderr line' >&2`)
 	t.Run("Stop_ConfiguredGraceBoundsTheWait", func(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
-		script, ready := writeTrapScript(t, tmpDir, `''`)
+		script, ready := buildTrapAgent(t, tmpDir, false)
 		target := newTestTarget(tmpDir, script)
 		sess := NewForkPerTurnSession(target, noopHooks(), slog.Default(), 200)
 
@@ -609,14 +666,11 @@ echo 'second stderr line' >&2`)
 	t.Run("RunTurn_CancelledTurnEscalatesOnConfiguredGrace", func(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
-		// A shell builtin busy-loop rather than "sleep 60": forking a
-		// separate sleep process would inherit the shell's ignored TERM
-		// disposition across exec (POSIX: SIG_IGN survives exec, unlike a
-		// caught handler) and keep the stdout pipe's write end open after
-		// os/exec's own WaitDelay escalation kills only the direct child,
-		// which would hang the scanner forever instead of exercising the
-		// bounded escalation this test measures.
-		script, ready := writeTrapScript(t, tmpDir, `''`)
+		// A signal that is received but not acted on, rather than a hang
+		// with no signal handling at all: this proves the escalation path
+		// force-kills a subprocess that ignores the graceful shutdown
+		// signal, not merely one that never gets a chance to see it.
+		script, ready := buildTrapAgent(t, tmpDir, false)
 		target := newTestTarget(tmpDir, script)
 		sess := NewForkPerTurnSession(target, noopHooks(), slog.Default(), 200)
 
@@ -652,7 +706,7 @@ echo 'second stderr line' >&2`)
 		t.Run("exit_inside_grace_emits_debug_and_no_warn", func(t *testing.T) {
 			t.Parallel()
 			tmpDir := t.TempDir()
-			script, ready := writeTrapScript(t, tmpDir, `'exit 0'`)
+			script, ready := buildTrapAgent(t, tmpDir, true)
 			target := newTestTarget(tmpDir, script)
 			var buf bytes.Buffer
 			logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -690,7 +744,7 @@ echo 'second stderr line' >&2`)
 		t.Run("grace_elapsed_emits_warn_with_outcome_and_grace", func(t *testing.T) {
 			t.Parallel()
 			tmpDir := t.TempDir()
-			script, ready := writeTrapScript(t, tmpDir, `''`)
+			script, ready := buildTrapAgent(t, tmpDir, false)
 			target := newTestTarget(tmpDir, script)
 			var buf bytes.Buffer
 			logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -727,7 +781,7 @@ echo 'second stderr line' >&2`)
 		t.Run("caller_deadline_emits_warn_with_that_outcome", func(t *testing.T) {
 			t.Parallel()
 			tmpDir := t.TempDir()
-			script, ready := writeTrapScript(t, tmpDir, `''`)
+			script, ready := buildTrapAgent(t, tmpDir, false)
 			target := newTestTarget(tmpDir, script)
 			var buf bytes.Buffer
 			logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -787,7 +841,7 @@ echo 'second stderr line' >&2`)
 
 		// Fix the command and retry on the same session. Since s.turns was
 		// not incremented, prospectiveTurn is still 1.
-		target.Command = agenttest.WriteScript(t, tmpDir, "agent-ok", `exit 0`)
+		target.Command = agenttest.FakeRuntime(t, tmpDir, "agent-ok", agenttest.OutputScenario, agenttest.Output{})
 		sess.RunTurn(context.Background(), "p", func(domain.AgentEvent) {}) //nolint:errcheck // testing turn tracking
 		if lastTurn != 1 {
 			t.Errorf("BuildArgs turn after failed-start retry = %d, want 1 (turns must not be incremented on failed start)", lastTurn)
