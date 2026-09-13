@@ -34,37 +34,10 @@ const teardownReturnOverhead = 2 * time.Second
 // hold the reply that echoes it back.
 const teardownParkedOptionSize = 4*1024*1024 + 4096
 
-// teardownParkedScriptTemplate is the fake agent for the parked
-// teardown scenario. Substituting __DIR__ and __SIZE__ gives a script
-// that first detaches two helper processes into their own session
-// before doing anything else, escaping this script's own process
-// group: one reads a small prefix of whatever arrives on its standard
-// input and then stops reading while holding that pipe's read end
-// open, and one simply holds its standard output's write end open.
-// Each explicitly redirects the file descriptor it does not
-// represent, and each is released from an ordinary shell "&"
-// background job's own implicit /dev/null substitution for standard
-// input by duplicating the saved descriptor explicitly rather than
-// leaving it to inherit fd 0 unredirected. It then writes a
-// session/request_permission request whose selected option carries an
-// identifier of at least four mebibytes, followed by a second,
-// distinct request the adapter never answers before teardown begins.
-// Finally it closes its own copies of both piped descriptors and
-// idles.
-const teardownParkedScriptTemplate = `dir='__DIR__'
-exec 3<&0
-exec 4>&1
-setsid sh -c 'echo $$ >"'"$dir"'/reader.pid"; dd bs=65536 count=1 of=/dev/null 2>/dev/null; touch "'"$dir"'/reader.done"; sleep 600' <&3 3<&- 4>&- >/dev/null 2>/dev/null &
-setsid sh -c 'echo $$ >"'"$dir"'/writer.pid"; sleep 600' >&4 4>&- 3<&- <&- 2>/dev/null &
-exec 3<&-
-exec 4>&-
-exec <&-
-huge=$(head -c __SIZE__ /dev/zero | tr '\0' 'x')
-printf '{"jsonrpc":"2.0","id":1,"method":"session/request_permission","params":{"sessionId":"sess-test","options":[{"kind":"reject_once","name":"reject","optionId":"%s"}],"toolCall":{"toolCallId":"tc-1","title":"work"}}}\n' "$huge"
-printf '{"jsonrpc":"2.0","id":2,"method":"fs/read_text_file","params":{}}\n'
-exec >&-
-sleep 600
-`
+// teardownReaderBufSize bounds the parked-teardown fixture's reader
+// helper to a single read well under teardownParkedOptionSize, so a
+// reply built from that option still cannot drain through it.
+const teardownReaderBufSize = 65536
 
 // parkedTeardownFixture bundles a session backed by a real subprocess
 // and real OS pipes, already parked mid-write on a permission reply
@@ -75,120 +48,65 @@ type parkedTeardownFixture struct {
 	release func()
 }
 
-// newParkedTeardownSession launches the scenario's fake agent as a
-// real subprocess, wires a session to it exactly as startSession
-// would (skipping the handshake calls, which this scenario has no use
-// for), and waits for genuine evidence that the reply write is
-// parked: the reader helper's own completion marker, written only
-// once it has consumed its one bounded read. That evidence, combined
-// with the reply being many times larger than any pipe buffer, is
-// what makes the park a property of the setup rather than a timing
-// assumption; the wait loop itself is bounded polling for that
-// marker, not a sleep standing in for the park.
+// newParkedTeardownSession launches the fake agent scenario as a real
+// subprocess, wires a session to it exactly as startSession would
+// (skipping the handshake calls, which this scenario has no use for),
+// and waits for genuine evidence that the reply write is parked: the
+// reader helper's own completion marker, written only once it has
+// consumed its one bounded read. That evidence, combined with the
+// reply being many times larger than any pipe buffer, is what makes
+// the park a property of the setup rather than a timing assumption;
+// the wait loop itself is bounded polling for that marker, not a
+// sleep standing in for the park.
 func newParkedTeardownSession(t *testing.T) *parkedTeardownFixture {
 	t.Helper()
-	agenttest.RequireSetsid(t)
-
-	dir := t.TempDir()
-	script := strings.NewReplacer(
-		"__DIR__", dir,
-		"__SIZE__", strconv.Itoa(teardownParkedOptionSize),
-	).Replace(teardownParkedScriptTemplate)
-	scriptPath := agenttest.WriteScript(t, dir, "agent.sh", script)
-
-	cmd := exec.Command(scriptPath) //nolint:gosec // fixed path under t.TempDir()
-	procutil.SetProcessGroup(cmd)
-
-	stdinCloser, err := cmd.StdinPipe()
-	if err != nil {
-		t.Fatalf("StdinPipe: %v", err)
-	}
-
-	pipes, err := procutil.StartWithOwnedPipes(cmd)
-	if err != nil {
-		t.Fatalf("StartWithOwnedPipes: %v", err)
-	}
-
-	state := &sessionState{
-		pid:         cmd.Process.Pid,
-		stdinCloser: stdinCloser,
-		pipes:       pipes,
-		stopCh:      make(chan struct{}),
-		pumpDone:    make(chan struct{}),
-		logger:      discardLogger(),
-		agentConfig: domain.AgentConfig{ReadTimeoutMS: 60000},
-		caps:        newCapabilityRecord(false),
-	}
-	state.stderrCollector = procutil.NewStderrCollector(pipes.Stderr, state.logger)
-
-	reaper := procutil.StartReaper(cmd)
-	state.waitCh = reaper.Done()
-
-	state.inbox = jsonrpc.NewInbox[pumpItem]()
-	state.conn = jsonrpc.NewConn(stdinCloser, pipes.Stdout, jsonrpc.Deliver(state.inbox, wrapPumpMessage),
-		jsonrpc.WithVersionMember(), jsonrpc.WithMaxLineBytes(8<<20))
-
-	go runPump(state)
-	markSessionKnown(state)
-
-	waitForFile(t, filepath.Join(dir, "reader.done"))
-
-	release := sync.OnceFunc(func() {
-		// Each helper is its own session and process group leader, so
-		// killing only the recorded pid leaves its own "sleep 600"
-		// child (a separate process in the same group) holding the
-		// pipe end open; the negative pid signals the whole group.
-		killHelperGroup(filepath.Join(dir, "reader.pid"))
-		killHelperGroup(filepath.Join(dir, "writer.pid"))
-	})
-	t.Cleanup(release)
-
-	return &parkedTeardownFixture{state: state, release: release}
+	return newParkedTeardownFixture(t, false)
 }
 
-// teardownParkedStderrScriptTemplate extends teardownParkedScriptTemplate
-// with a third detached helper that holds the standard-error write end
-// open, for property P13's own run: with that helper alongside the
-// reader and writer, drain_stderr_and_reap can only abandon the
-// standard-error collector, and close_pipes is the only step left able
-// to release it. This template is used only by that property's own
-// fixture and MUST NOT replace the shared one: parking the collector on
-// every run built from it would break the four runs whose step slices
-// never reach close_pipes.
-const teardownParkedStderrScriptTemplate = `dir='__DIR__'
-exec 3<&0
-exec 4>&1
-setsid sh -c 'echo $$ >"'"$dir"'/reader.pid"; dd bs=65536 count=1 of=/dev/null 2>/dev/null; touch "'"$dir"'/reader.done"; sleep 600' <&3 3<&- 4>&- >/dev/null 2>/dev/null &
-setsid sh -c 'echo $$ >"'"$dir"'/writer.pid"; sleep 600' >&4 4>&- 3<&- <&- 2>/dev/null &
-setsid sh -c 'echo $$ >"'"$dir"'/stderr_holder.pid"; sleep 600' <&3 3<&- 4>&- >/dev/null &
-exec 3<&-
-exec 4>&-
-exec <&-
-huge=$(head -c __SIZE__ /dev/zero | tr '\0' 'x')
-printf '{"jsonrpc":"2.0","id":1,"method":"session/request_permission","params":{"sessionId":"sess-test","options":[{"kind":"reject_once","name":"reject","optionId":"%s"}],"toolCall":{"toolCallId":"tc-1","title":"work"}}}\n' "$huge"
-printf '{"jsonrpc":"2.0","id":2,"method":"fs/read_text_file","params":{}}\n'
-exec >&-
-sleep 600
-`
-
 // newParkedTeardownSessionWithStderrHolder behaves like
-// newParkedTeardownSession, except its fake agent also detaches a third
-// helper that holds the standard-error write end open, so
+// newParkedTeardownSession, except its fake agent also detaches a
+// third helper that holds the standard-error write end open, so
 // drain_stderr_and_reap can only abandon the collector and close_pipes
 // is the only remaining step able to release it. Used only by property
 // P13's own tests.
 func newParkedTeardownSessionWithStderrHolder(t *testing.T) *parkedTeardownFixture {
 	t.Helper()
-	agenttest.RequireSetsid(t)
+	return newParkedTeardownFixture(t, true)
+}
+
+// newParkedTeardownFixture builds the fixture newParkedTeardownSession
+// and newParkedTeardownSessionWithStderrHolder share, differing only
+// in whether a third detached helper parks the standard-error drain.
+func newParkedTeardownFixture(t *testing.T, withStderrHolder bool) *parkedTeardownFixture {
+	t.Helper()
 
 	dir := t.TempDir()
-	script := strings.NewReplacer(
-		"__DIR__", dir,
-		"__SIZE__", strconv.Itoa(teardownParkedOptionSize),
-	).Replace(teardownParkedStderrScriptTemplate)
-	scriptPath := agenttest.WriteScript(t, dir, "agent.sh", script)
+	readerPIDPath := filepath.Join(dir, "reader.pid")
+	readerDonePath := filepath.Join(dir, "reader.done")
+	writerPIDPath := filepath.Join(dir, "writer.pid")
 
-	cmd := exec.Command(scriptPath) //nolint:gosec // fixed path under t.TempDir()
+	readerPath := agenttest.FakeRuntime(t, dir, "reader", scenarioBoundedReader, boundedReaderParams{
+		PIDPath:  readerPIDPath,
+		DonePath: readerDonePath,
+		BufSize:  teardownReaderBufSize,
+	})
+	writerPath := agenttest.FakeRuntime(t, dir, "writer", scenarioHoldOpen, holdOpenParams{PIDPath: writerPIDPath})
+
+	agentParams := parkedAgentParams{
+		ReaderHelperPath: readerPath,
+		WriterHelperPath: writerPath,
+		OptionSize:       teardownParkedOptionSize,
+	}
+
+	var stderrPIDPath string
+	if withStderrHolder {
+		stderrPIDPath = filepath.Join(dir, "stderr_holder.pid")
+		agentParams.StderrHelperPath = agenttest.FakeRuntime(t, dir, "stderr-holder", scenarioHoldOpen, holdOpenParams{PIDPath: stderrPIDPath})
+	}
+
+	agentPath := agenttest.FakeRuntime(t, dir, "agent", scenarioParkedAgent, agentParams)
+
+	cmd := exec.Command(agentPath) //nolint:gosec // fixed path under t.TempDir()
 	procutil.SetProcessGroup(cmd)
 
 	stdinCloser, err := cmd.StdinPipe()
@@ -223,17 +141,24 @@ func newParkedTeardownSessionWithStderrHolder(t *testing.T) *parkedTeardownFixtu
 	go runPump(state)
 	markSessionKnown(state)
 
-	waitForFile(t, filepath.Join(dir, "reader.done"))
+	waitForFile(t, readerDonePath)
 
 	release := sync.OnceFunc(func() {
-		killHelperGroup(filepath.Join(dir, "reader.pid"))
-		killHelperGroup(filepath.Join(dir, "writer.pid"))
-		killHelperGroup(filepath.Join(dir, "stderr_holder.pid"))
+		// Each helper is its own session and process group leader, so
+		// killing only the recorded pid leaves its own idle process
+		// (a separate process in the same group) holding the pipe end
+		// open; the negative pid signals the whole group.
+		killHelperGroup(readerPIDPath)
+		killHelperGroup(writerPIDPath)
+		if stderrPIDPath != "" {
+			killHelperGroup(stderrPIDPath)
+		}
 	})
 	t.Cleanup(release)
 
 	return &parkedTeardownFixture{state: state, release: release}
 }
+
 
 // waitForFile polls for path to exist, failing t if awaitTimeout elapses
 // first. This is a bounded wait for a concrete condition the fake
