@@ -3,6 +3,8 @@
 package qualification
 
 import (
+	"fmt"
+	"os"
 	"os/exec"
 	"syscall"
 	"testing"
@@ -11,6 +13,29 @@ import (
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 	"github.com/sortie-ai/sortie/internal/agent/procutil"
 )
+
+// procgroupLeaderScenario names the Go fake runtime the surviving-
+// grandchild case launches as its own leader: it starts hangPath as a
+// background child, left in the same process group since it sets no
+// SysProcAttr of its own, and exits immediately - mirroring a shell
+// leader that backgrounds a job and returns before the job itself
+// exits.
+const procgroupLeaderScenario = "leader"
+
+func spawnDetachedGroupChild(_ []string, hangPath string) int {
+	cmd := exec.Command(hangPath) //nolint:gosec // hangPath is a fake runtime this test built under its own temp directory
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "leader: start %s: %v\n", hangPath, err)
+		return 1
+	}
+	return 0
+}
+
+func TestMain(m *testing.M) {
+	agenttest.Main(m, map[string]agenttest.Scenario{
+		procgroupLeaderScenario: agenttest.Typed(spawnDetachedGroupChild),
+	})
+}
 
 // startTrackedGroup starts cmd in its own process group through the
 // production launch contract and returns the started command and its
@@ -41,7 +66,8 @@ func TestProcessGroupAbsenceOracle(t *testing.T) {
 	t.Run("a live group is present", func(t *testing.T) {
 		t.Parallel()
 
-		_, pgid := startTrackedGroup(t, exec.Command("sleep", "5")) //nolint:gosec // bounded fake local process
+		hangPath := agenttest.FakeRuntime(t, t.TempDir(), "runtime", agenttest.OutputScenario, agenttest.Output{Hang: true})
+		_, pgid := startTrackedGroup(t, exec.Command(hangPath)) //nolint:gosec // hangPath is a fake runtime this test built under its own temp directory
 		present, err := ProcessGroupPresent(pgid)
 		if err != nil {
 			t.Fatalf("ProcessGroupPresent() error = %v, want nil", err)
@@ -54,7 +80,8 @@ func TestProcessGroupAbsenceOracle(t *testing.T) {
 	t.Run("a killed group drains to absence within the deadline", func(t *testing.T) {
 		t.Parallel()
 
-		cmd, pgid := startTrackedGroup(t, exec.Command("sleep", "60")) //nolint:gosec // bounded fake local process killed below
+		hangPath := agenttest.FakeRuntime(t, t.TempDir(), "runtime", agenttest.OutputScenario, agenttest.Output{Hang: true})
+		cmd, pgid := startTrackedGroup(t, exec.Command(hangPath)) //nolint:gosec // hangPath is a fake runtime this test built under its own temp directory
 		_ = procutil.SignalProcessGroup(pgid, syscall.SIGKILL)
 		_, _ = cmd.Process.Wait()
 		AwaitProcessGroupAbsence(t, pgid)
@@ -68,8 +95,10 @@ func TestProcessGroupAbsenceOracle(t *testing.T) {
 
 		// The leader forks a grandchild into the same group and exits;
 		// the group survives while the grandchild does.
-		script := agenttest.WriteScript(t, t.TempDir(), "leader.sh", "sleep 60 &\nexit 0\n")
-		cmd, pgid := startTrackedGroup(t, exec.Command(script)) //nolint:gosec // test-owned script under the test's temp directory
+		dir := t.TempDir()
+		hangPath := agenttest.FakeRuntime(t, dir, "grandchild", agenttest.OutputScenario, agenttest.Output{Hang: true})
+		script := agenttest.FakeRuntime(t, dir, "leader", procgroupLeaderScenario, hangPath)
+		cmd, pgid := startTrackedGroup(t, exec.Command(script)) //nolint:gosec // script is a fake runtime this test built under its own temp directory
 
 		// A bounded settle lets the leader fork and exit before the
 		// first liveness check.
