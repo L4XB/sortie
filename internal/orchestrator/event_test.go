@@ -1212,6 +1212,50 @@ func TestHandleAgentEvent_ModelTracking_NoModel(t *testing.T) {
 	}
 }
 
+// TestTokenUsageModel verifies that tokenUsageModel returns a
+// token_usage event's Model verbatim, whitespace-only value included,
+// and "" for any other event type even when Model is set.
+func TestTokenUsageModel(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		event domain.AgentEvent
+		want  string
+	}{
+		{
+			name:  "token_usage event returns its model verbatim",
+			event: domain.AgentEvent{Type: domain.EventTokenUsage, Model: "claude-sonnet-4-20250514"},
+			want:  "claude-sonnet-4-20250514",
+		},
+		{
+			name:  "token_usage event with a whitespace-only model returns it verbatim",
+			event: domain.AgentEvent{Type: domain.EventTokenUsage, Model: "   "},
+			want:  "   ",
+		},
+		{
+			name:  "token_usage event with an empty model returns empty",
+			event: domain.AgentEvent{Type: domain.EventTokenUsage, Model: ""},
+			want:  "",
+		},
+		{
+			name:  "a non-token_usage event returns empty even when Model is set",
+			event: domain.AgentEvent{Type: domain.EventTurnCompleted, Model: "claude-sonnet-4-20250514"},
+			want:  "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := tokenUsageModel(tt.event); got != tt.want {
+				t.Errorf("tokenUsageModel(%+v) = %q, want %q", tt.event, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestHandleAgentEvent_CacheReadTokens_DebugLog verifies that the
 // delta_cache_read field appears in the debug log for token_usage events.
 func TestHandleAgentEvent_CacheReadTokens_DebugLog(t *testing.T) {
