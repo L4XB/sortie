@@ -885,6 +885,7 @@ func queuedOrderingIssueEntry(issueID string) *RunningEntry {
 	return &RunningEntry{
 		Identifier: issueID + "-ident",
 		Issue:      domain.Issue{ID: issueID, Identifier: issueID + "-ident", State: "To Do"},
+		DispatchID: issueID + "-dispatch",
 		StartedAt:  time.Now().UTC(),
 		CancelFunc: func() {},
 	}
@@ -929,27 +930,22 @@ func TestOrchestrator_QueuedMessagesApplyAheadOfExit(t *testing.T) {
 			tracker := &candidateTrackerAdapter{mockTrackerAdapter: &mockTrackerAdapter{}}
 			o := budgetOrchestrator(state, budgetTickConfig(0), store, tracker)
 
-			// HandleWorkerExit always appends the run_history row before it
-			// upserts its own session_metadata row (exit.go), and nothing
-			// else in this trial's single-issue exit calls either store
-			// method in between. So the first UpsertSessionMetadata call
-			// observed after AppendRunHistory is HandleWorkerExit's own,
-			// distinct from the queued event's earlier throttled
-			// incremental write.
+			// HandleWorkerExit's own session_metadata write always carries
+			// an empty DispatchID (exit.go clears it ahead of the
+			// run_history append), while the queued event's earlier
+			// throttled incremental write carries the entry's non-empty
+			// DispatchID. So the first UpsertSessionMetadata call carrying
+			// an empty DispatchID is HandleWorkerExit's own, distinguishable
+			// from the queued write regardless of call order.
 			type observedRow struct {
 				meta               persistence.SessionMetadata
 				selfReviewQueueLen int
 			}
 			captured := make(chan observedRow, 1)
-			afterRunHistory := false
-			store.onAppendRunHistory = func(persistence.RunHistory) {
-				afterRunHistory = true
-			}
 			store.onUpsertSessionMetadata = func(meta persistence.SessionMetadata) {
-				if !afterRunHistory {
+				if meta.DispatchID != "" {
 					return
 				}
-				afterRunHistory = false
 				captured <- observedRow{meta: meta, selfReviewQueueLen: len(o.selfReviewCh)}
 			}
 
@@ -1001,17 +997,17 @@ func TestOrchestrator_QueuedMessagesApplyAheadOfExit(t *testing.T) {
 			o := budgetOrchestrator(state, budgetTickConfig(0), store, tracker)
 
 			// The hooks run on the drain goroutine, which has returned before
-			// the test reads selfReviewQueueLen.
+			// the test reads selfReviewQueueLen. HandleWorkerExit's own
+			// session_metadata write always carries an empty DispatchID
+			// (exit.go clears it ahead of the run_history append), which
+			// distinguishes it from the queued event's earlier throttled
+			// incremental write, carrying the entry's non-empty DispatchID.
 			selfReviewQueueLen := -1
-			afterRunHistory := false
-			store.onAppendRunHistory = func(persistence.RunHistory) {
-				afterRunHistory = true
-			}
-			store.onUpsertSessionMetadata = func(persistence.SessionMetadata) {
-				if afterRunHistory {
-					afterRunHistory = false
-					selfReviewQueueLen = len(o.selfReviewCh)
+			store.onUpsertSessionMetadata = func(meta persistence.SessionMetadata) {
+				if meta.DispatchID != "" {
+					return
 				}
+				selfReviewQueueLen = len(o.selfReviewCh)
 			}
 
 			o.agentEventCh <- queuedOrderingCrossingEvent(issueID, "m")
@@ -1612,6 +1608,70 @@ func TestMakeWorkerFn(t *testing.T) {
 
 		if capturedStrictHostKeyChecking != "yes" {
 			t.Errorf("StartSessionParams.SSHStrictHostKeyChecking = %q, want %q", capturedStrictHostKeyChecking, "yes")
+		}
+	})
+
+	t.Run("DispatchID from context reaches the tool server env", func(t *testing.T) {
+		t.Parallel()
+
+		state := NewState(1000, 5, 0, nil, AgentTotals{})
+		tmpDir := t.TempDir()
+		cfg := defaultWorkerConfig(tmpDir)
+		tmpl := mustParseTemplate(t, "do {{ .issue.identifier }}")
+
+		var capturedMCPConfigPath atomic.Value
+		agent := &mockAgentAdapter{
+			startSessionFn: func(_ context.Context, params domain.StartSessionParams) (domain.Session, error) {
+				capturedMCPConfigPath.Store(params.MCPConfigPath)
+				return domain.Session{ID: "sess-1"}, nil
+			},
+		}
+
+		wm := &stubWorkflowManager{config: cfg, template: tmpl, absPath: "/fake/WORKFLOW.md"}
+
+		o := NewOrchestrator(OrchestratorParams{
+			State:           state,
+			Logger:          discardLogger(),
+			TrackerAdapter:  &mockTrackerAdapter{},
+			AgentAdapter:    agent,
+			WorkflowManager: wm,
+			Store:           &stubStore{},
+		})
+
+		issue := workerTestIssue()
+		state.Running[issue.ID] = &RunningEntry{
+			Identifier: issue.Identifier,
+			Issue:      issue,
+		}
+
+		wfn := o.makeWorkerFn("", "", "", "", "", nil)
+
+		exitDone := make(chan struct{})
+		go func() {
+			wfn(withDispatchID(context.Background(), "dispatch-mkw-123"), issue, nil)
+			close(exitDone)
+		}()
+
+		select {
+		case <-exitDone:
+		case <-time.After(10 * time.Second):
+			t.Fatal("worker did not exit within 10 seconds")
+		}
+
+		mcpConfigPath, _ := capturedMCPConfigPath.Load().(string)
+		if mcpConfigPath == "" {
+			t.Fatal("StartSessionParams.MCPConfigPath is empty, want non-empty")
+		}
+
+		workspacePath := filepath.Dir(filepath.Dir(mcpConfigPath))
+		entry := sortieEntry(t, readMCPConfig(t, workspacePath))
+		env, ok := entry["env"].(map[string]any)
+		if !ok {
+			t.Fatal("env is not an object")
+		}
+		got, _ := env["SORTIE_DISPATCH_ID"].(string)
+		if got != "dispatch-mkw-123" {
+			t.Errorf("env[%q] = %q, want %q (WorkerDeps.DispatchID from dispatchIDFromContext)", "SORTIE_DISPATCH_ID", got, "dispatch-mkw-123")
 		}
 	})
 }
@@ -6134,6 +6194,28 @@ func TestMaybeWriteIncrementalMetadata(t *testing.T) {
 		}
 		if writes[0].APIRequestCount != 4 {
 			t.Errorf("SessionMetadata.APIRequestCount = %d, want 4 for a measured row", writes[0].APIRequestCount)
+		}
+	})
+
+	t.Run("DispatchID from the running entry is carried on every write", func(t *testing.T) {
+		t.Parallel()
+
+		store := &stubStore{}
+		o, entry := incrementalWriteOrchestrator(t, store)
+		entry.DispatchID = "dispatch-incr-1"
+
+		o.maybeWriteIncrementalMetadata(ctx, "id-1", tokenUsageEvent(10, 20, 30, 5))
+		entry.LastMetadataWrite = time.Now().UTC().Add(-sessionMetadataWriteInterval - time.Second)
+		o.maybeWriteIncrementalMetadata(ctx, "id-1", tokenUsageEvent(11, 21, 33, 6))
+
+		writes := store.sessionWrites()
+		if len(writes) != 2 {
+			t.Fatalf("UpsertSessionMetadata calls = %d, want 2", len(writes))
+		}
+		for i, w := range writes {
+			if w.DispatchID != "dispatch-incr-1" {
+				t.Errorf("writes[%d].DispatchID = %q, want %q", i, w.DispatchID, "dispatch-incr-1")
+			}
 		}
 	})
 
