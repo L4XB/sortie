@@ -2256,6 +2256,26 @@ func TestBuildDashboardData_ExclusionNotes(t *testing.T) {
 		}
 	})
 
+	t.Run("no token rates leaves the cost note empty", func(t *testing.T) {
+		t.Parallel()
+
+		snap := orchestrator.RuntimeSnapshotResult{
+			GeneratedAt: now,
+			Running: []orchestrator.SnapshotRunningEntry{
+				{
+					Identifier: "MT-NO-RATES", StartedAt: now.Add(-time.Minute), AgentKind: "claude",
+					UsageMeasured: true, AgentInputTokens: 1000, UsageArrival: registry.UsageArrivalIncremental,
+				},
+			},
+		}
+
+		data := buildDashboardData(snap, "test", now.Add(-time.Hour), nil, now, nil)
+
+		if data.CostUnpricedNote != "" {
+			t.Errorf("CostUnpricedNote = %q, want empty: Est. Cost is not shown without token rates", data.CostUnpricedNote)
+		}
+	})
+
 	t.Run("no-usage-arrival session never contributes to the unreported note", func(t *testing.T) {
 		t.Parallel()
 

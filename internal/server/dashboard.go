@@ -487,10 +487,10 @@ func buildDashboardData(
 		"%d sessions that already ended never reported token usage; the totals above exclude them too.")
 
 	aggregateCost, aggregateCostSet, unpricedCount := activeCostTotal(sortedRunning, tokenRates)
-	data.CostUnpricedNote = countedNote(int64(unpricedCount),
-		"%d running session is excluded from Est. Cost because token_rates has no price for its agent.",
-		"%d running sessions are excluded from Est. Cost because token_rates has no price for their agents.")
 	if hasRates {
+		data.CostUnpricedNote = countedNote(int64(unpricedCount),
+			"%d running session is excluded from Est. Cost because token_rates has no price for its agent.",
+			"%d running sessions are excluded from Est. Cost because token_rates has no price for their agents.")
 		data.EstimatedCostLabel = "Active Est. Cost (USD)"
 	}
 	if aggregateCostSet {
