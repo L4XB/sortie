@@ -1077,6 +1077,7 @@ func budgetCeilingExemptionFixture(t *testing.T) (o *Orchestrator, store *stubSt
 		store:           store,
 		workflowManager: &stubWorkflowManager{config: cfg},
 		agentEventCh:    make(chan agentEventMsg, 8),
+		workerExitCh:    make(chan WorkerResult, 8),
 		selfReviewCh:    make(chan selfReviewProgressMsg, 8),
 		retryTimerCh:    make(chan string, 8),
 		hostPool:        NewHostPool(nil, 0),
