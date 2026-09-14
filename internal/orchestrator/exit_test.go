@@ -1608,6 +1608,9 @@ func TestHandleWorkerExit_UnmeasuredSessionsSurvivesRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("persistence.Open: %v", err)
 	}
+	// Close is idempotent, so this only matters when a failure skips the
+	// explicit close before the reopen below.
+	t.Cleanup(func() { _ = store1.Close() })
 	if err := store1.Migrate(ctx); err != nil {
 		t.Fatalf("store1.Migrate: %v", err)
 	}
