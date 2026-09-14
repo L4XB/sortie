@@ -350,3 +350,34 @@ func TestDrainJobObject(t *testing.T) {
 		}
 	})
 }
+
+// TestDrainJobObject_UnreadableMemberList pins that a job whose member
+// list cannot be read is reported as unconfirmed rather than drained.
+// jobHasRunningMember answers false both for a job it read and found
+// empty and for one it could not read at all, and letting the second
+// end the drain would publish a launch's outcome with its tree
+// unproven, which is the guarantee the resend loop exists to make.
+//
+// An invalid job handle is what makes QueryInformationJobObject fail
+// deterministically; terminateJobObjectFunc is stubbed so the failure
+// under test is the member-list read rather than the termination.
+//
+// Cannot run on this host; on the CI Windows job this reddens under a
+// mutation that drops jobHasRunningMember's error, because drainJobObject
+// then returns nil on its first poll instead of reporting the bound.
+//
+// groupDrainBound and terminateJobObjectFunc are mutated, so this test
+// does not run in parallel with the package's other parallel tests.
+func TestDrainJobObject_UnreadableMemberList(t *testing.T) {
+	origBound, origTerm := groupDrainBound, terminateJobObjectFunc
+	defer func() { groupDrainBound, terminateJobObjectFunc = origBound, origTerm }()
+
+	groupDrainBound = 50 * time.Millisecond
+	terminateJobObjectFunc = func(windows.Handle, uint32) error { return nil }
+
+	err := drainJobObject(4242, windows.InvalidHandle)
+
+	if err == nil {
+		t.Fatal("drainJobObject(unreadable job) error = nil, want non-nil (an unread member list does not confirm an empty job)")
+	}
+}
