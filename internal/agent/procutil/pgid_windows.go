@@ -341,6 +341,14 @@ func jobHasRunningMember(job windows.Handle) bool {
 	return false
 }
 
+// isConsoleHostImage reports whether name, a process image base name,
+// names the Windows console host. Windows starts one for a client with
+// no console to inherit, so it is never a process an operator's own
+// command started, whatever started it.
+func isConsoleHostImage(name string) bool {
+	return strings.EqualFold(name, "conhost.exe")
+}
+
 // memberIsRunning reports whether pid, read from job's own member
 // list, is still a running, non-console-host member of job. Confirming
 // membership through IsProcessInJob after opening the PID by number
@@ -357,13 +365,19 @@ func memberIsRunning(job windows.Handle, pid uint32) bool {
 		return false
 	}
 
-	event, err := windows.WaitForSingleObject(handle, 0)
-	if err != nil || event != uint32(windows.WAIT_TIMEOUT) {
+	if image, err := queryImageBaseName(handle); err == nil && isConsoleHostImage(image) {
 		return false
 	}
 
-	if image, err := queryImageBaseName(handle); err == nil && strings.EqualFold(image, "conhost.exe") {
-		return false
-	}
-	return true
+	// Read last, after the name query rather than before it: a member
+	// that exits between opening its handle and here can make
+	// queryImageBaseName fail with no console host ever having been
+	// named, and a query failure must not default to counting the
+	// member. Its current state, not a name that could not be read,
+	// decides whether it still counts; WaitForSingleObject signals a
+	// process handle exactly when the process terminates, so a query
+	// failure caused by the same exit is resolved by this same check
+	// finding the handle already signaled.
+	event, err := windows.WaitForSingleObject(handle, 0)
+	return err == nil && event == uint32(windows.WAIT_TIMEOUT)
 }

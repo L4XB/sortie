@@ -408,7 +408,11 @@ func processIsRunning(pid uint32) bool {
 // by any handle of ours, so each candidate is confirmed still running
 // before it is reported; a candidate that has exited, or whose
 // identifier was recycled, is dropped rather than reported as a
-// survivor.
+// survivor. A console host is dropped the same way the leftover report
+// drops one, by image base name; the snapshot this walk reads it from
+// carries the name for every entry it holds, so unlike the leftover
+// report's live query this exclusion has no candidate whose name it
+// could fail to read.
 func scanSurvivors(rootPID uint32, jobPIDs []uint32) ([]jobSurvivor, error) {
 	snapshot, err := createToolhelp32SnapshotRetry(windows.TH32CS_SNAPPROCESS, 0)
 	if err != nil {
@@ -469,6 +473,9 @@ func scanSurvivors(rootPID uint32, jobPIDs []uint32) ([]jobSurvivor, error) {
 	survivors := make([]jobSurvivor, 0, len(closure))
 	for _, e := range entries {
 		if !closure[e.pid] {
+			continue
+		}
+		if isConsoleHostImage(e.image) {
 			continue
 		}
 		if !processIsRunning(e.pid) {
