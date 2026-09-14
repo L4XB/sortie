@@ -19,7 +19,7 @@ func TestStartWithOwnedPipes_Success(t *testing.T) {
 	t.Parallel()
 
 	cmd := fakeRuntimeCmd(t, agenttest.Output{Stdout: "out-line\n", Stderr: "err-line\n"})
-	pipes, err := StartWithOwnedPipes(cmd)
+	pipes, err := StartWithOwnedPipes(cmd, nil)
 	if err != nil {
 		t.Fatalf("StartWithOwnedPipes() error = %v, want nil", err)
 	}
@@ -61,7 +61,7 @@ func TestStartWithOwnedPipes_StageProcessStart(t *testing.T) {
 	t.Parallel()
 
 	cmd := exec.Command("sortie-nonexistent-binary-99999")
-	pipes, err := StartWithOwnedPipes(cmd)
+	pipes, err := StartWithOwnedPipes(cmd, nil)
 	if pipes != nil {
 		t.Errorf("StartWithOwnedPipes() pipes = %v, want nil", pipes)
 	}
@@ -228,7 +228,7 @@ func TestStartWithOwnedPipes_ParentWriteEndCloseIsLoadBearing(t *testing.T) {
 		t.Parallel()
 
 		cmd := fakeRuntimeCmd(t, agenttest.Output{})
-		pipes, err := StartWithOwnedPipes(cmd)
+		pipes, err := StartWithOwnedPipes(cmd, nil)
 		if err != nil {
 			t.Fatalf("StartWithOwnedPipes() error = %v, want nil", err)
 		}

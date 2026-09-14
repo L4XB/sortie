@@ -234,7 +234,7 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 	cmd.Dir = state.target.WorkspacePath
 	cmd.Env = env
 
-	pipes, err := procutil.StartWithOwnedPipes(cmd)
+	pipes, err := procutil.StartWithOwnedPipes(cmd, logger)
 	if err != nil {
 		state.mu.Unlock()
 
@@ -259,7 +259,7 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 				Message: "create stderr pipe",
 				Err:     startErr.Err,
 			}
-		default: // procutil.StageProcessStart
+		default: // procutil.StageProcessStart, procutil.StageProcessResume
 			return domain.TurnResult{}, &domain.AgentError{
 				Kind:    domain.ErrResponseError,
 				Message: "start opencode subprocess",
@@ -283,13 +283,9 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 	state.active = runtime
 	state.mu.Unlock()
 
-	if assignErr := procutil.AssignProcess(cmd.Process.Pid, cmd.Process); assignErr != nil {
-		logger.Warn("process group assignment failed", slog.Any("error", assignErr))
-	}
-
 	runtime.stderrCollector = procutil.NewStderrCollector(pipes.Stderr, logger)
 	runtime.reader = procutil.NewStdoutReader(pipes.Stdout, logger)
-	startWait(runtime, cmd)
+	startWait(runtime, cmd, logger)
 
 	emit := func(event domain.AgentEvent) {
 		if state.target.RemoteCommand == "" {
@@ -702,9 +698,9 @@ func (s *sessionState) applySessionEvent(eventSessionID string) (bool, bool) {
 // startWait reaps the turn's subprocess independently of its stdout
 // reader and, once the reap and group kill have run, bounds the wait
 // for the turn's stderr drain before reading it.
-func startWait(runtime *turnRuntime, cmd *exec.Cmd) {
+func startWait(runtime *turnRuntime, cmd *exec.Cmd, logger *slog.Logger) {
 	go func() {
-		reaper := procutil.StartReaper(cmd)
+		reaper := procutil.StartReaper(cmd, logger)
 		<-reaper.Done()
 
 		// The turn's exit is published below, behind a stderr bound that

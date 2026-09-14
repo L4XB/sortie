@@ -252,7 +252,7 @@ func (s *ForkPerTurnSession) RunTurn(
 	// arriving in a reopened window cannot read s.proc == nil and miss
 	// signaling a process that was about to be recorded.
 	s.mu.Lock()
-	pipes, err := procutil.StartWithOwnedPipes(cmd)
+	pipes, err := procutil.StartWithOwnedPipes(cmd, s.logger)
 	if err != nil {
 		s.mu.Unlock()
 
@@ -278,7 +278,7 @@ func (s *ForkPerTurnSession) RunTurn(
 				Message: "failed to create stderr pipe",
 				Err:     startErr.Err,
 			}
-		default: // procutil.StageProcessStart
+		default: // procutil.StageProcessStart, procutil.StageProcessResume
 			if ctx.Err() != nil {
 				usage := s.hooks.GetUsage()
 				EmitTurnCancelled(emit, "context cancelled", usage)
@@ -307,9 +307,6 @@ func (s *ForkPerTurnSession) RunTurn(
 	// close here cannot cut that bound short.
 	defer pipes.Close() //nolint:errcheck,gosec // best-effort cleanup
 
-	if assignErr := procutil.AssignProcess(cmd.Process.Pid, cmd.Process); assignErr != nil {
-		s.logger.Warn("process group assignment failed", slog.Any("error", assignErr))
-	}
 	s.turns = prospectiveTurn
 	s.proc = cmd.Process
 	s.waitCh = make(chan struct{})
@@ -323,7 +320,7 @@ func (s *ForkPerTurnSession) RunTurn(
 
 	stderrCollector := procutil.NewStderrCollector(pipes.Stderr, s.logger)
 	reader := procutil.NewStdoutReader(pipes.Stdout, s.logger)
-	reaper := procutil.StartReaper(cmd)
+	reaper := procutil.StartReaper(cmd, s.logger)
 
 	var lastParsed any
 	parseLine := func(line []byte) {

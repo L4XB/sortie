@@ -95,7 +95,7 @@ func TestReaper_KillsProcessGroupBeforeDoneCloses(t *testing.T) {
 
 	childPID := pollReaperTestPIDFile(t, pidFile, 5*time.Second)
 
-	r := StartReaper(cmd)
+	r := StartReaper(cmd, nil)
 	select {
 	case <-r.Done():
 	case <-time.After(5 * time.Second):

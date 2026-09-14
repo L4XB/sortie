@@ -9,7 +9,7 @@ cmd/sortie → internal/* (wiring only)
 server → domain, orchestrator
 orchestrator → domain, config, persistence, workspace, registry, prompt, workflow, logging, adapter-family packages that register no kind (scm/scmcore, agent/procutil); kind packages only via registry
 workflow → config, prompt
-workspace → domain, config, persistence
+workspace → domain, config, persistence, agent/procutil
 persistence → domain, config
 registry → domain, typeutil
 tracker/*, scm/*, agent/*, notify/* → domain, registry, logging, trackermetrics, *kit/*util, packages under their own family root that register no kind; no cross-adapter imports

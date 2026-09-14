@@ -24,6 +24,7 @@
 package kiro
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"os"
@@ -32,6 +33,7 @@ import (
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/logging"
 	"github.com/sortie-ai/sortie/internal/registry"
@@ -131,7 +133,7 @@ func (a *KiroAdapter) StartSession(ctx context.Context, params domain.StartSessi
 	}
 
 	if target.RemoteCommand == "" {
-		if authErr := checkCredential(ctx, target.Command); authErr != nil {
+		if authErr := checkCredential(ctx, target.Command, procutil.StopGrace(params.AgentConfig.StopGraceMS)); authErr != nil {
 			return domain.Session{}, authErr
 		}
 	} else {
@@ -209,7 +211,7 @@ func (a *KiroAdapter) StartSession(ctx context.Context, params domain.StartSessi
 // could not confirm the credential (a timeout or non-zero exit), not that
 // the agent is missing. It is classified as a retryable credential problem
 // rather than the non-retryable [domain.ErrAgentNotFound].
-func checkCredential(ctx context.Context, command string) *domain.AgentError {
+func checkCredential(ctx context.Context, command string, stopGrace time.Duration) *domain.AgentError {
 	if strings.TrimSpace(os.Getenv("KIRO_API_KEY")) == "" {
 		return &domain.AgentError{
 			Kind:    domain.ErrResponseError,
@@ -220,8 +222,14 @@ func checkCredential(ctx context.Context, command string) *domain.AgentError {
 	canaryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	out, canaryErr := exec.CommandContext(canaryCtx, command, "whoami").CombinedOutput() //nolint:gosec // command resolved by ResolveLaunchTarget via LookPath
-	if canaryErr != nil {
+	cmd := exec.CommandContext(canaryCtx, command, "whoami") //nolint:gosec // command resolved by ResolveLaunchTarget via LookPath
+	var combined bytes.Buffer
+	result, startErr := procutil.RunCapture(cmd, stopGrace, procutil.CaptureParams{Stdout: &combined, Stderr: &combined})
+	if startErr != nil || result.WaitErr != nil {
+		canaryErr := startErr
+		if canaryErr == nil {
+			canaryErr = result.WaitErr
+		}
 		return &domain.AgentError{
 			Kind:    domain.ErrResponseError,
 			Message: "kiro-cli whoami canary timed out or exited non-zero",
@@ -229,7 +237,7 @@ func checkCredential(ctx context.Context, command string) *domain.AgentError {
 		}
 	}
 
-	output := string(out)
+	output := combined.String()
 	if strings.Contains(output, authFailedMarker) || !strings.Contains(output, whoamiSuccessMarker) {
 		return &domain.AgentError{
 			Kind:    domain.ErrResponseError,

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/workspace"
 )
@@ -262,7 +263,7 @@ func RunReactionTriage(
 	env["SORTIE_REACTION_RESULT"] = resultPath
 
 	started := time.Now()
-	_, hookErr := workspace.RunHook(ctx, workspace.HookParams{
+	hookResult, hookErr := workspace.RunHook(ctx, workspace.HookParams{
 		Script:    cfg.Script,
 		Dir:       pathResult.Path,
 		Env:       env,
@@ -273,13 +274,21 @@ func RunReactionTriage(
 	if hookErr != nil {
 		output := ""
 		op := ""
+		terminatedLeftovers := false
 		if he, ok := errors.AsType[*workspace.HookError](hookErr); ok {
 			output = he.Output
 			op = he.Op
+			terminatedLeftovers = he.TerminatedLeftovers
+		}
+		if terminatedLeftovers {
+			log.Info(procutil.LeftoversTerminatedMessage, slog.String("reaction_kind", req.Kind)) //nolint:sloglint // procutil.LeftoversTerminatedMessage is a fixed string constant
 		}
 		return finish(triageFallbackOutcome(fallbackForHookOp(op), elapsed), output)
 	}
 
+	if hookResult.TerminatedLeftovers {
+		log.Info(procutil.LeftoversTerminatedMessage, slog.String("reaction_kind", req.Kind)) //nolint:sloglint // procutil.LeftoversTerminatedMessage is a fixed string constant
+	}
 	return finish(decodeResult(resultPath, elapsed), "")
 }
 

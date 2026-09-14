@@ -32,3 +32,24 @@ func SetGroupCancel(cmd *exec.Cmd, grace time.Duration) {
 	}
 	cmd.WaitDelay = grace
 }
+
+// SetGroupKill prepares cmd so that cancelling the context it was built
+// with terminates its process group (or Job Object on Windows) at once,
+// with no catchable signal first. It places cmd in its own process
+// group and leaves cmd.WaitDelay zero: a capture's own pipes are never
+// waited on by os/exec, so nothing needs the escalation to a force kill
+// that WaitDelay exists to provide.
+//
+// Call it before [exec.Cmd.Start], on a command created with
+// [exec.CommandContext].
+func SetGroupKill(cmd *exec.Cmd) {
+	SetProcessGroup(cmd)
+	cmd.Cancel = func() error {
+		killErr := KillProcessGroup(cmd.Process.Pid)
+		procErr := cmd.Process.Kill()
+		if killErr != nil {
+			return killErr
+		}
+		return procErr
+	}
+}

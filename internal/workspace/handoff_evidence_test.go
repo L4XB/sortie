@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"testing"
 )
 
@@ -177,5 +179,27 @@ func TestHandoffEvidenceNonGitWorkspace(t *testing.T) {
 	_, err := CaptureHandoffEvidenceBaseline(context.Background(), dir)
 	if !errors.Is(err, ErrNotGitWorkspace) {
 		t.Fatalf("CaptureHandoffEvidenceBaseline error = %v, want ErrNotGitWorkspace", err)
+	}
+}
+
+// TestGitCommand_DisablesFilesystemMonitorOnlyOnWindows pins P20:
+// GitCommand disables Git's filesystem monitor only on Windows, and
+// otherwise passes args through unchanged; Dir is always set to dir.
+func TestGitCommand_DisablesFilesystemMonitorOnlyOnWindows(t *testing.T) {
+	dir := t.TempDir()
+	cmd := GitCommand(context.Background(), dir, "status")
+
+	if cmd.Dir != dir {
+		t.Errorf("Dir = %q, want %q", cmd.Dir, dir)
+	}
+
+	var wantArgs []string
+	if runtime.GOOS == "windows" {
+		wantArgs = []string{"git", "-c", "core.fsmonitor=false", "status"}
+	} else {
+		wantArgs = []string{"git", "status"}
+	}
+	if !slices.Equal(cmd.Args, wantArgs) {
+		t.Errorf("Args = %v, want %v", cmd.Args, wantArgs)
 	}
 }

@@ -62,6 +62,11 @@ type HookError struct {
 	// truncation marker when earlier output was dropped.
 	Output string
 
+	// TerminatedLeftovers is true when the hook exited on its own and
+	// its termination reached a process of its tree other than the
+	// hook script itself.
+	TerminatedLeftovers bool
+
 	// Err is the underlying error.
 	Err error
 }

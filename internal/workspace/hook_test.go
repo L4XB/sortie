@@ -7,13 +7,37 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
 )
+
+// hookLogBuffer is a bytes.Buffer guarded by a mutex, for capturing
+// records logged through slog.Default while a hook's own subprocess
+// output is drained concurrently.
+type hookLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *hookLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *hookLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 func assertHookErrorOp(t *testing.T, err error, wantOp string) {
 	t.Helper()
@@ -570,6 +594,111 @@ func TestTruncateScript(t *testing.T) {
 				t.Errorf("truncateScript() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestRunHook_HeldAndNullRedirectedBackgroundProcessesTerminated pins
+// P12: a script that prints a line, backgrounds a held descendant
+// holding the hook's output, and backgrounds a second process whose
+// output is redirected away, then exits 0. RunHook returns within 2s
+// with the line and no error, logs no CaptureAbandonedWarning record,
+// and both background processes are gone.
+func TestRunHook_HeldAndNullRedirectedBackgroundProcessesTerminated(t *testing.T) {
+	origDefault := slog.Default()
+	logBuf := &hookLogBuffer{}
+	slog.SetDefault(slog.New(slog.NewTextHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(origDefault) })
+
+	dir := t.TempDir()
+	heldPIDFile := filepath.Join(dir, "held.pid")
+	nullPIDFile := filepath.Join(dir, "null.pid")
+	script := fmt.Sprintf(
+		"echo hello\nsleep 30 & echo $! > %q\nsleep 30 >/dev/null 2>&1 & echo $! > %q\n",
+		heldPIDFile, nullPIDFile,
+	)
+
+	start := time.Now()
+	result, err := RunHook(context.Background(), HookParams{
+		Script:    script,
+		Dir:       t.TempDir(),
+		Env:       map[string]string{},
+		TimeoutMS: 5000,
+	})
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("RunHook() took %v, want within 2s", elapsed)
+	}
+	if err != nil {
+		t.Fatalf("RunHook() error = %v", err)
+	}
+	if !strings.Contains(result.Output, "hello") {
+		t.Errorf("Output = %q, want it to contain %q", result.Output, "hello")
+	}
+	if out := logBuf.String(); strings.Contains(out, procutil.CaptureAbandonedWarning) {
+		t.Errorf("log output contains %q, want no abandonment WARN; got %q", procutil.CaptureAbandonedWarning, out)
+	}
+
+	heldPID := readHookPIDFile(t, heldPIDFile)
+	nullPID := readHookPIDFile(t, nullPIDFile)
+	assertHookProcessGone(t, heldPID)
+	assertHookProcessGone(t, nullPID)
+}
+
+// readHookPIDFile reads a PID a background job wrote via "echo $!" to
+// path.
+func readHookPIDFile(t *testing.T, path string) int {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) = %v", path, err)
+	}
+	var pid int
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &pid); err != nil || pid <= 0 {
+		t.Fatalf("parse PID from %q = %q: %v", path, data, err)
+	}
+	return pid
+}
+
+// assertHookProcessGone polls until kill(pid, 0) reports ESRCH, or
+// fails t after a bound well under the 30s the fixture's background
+// sleeps run for.
+func assertHookProcessGone(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Errorf("process %d still answers signal 0, want it gone", pid)
+}
+
+// TestRunHook_XDGRuntimeDirAndDBusAddressInherited pins P21: a hook
+// receives XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS from the
+// parent process with their exact values, so it can reach a systemd
+// user manager, while an unrelated variable stays excluded.
+func TestRunHook_XDGRuntimeDirAndDBusAddressInherited(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", "/run/user/1234")
+	t.Setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1234/bus")
+	t.Setenv("TEST_SECRET_LEAK_CANARY", "leak-me-not")
+
+	result, err := RunHook(context.Background(), HookParams{
+		Script:    "env",
+		Dir:       t.TempDir(),
+		Env:       map[string]string{},
+		TimeoutMS: 5000,
+	})
+	if err != nil {
+		t.Fatalf("RunHook() error: %v", err)
+	}
+	if !strings.Contains(result.Output, "XDG_RUNTIME_DIR=/run/user/1234") {
+		t.Errorf("Output = %q, want it to contain %q", result.Output, "XDG_RUNTIME_DIR=/run/user/1234")
+	}
+	if !strings.Contains(result.Output, "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1234/bus") {
+		t.Errorf("Output = %q, want it to contain %q", result.Output, "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1234/bus")
+	}
+	if strings.Contains(result.Output, "TEST_SECRET_LEAK_CANARY") {
+		t.Error("hook env contains TEST_SECRET_LEAK_CANARY, want it excluded")
 	}
 }
 

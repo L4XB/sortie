@@ -11,14 +11,16 @@ func normalizeEnvKey(key string) string { return key }
 // stripped so that secrets are not present in the hook subprocess
 // environment unless explicitly injected via SORTIE_* prefixed vars.
 var allowedEnvKeys = map[string]bool{
-	"PATH":          true,
-	"HOME":          true,
-	"SHELL":         true,
-	"TMPDIR":        true,
-	"USER":          true,
-	"LOGNAME":       true,
-	"TERM":          true,
-	"LANG":          true,
-	"LC_ALL":        true,
-	"SSH_AUTH_SOCK": true,
+	"PATH":                     true,
+	"HOME":                     true,
+	"SHELL":                    true,
+	"TMPDIR":                   true,
+	"USER":                     true,
+	"LOGNAME":                  true,
+	"TERM":                     true,
+	"LANG":                     true,
+	"LC_ALL":                   true,
+	"SSH_AUTH_SOCK":            true,
+	"XDG_RUNTIME_DIR":          true,
+	"DBUS_SESSION_BUS_ADDRESS": true,
 }
