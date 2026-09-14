@@ -299,7 +299,15 @@ func runHookHelperScenario(_ []string, p runHookHelperParams) int {
 	if marshalErr != nil {
 		return 2
 	}
-	if writeErr := os.WriteFile(p.ResultPath, data, 0o600); writeErr != nil {
+	// The reader polls for the file and retries only a failed read, so a
+	// path it can open while the write is still in flight hands it a
+	// partial document it cannot parse. Renaming a fully written file
+	// into place leaves nothing at ResultPath for it to read early.
+	tmpPath := p.ResultPath + ".tmp"
+	if writeErr := os.WriteFile(tmpPath, data, 0o600); writeErr != nil {
+		return 2
+	}
+	if renameErr := os.Rename(tmpPath, p.ResultPath); renameErr != nil {
 		return 2
 	}
 	return 0
