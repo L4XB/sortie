@@ -5,6 +5,7 @@ package procutil
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
 	"os/exec"
@@ -372,7 +373,7 @@ func TestStartReaper_DoneWaitsForGroupDrain(t *testing.T) {
 		return syscall.ESRCH
 	}
 
-	r := StartReaper(cmd)
+	r := StartReaper(cmd, nil)
 
 	select {
 	case <-r.Done():
@@ -389,5 +390,140 @@ func TestStartReaper_DoneWaitsForGroupDrain(t *testing.T) {
 	}
 	if calls < 3 {
 		t.Errorf("groupKillFunc call count = %d, want >= 3 (the drain must resend before Done closes)", calls)
+	}
+}
+
+// blockingWarnHandler wraps a [captureLogSpy] and blocks inside Handle
+// for the one record whose message equals msg, signaling hit once it
+// has entered that block. A test uses hit to know the record has been
+// handed to the logger, then release to let the call return, so it can
+// observe that [Reaper.Done] is still open while StartReaper's log call
+// is in flight and only closes once that call has returned.
+type blockingWarnHandler struct {
+	inner   *captureLogSpy
+	msg     string
+	hit     chan struct{}
+	release chan struct{}
+}
+
+func (h *blockingWarnHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *blockingWarnHandler) Handle(ctx context.Context, r slog.Record) error {
+	err := h.inner.Handle(ctx, r)
+	if r.Message == h.msg {
+		close(h.hit)
+		<-h.release
+	}
+	return err
+}
+
+func (h *blockingWarnHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *blockingWarnHandler) WithGroup(string) slog.Handler      { return h }
+
+// TestStartReaper_CleanupFailureLogsOneRecordBeforeDoneCloses pins the
+// fix's core claim: a reap whose group termination cannot prove the
+// process tree gone logs exactly one CaptureCleanupWarning record,
+// carrying the command and error attributes, and that record is written
+// before Done closes rather than after.
+//
+// groupKillFunc and groupDrainBound are mutated, so this test does not
+// run in parallel with the package's other parallel tests.
+func TestStartReaper_CleanupFailureLogsOneRecordBeforeDoneCloses(t *testing.T) {
+	origBound, origKill := groupDrainBound, groupKillFunc
+	t.Cleanup(func() { groupDrainBound, groupKillFunc = origBound, origKill })
+	groupDrainBound = 100 * time.Millisecond
+	groupKillFunc = func(int, syscall.Signal) error { return nil }
+
+	cmd := fakeRuntimeCmd(t, agenttest.Output{})
+	SetProcessGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("cmd.Start() = %v", err)
+	}
+
+	spy := &captureLogSpy{}
+	handler := &blockingWarnHandler{inner: spy, msg: CaptureCleanupWarning, hit: make(chan struct{}), release: make(chan struct{})}
+	logger := slog.New(handler)
+
+	r := StartReaper(cmd, logger)
+
+	select {
+	case <-handler.hit:
+	case <-time.After(3 * time.Second):
+		t.Fatal("CaptureCleanupWarning was not logged within 3s")
+	}
+
+	select {
+	case <-r.Done():
+		t.Fatal("Done() closed before the blocked log call returned, want the record written first")
+	default:
+	}
+
+	close(handler.release)
+
+	select {
+	case <-r.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("Done() did not close after the log call was allowed to return")
+	}
+
+	var matches []captureLogRecord
+	for _, rec := range spy.snapshot() {
+		if rec.Msg == CaptureCleanupWarning {
+			matches = append(matches, rec)
+		}
+	}
+	if len(matches) != 1 {
+		t.Fatalf("CaptureCleanupWarning logged %d times, want exactly 1", len(matches))
+	}
+	rec := matches[0]
+	if got := len(rec.Attrs); got != 2 {
+		t.Errorf("record carries %d attributes, want exactly 2 (command, error); got %v", got, rec.Attrs)
+	}
+	if _, ok := rec.Attrs["command"]; !ok {
+		t.Error("record missing the command attribute")
+	}
+	if _, ok := rec.Attrs["error"]; !ok {
+		t.Error("record missing the error attribute")
+	}
+}
+
+// TestStartReaper_NilLoggerLogsThroughDefault pins StartReaper's nil
+// fallback: a reap started with a nil logger neither panics nor loses
+// the CaptureCleanupWarning record, which lands on slog.Default().
+//
+// groupKillFunc and groupDrainBound are mutated and slog.Default() is
+// replaced, so this test does not run in parallel with the package's
+// other parallel tests.
+func TestStartReaper_NilLoggerLogsThroughDefault(t *testing.T) {
+	origBound, origKill := groupDrainBound, groupKillFunc
+	t.Cleanup(func() { groupDrainBound, groupKillFunc = origBound, origKill })
+	groupDrainBound = 100 * time.Millisecond
+	groupKillFunc = func(int, syscall.Signal) error { return nil }
+
+	spy := &captureLogSpy{}
+	origDefault := slog.Default()
+	slog.SetDefault(slog.New(spy))
+	t.Cleanup(func() { slog.SetDefault(origDefault) })
+
+	cmd := fakeRuntimeCmd(t, agenttest.Output{})
+	SetProcessGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("cmd.Start() = %v", err)
+	}
+
+	r := StartReaper(cmd, nil)
+
+	select {
+	case <-r.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("Done() did not close within 3s")
+	}
+
+	record, ok := findCaptureLogRecord(spy, CaptureCleanupWarning)
+	if !ok {
+		t.Fatal("a nil logger lost the CaptureCleanupWarning record, want it logged through slog.Default()")
+	}
+	if got := len(record.Attrs); got != 2 {
+		t.Errorf("record carries %d attributes, want exactly 2 (command, error); got %v", got, record.Attrs)
 	}
 }

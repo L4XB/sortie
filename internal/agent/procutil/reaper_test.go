@@ -25,7 +25,7 @@ func TestReaper_DoneAndErr(t *testing.T) {
 			t.Fatalf("cmd.Start() = %v", err)
 		}
 
-		r := StartReaper(cmd)
+		r := StartReaper(cmd, nil)
 		select {
 		case <-r.Done():
 		case <-time.After(3 * time.Second):
@@ -50,7 +50,7 @@ func TestReaper_DoneAndErr(t *testing.T) {
 			t.Fatalf("cmd.Start() = %v", err)
 		}
 
-		r := StartReaper(cmd)
+		r := StartReaper(cmd, nil)
 		select {
 		case <-r.Done():
 		case <-time.After(3 * time.Second):
@@ -70,7 +70,7 @@ func TestReaper_DoneAndErr(t *testing.T) {
 			t.Fatalf("cmd.Start() = %v", err)
 		}
 
-		r := StartReaper(cmd)
+		r := StartReaper(cmd, nil)
 		select {
 		case <-r.Done():
 			t.Fatal("Done() closed before the subprocess exited")
@@ -105,7 +105,7 @@ func TestReaper_OutputSurvivesAfterDoneCloses(t *testing.T) {
 	}
 	t.Cleanup(func() { pipes.Close() }) //nolint:errcheck // best-effort cleanup
 
-	r := StartReaper(cmd)
+	r := StartReaper(cmd, nil)
 	select {
 	case <-r.Done():
 	case <-time.After(5 * time.Second):
@@ -139,7 +139,7 @@ func TestReaper_ClosingStdoutAtDoneLosesOutput(t *testing.T) {
 	}
 	t.Cleanup(func() { pipes.Close() }) //nolint:errcheck // best-effort cleanup
 
-	r := StartReaper(cmd)
+	r := StartReaper(cmd, nil)
 	select {
 	case <-r.Done():
 	case <-time.After(5 * time.Second):

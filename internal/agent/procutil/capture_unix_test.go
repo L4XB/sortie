@@ -470,6 +470,44 @@ func TestRunCapture_SIGTERMTrapMarkerCollected(t *testing.T) {
 	}
 }
 
+// TestStartCapture_CleanupFailureLogsExactlyOneRecord pins the other
+// half of the fix: a captured launch whose group termination cannot
+// prove the process tree gone logs exactly one CaptureCleanupWarning
+// record, not two. Before the fix, both StartReaper's caller-agnostic
+// logging and Capture.Wait's own copy fired for the same failure; this
+// pins that the duplicate is gone.
+//
+// groupKillFunc and groupDrainBound are mutated, so this test does not
+// run in parallel with the package's other parallel tests.
+func TestStartCapture_CleanupFailureLogsExactlyOneRecord(t *testing.T) {
+	origBound, origKill := groupDrainBound, groupKillFunc
+	t.Cleanup(func() { groupDrainBound, groupKillFunc = origBound, origKill })
+	groupDrainBound = 100 * time.Millisecond
+	groupKillFunc = func(int, syscall.Signal) error { return nil }
+
+	cmd := fakeRuntimeCmd(t, agenttest.Output{})
+	SetProcessGroup(cmd)
+	spy := &captureLogSpy{}
+	logger := slog.New(spy)
+
+	c, err := StartCapture(cmd, CaptureParams{Logger: logger})
+	if err != nil {
+		t.Fatalf("StartCapture() error = %v", err)
+	}
+
+	waitCaptureResult(t, c, groupDrainBound+5*time.Second)
+
+	var count int
+	for _, r := range spy.snapshot() {
+		if r.Msg == CaptureCleanupWarning {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("CaptureCleanupWarning logged %d times for a captured launch, want exactly 1 (Capture.Wait must not log its own duplicate copy)", count)
+	}
+}
+
 // TestSetGroupKill_CancellationSendsSIGKILLNotGraceful pins P19:
 // SetGroupKill's cancellation terminates the group with SIGKILL at
 // once, with no catchable signal first, so a direct child that ignores
