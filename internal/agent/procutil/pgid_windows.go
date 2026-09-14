@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -133,6 +134,10 @@ func processAlreadyGone(err error) bool {
 // whether a member other than one already exited was still running
 // just before that termination. See the "Leftover report" logic this
 // mirrors for the exact membership check.
+//
+// Termination itself is bounded by [drainJobObject]: it resends until
+// jobHasRunningMember finds no member left or groupDrainBound passes,
+// mirroring the Unix path's resend-and-wait loop for the same reason.
 func killProcessGroupReportingLeftover(pid int) (leftover bool, err error) {
 	v, ok := jobs.LoadAndDelete(pid)
 	if !ok {
@@ -156,12 +161,41 @@ func killProcessGroupReportingLeftover(pid int) (leftover bool, err error) {
 	}
 
 	leftover = jobHasRunningMember(entry.job)
-	err = windows.TerminateJobObject(entry.job, jobTerminateExitCode)
+	err = drainJobObject(pid, entry.job)
 	// A failing CloseHandle means the handle was already invalid, which
-	// leaves the caller nothing to act on; the termination result is
-	// the one worth reporting.
+	// leaves the caller nothing to act on; the drain result is the one
+	// worth reporting.
 	_ = windows.CloseHandle(entry.job)
 	return leftover, err
+}
+
+// drainJobObject terminates job repeatedly, on every poll so a member
+// gained after the first termination does not outlive it, until
+// jobHasRunningMember reports none left or groupDrainBound passes. It
+// shares that bound, the poll interval, and the termination call with
+// [runJobDrain]'s own drain, but settles on jobHasRunningMember's
+// console-host exclusion and liveness rule rather than the job's raw
+// active-process count, matching the membership check
+// killProcessGroupReportingLeftover already used for the leftover
+// report.
+//
+// A non-nil error means either a termination call itself failed, or
+// the job still held a running member when the bound ran out; either
+// way a descendant may have survived the reap.
+func drainJobObject(pid int, job windows.Handle) error {
+	deadline := time.Now().Add(groupDrainBound)
+	for {
+		if termErr := terminateJobObjectFunc(job, jobTerminateExitCode); termErr != nil {
+			return termErr
+		}
+		if !jobHasRunningMember(job) {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("job object for process %d still had a running member after the %s drain bound", pid, groupDrainBound)
+		}
+		time.Sleep(groupDrainPollInterval)
+	}
 }
 
 // assignToJobObject creates an anonymous Job Object with

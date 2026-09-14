@@ -136,14 +136,6 @@ func startAndAssign(cmd *exec.Cmd, logger *slog.Logger, keepJobHandle bool) (job
 	return uintptr(dup), startedAt, nil
 }
 
-// jobDrainBound bounds runJobDrain's poll-and-terminate loop. Only a
-// test replaces it, to shorten the wait for a job that never settles.
-var jobDrainBound = 2 * time.Second
-
-// jobDrainPollInterval is the pause between runJobDrain's poll
-// iterations.
-const jobDrainPollInterval = 5 * time.Millisecond
-
 // terminateJobObjectFunc is runJobDrain's termination call. Only a test
 // replaces it, to exercise a termination that fails or does nothing.
 var terminateJobObjectFunc = windows.TerminateJobObject
@@ -176,13 +168,13 @@ type jobDrainResult struct {
 
 // runJobDrain terminates job repeatedly, on every poll so a process
 // created after the first termination does not outlive it, until the
-// job reports no active process or jobDrainBound passes. Termination
+// job reports no active process or groupDrainBound passes. Termination
 // completes asynchronously, so returning before the active count
 // reaches zero would let a dying member briefly outlive the caller with
 // its working-directory handle still open.
 func runJobDrain(job windows.Handle) jobDrainResult {
 	start := time.Now()
-	deadline := start.Add(jobDrainBound)
+	deadline := start.Add(groupDrainBound)
 
 	var result jobDrainResult
 	for {
@@ -214,7 +206,7 @@ func runJobDrain(job windows.Handle) jobDrainResult {
 			result.DrainMS = time.Since(start).Milliseconds()
 			return result
 		}
-		time.Sleep(jobDrainPollInterval)
+		time.Sleep(groupDrainPollInterval)
 	}
 }
 
