@@ -630,19 +630,58 @@ func contractBuildCmdIndex(file *ast.File, importPath string, idx *contractCmdIn
 	}
 }
 
+// contractFileImportAliases maps each import file binds to the local
+// identifier a selector qualifies it with: the explicit alias when one
+// is given, or the path's last segment otherwise. contractCmdBoundCall
+// uses it to resolve a package-qualified call, such as
+// workspace.GitCommand(...), to the import path contractBuildCmdIndex
+// keyed that function's idx.funcs entry under, so a call bound to a
+// constructor declared in another walked package is recognized exactly
+// as a same-package call is. Blank and dot imports are omitted: neither
+// binds a name a selector could qualify.
+func contractFileImportAliases(file *ast.File) map[string]string {
+	aliases := make(map[string]string, len(file.Imports))
+	for _, imp := range file.Imports {
+		path, err := strconv.Unquote(imp.Path.Value)
+		if err != nil {
+			continue
+		}
+		name := ""
+		switch {
+		case imp.Name == nil:
+			segments := strings.Split(path, "/")
+			name = segments[len(segments)-1]
+		case imp.Name.Name != "_" && imp.Name.Name != ".":
+			name = imp.Name.Name
+		}
+		if name != "" {
+			aliases[name] = path
+		}
+	}
+	return aliases
+}
+
 // contractCmdBoundCall reports whether expr is a call to exec.Command,
-// exec.CommandContext, or a function or method contractBuildCmdIndex
-// indexed as returning an exec.Cmd.
-func contractCmdBoundCall(execName string, idx *contractCmdIndex, importPath string, expr ast.Expr) bool {
+// exec.CommandContext, a package-qualified call aliasPaths resolves to a
+// function contractBuildCmdIndex indexed under that package's import
+// path, or an unqualified call to a function or method it indexed under
+// the bare name.
+func contractCmdBoundCall(execName string, idx *contractCmdIndex, importPath string, aliasPaths map[string]string, expr ast.Expr) bool {
 	call, ok := expr.(*ast.CallExpr)
 	if !ok {
 		return false
 	}
 	switch fn := call.Fun.(type) {
 	case *ast.SelectorExpr:
-		if ident, ok := fn.X.(*ast.Ident); ok && execName != "" && ident.Name == execName &&
+		ident, isIdent := fn.X.(*ast.Ident)
+		if isIdent && execName != "" && ident.Name == execName &&
 			(fn.Sel.Name == "Command" || fn.Sel.Name == "CommandContext") {
 			return true
+		}
+		if isIdent {
+			if pkgPath, isPkg := aliasPaths[ident.Name]; isPkg && idx.funcs[pkgPath+"."+fn.Sel.Name] {
+				return true
+			}
 		}
 		return idx.methods[fn.Sel.Name]
 	case *ast.Ident:
@@ -673,7 +712,7 @@ func contractProcessBoundExpr(osName string, expr ast.Expr) bool {
 // bound to an exec.Cmd and the set bound to an *os.Process, per the
 // rules contractCmdBoundCall and contractProcessBoundExpr apply to
 // their declaration or the value they were last assigned from.
-func contractCollectBoundNames(execName, osName string, idx *contractCmdIndex, importPath string, fn *ast.FuncDecl) (cmdNames, procNames map[string]bool) {
+func contractCollectBoundNames(execName, osName string, idx *contractCmdIndex, importPath string, aliasPaths map[string]string, fn *ast.FuncDecl) (cmdNames, procNames map[string]bool) {
 	cmdNames = map[string]bool{}
 	procNames = map[string]bool{}
 
@@ -730,7 +769,7 @@ func contractCollectBoundNames(execName, osName string, idx *contractCmdIndex, i
 					if i >= len(vs.Names) {
 						continue
 					}
-					if contractCmdBoundCall(execName, idx, importPath, val) {
+					if contractCmdBoundCall(execName, idx, importPath, aliasPaths, val) {
 						cmdNames[vs.Names[i].Name] = true
 					}
 					if contractProcessBoundExpr(osName, val) {
@@ -747,7 +786,7 @@ func contractCollectBoundNames(execName, osName string, idx *contractCmdIndex, i
 				if !ok {
 					continue
 				}
-				if contractCmdBoundCall(execName, idx, importPath, rhs) {
+				if contractCmdBoundCall(execName, idx, importPath, aliasPaths, rhs) {
 					cmdNames[ident.Name] = true
 				}
 				if contractProcessBoundExpr(osName, rhs) {
@@ -765,12 +804,12 @@ func contractCollectBoundNames(execName, osName string, idx *contractCmdIndex, i
 // exec.CommandContext call, a call to an indexed function or method, a
 // local identifier contractCollectBoundNames marked, or a selector
 // whose field fields declares as an exec.Cmd.
-func contractExprIsCmdBound(execName string, idx *contractCmdIndex, importPath string, cmdNames map[string]bool, fields contractCmdFields, expr ast.Expr) bool {
+func contractExprIsCmdBound(execName string, idx *contractCmdIndex, importPath string, aliasPaths map[string]string, cmdNames map[string]bool, fields contractCmdFields, expr ast.Expr) bool {
 	switch e := expr.(type) {
 	case *ast.Ident:
 		return cmdNames[e.Name]
 	case *ast.CallExpr:
-		return contractCmdBoundCall(execName, idx, importPath, e)
+		return contractCmdBoundCall(execName, idx, importPath, aliasPaths, e)
 	case *ast.SelectorExpr:
 		return fields[e.Sel.Name]
 	}
@@ -804,6 +843,7 @@ func checkContractCaptureFile(fset *token.FileSet, file *ast.File, importPath st
 	if execName == "" && osName == "" && syscallName == "" && winName == "" {
 		return violations
 	}
+	aliasPaths := contractFileImportAliases(file)
 
 	if execName != "" {
 		ast.Inspect(file, func(n ast.Node) bool {
@@ -830,7 +870,7 @@ func checkContractCaptureFile(fset *token.FileSet, file *ast.File, importPath st
 		if !ok || fn.Body == nil {
 			continue
 		}
-		cmdNames, procNames := contractCollectBoundNames(execName, osName, idx, importPath, fn)
+		cmdNames, procNames := contractCollectBoundNames(execName, osName, idx, importPath, aliasPaths, fn)
 
 		ast.Inspect(fn.Body, func(n ast.Node) bool {
 			call, ok := n.(*ast.CallExpr)
@@ -851,7 +891,7 @@ func checkContractCaptureFile(fset *token.FileSet, file *ast.File, importPath st
 					})
 					return true
 				case "Start", "Run":
-					if contractExprIsCmdBound(execName, idx, importPath, cmdNames, fields, sel.X) {
+					if contractExprIsCmdBound(execName, idx, importPath, aliasPaths, cmdNames, fields, sel.X) {
 						violations = append(violations, contractViolation{
 							pos:  fset.Position(call.Pos()),
 							text: "waits on an exec.Cmd directly; call " + contractCaptureOwner,
@@ -862,7 +902,7 @@ func checkContractCaptureFile(fset *token.FileSet, file *ast.File, importPath st
 			}
 
 			if sel.Sel.Name == "Wait" {
-				if execName != "" && contractExprIsCmdBound(execName, idx, importPath, cmdNames, fields, sel.X) {
+				if execName != "" && contractExprIsCmdBound(execName, idx, importPath, aliasPaths, cmdNames, fields, sel.X) {
 					violations = append(violations, contractViolation{
 						pos:  fset.Position(call.Pos()),
 						text: "waits on an exec.Cmd directly; call " + contractCaptureOwner,
@@ -904,18 +944,34 @@ func checkContractCaptureFile(fset *token.FileSet, file *ast.File, importPath st
 	return violations
 }
 
-// checkContractCapture applies rule CAPTURE to every non-test file in
-// pkg, building the function, method, and struct-field index from
-// pkg.files alone: a package's own exec.Cmd-returning helper and its
-// call site are always parsed together, whether pkg is one directory
-// from a tree walk or one fixture package built from a single file.
-func checkContractCapture(fset *token.FileSet, pkg contractPackage) []contractViolation {
+// contractBuildModuleCmdIndex builds one function, method, and
+// struct-field index from every non-test file across every package in
+// walked, so a caller in one package that binds a *exec.Cmd from a
+// constructor declared in another - workspace.GitCommand called from
+// internal/orchestrator, for instance - is indexed the same as a
+// same-package call site. The cost stays linear in the file count
+// contractWalkRoot already parsed: this is one more pass over files
+// already held in memory, not a second walk of the tree.
+func contractBuildModuleCmdIndex(walked []contractWalkedPackage) (*contractCmdIndex, contractCmdFields) {
 	idx := &contractCmdIndex{funcs: map[string]bool{}, methods: map[string]bool{}}
 	fields := contractCmdFields{}
-	for _, file := range pkg.files {
-		contractBuildCmdIndex(file, pkg.importPath, idx, fields)
+	for _, w := range walked {
+		for _, file := range w.pkg.files {
+			contractBuildCmdIndex(file, w.pkg.importPath, idx, fields)
+		}
 	}
+	return idx, fields
+}
 
+// checkContractCapture applies rule CAPTURE to every non-test file in
+// pkg, using idx and fields the caller built ahead of time with
+// contractBuildModuleCmdIndex. A caller checking one package in
+// isolation - a fixture test's single-file package, for instance - may
+// build idx and fields from that same package alone; a caller checking
+// a real tree builds them from every package the walk found, so a
+// cross-package call site resolves against the same index a
+// same-package one does.
+func checkContractCapture(fset *token.FileSet, pkg contractPackage, idx *contractCmdIndex, fields contractCmdFields) []contractViolation {
 	var violations []contractViolation
 	for _, file := range pkg.files {
 		violations = append(violations, checkContractCaptureFile(fset, file, pkg.importPath, idx, fields)...)
@@ -2248,10 +2304,11 @@ var contractCaptureTeardownRoots = []struct {
 }
 
 // contractWalkCaptureAndTeardown walks both contractCaptureTeardownRoots
-// through contractWalkRoot, grouping files by directory so rule
-// CAPTURE's function, method, and struct-field index is built from one
-// package's own files, and merges the two roots' packages into one
-// dir-ordered slice.
+// through contractWalkRoot, grouping files by directory, and merges the
+// two roots' packages into one dir-ordered slice. The caller builds rule
+// CAPTURE's index from the merged slice via contractBuildModuleCmdIndex,
+// so a constructor call spanning two of the walked packages resolves the
+// same way a same-package call does.
 func contractWalkCaptureAndTeardown(t *testing.T, fset *token.FileSet) []contractWalkedPackage {
 	t.Helper()
 	var walked []contractWalkedPackage
@@ -2272,10 +2329,11 @@ func contractWalkCaptureAndTeardown(t *testing.T, fset *token.FileSet) []contrac
 func TestContractCaptureAndTeardown(t *testing.T) {
 	fset := token.NewFileSet()
 	walked := contractWalkCaptureAndTeardown(t, fset)
+	idx, fields := contractBuildModuleCmdIndex(walked)
 
 	for _, w := range walked {
 		if !contractExempt(w.pkg.dirName, ruleCAPTURE) {
-			for _, v := range checkContractCapture(fset, w.pkg) {
+			for _, v := range checkContractCapture(fset, w.pkg, idx, fields) {
 				t.Errorf("%s: %s", v.pos, v.text)
 			}
 		}
@@ -3262,7 +3320,8 @@ func launch(cmd *exec.Cmd) {
 			}
 
 			pkg := contractPackage{dirName: tt.dirName, importPath: tt.importPath, files: []*ast.File{file}}
-			got := checkContractCapture(fset, pkg)
+			idx, fields := contractBuildModuleCmdIndex([]contractWalkedPackage{{pkg: pkg}})
+			got := checkContractCapture(fset, pkg, idx, fields)
 			got = append(got, checkContractTeardown(fset, file)...)
 
 			if len(got) != tt.wantCount {
@@ -3274,6 +3333,95 @@ func launch(cmd *exec.Cmd) {
 				t.Errorf("violations = %+v, want one containing %q", got, tt.wantSubstr)
 			}
 		})
+	}
+}
+
+// TestCheckContractCapture_DetectsCrossPackageConstructorViolations pins
+// that rule CAPTURE binds a call to a constructor declared in another
+// walked package, not only one declared in the caller's own package.
+// The producer fixture reproduces workspace.GitCommand's real shape - a
+// context- and dir-taking function returning *exec.Cmd, built on
+// exec.CommandContext - and the consumer fixture reproduces
+// internal/orchestrator's real call shape, assigning its result to a
+// local and hand-wiring Wait directly instead of going through
+// procutil.RunCapture or procutil.StartCapture. idx and fields are
+// built module-wide via contractBuildModuleCmdIndex across both fixture
+// packages, the way TestContractCaptureAndTeardown builds them across
+// the real walk; an idx built from the consumer package alone - the
+// defect this test guards against - indexes no function under
+// GitCommand's own import path and misses the call.
+func TestCheckContractCapture_DetectsCrossPackageConstructorViolations(t *testing.T) {
+	t.Parallel()
+
+	const producerSrc = `package workspace
+
+import (
+	"context"
+	"os/exec"
+)
+
+func GitCommand(ctx context.Context, dir string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = dir
+	return cmd
+}
+`
+
+	const consumerSrc = `package orchestrator
+
+import (
+	"context"
+	"os/exec"
+
+	"github.com/sortie-ai/sortie/internal/workspace"
+)
+
+func runVerification(ctx context.Context, command string) *exec.Cmd {
+	return exec.CommandContext(ctx, "sh", "-c", command)
+}
+
+func runGitDiff(ctx context.Context, workspacePath string, args ...string) error {
+	cmd := workspace.GitCommand(ctx, workspacePath, args...)
+	return cmd.Wait()
+}
+`
+
+	fset := token.NewFileSet()
+	producerFile, err := parser.ParseFile(fset, "workspace.go", producerSrc, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parser.ParseFile(producer): %v", err)
+	}
+	consumerFile, err := parser.ParseFile(fset, "orchestrator.go", consumerSrc, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parser.ParseFile(consumer): %v", err)
+	}
+
+	producerPkg := contractPackage{
+		dirName:    "workspace",
+		importPath: "github.com/sortie-ai/sortie/internal/workspace",
+		files:      []*ast.File{producerFile},
+	}
+	consumerPkg := contractPackage{
+		dirName:    "orchestrator",
+		importPath: contractOrchestratorPath,
+		files:      []*ast.File{consumerFile},
+	}
+
+	walked := []contractWalkedPackage{{pkg: producerPkg}, {pkg: consumerPkg}}
+	idx, fields := contractBuildModuleCmdIndex(walked)
+
+	got := checkContractCapture(fset, consumerPkg, idx, fields)
+	if len(got) != 1 {
+		t.Fatalf("checkContractCapture() on a caller of a cross-package constructor returned %d violations, want 1: %+v", len(got), got)
+	}
+	const wantSubstr = "waits on an exec.Cmd directly"
+	if !strings.Contains(got[0].text, wantSubstr) {
+		t.Errorf("violations = %+v, want one containing %q", got, wantSubstr)
+	}
+
+	producerGot := checkContractCapture(fset, producerPkg, idx, fields)
+	if len(producerGot) != 0 {
+		t.Errorf("checkContractCapture() on the constructor's own package returned %d violations, want 0: %+v", len(producerGot), producerGot)
 	}
 }
 
