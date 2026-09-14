@@ -428,6 +428,99 @@ func NewOrchestrator(params OrchestratorParams) *Orchestrator {
 	return o
 }
 
+// applyQueued calls apply for each message ch holds, in queue order,
+// without blocking, stopping at an empty receive or after cap(ch)
+// messages.
+func applyQueued[T any](ch <-chan T, apply func(T)) {
+	for range cap(ch) {
+		select {
+		case msg := <-ch:
+			apply(msg)
+		default:
+			return
+		}
+	}
+}
+
+// applyAgentEvent applies one agent event message to the running entry
+// of its issue and, only when enforceCeiling is true, evaluates the
+// in-flight token ceiling for it.
+func (o *Orchestrator) applyAgentEvent(ctx context.Context, msg agentEventMsg, enforceCeiling bool) {
+	HandleAgentEvent(o.state, msg.IssueID, msg.Event, o.logger, o.metrics)
+	o.maybeWriteIncrementalMetadata(ctx, msg.IssueID, msg.Event)
+	if enforceCeiling {
+		enforceInFlightTokenCeiling(ctx, o.state, msg.IssueID, msg.Event, o.store, o.metrics, o.logger)
+	}
+}
+
+// applySelfReviewProgress applies one self-review progress message to
+// the running entry of its issue; it does nothing when the issue has
+// none.
+func (o *Orchestrator) applySelfReviewProgress(msg selfReviewProgressMsg) {
+	entry, ok := o.state.Running[msg.IssueID]
+	if !ok {
+		return
+	}
+	if msg.Message == "self_review_done" {
+		entry.SelfReviewActive = false
+		entry.SelfReviewIteration = 0
+	} else {
+		entry.SelfReviewActive = true
+		entry.SelfReviewIteration = msg.Iteration
+	}
+}
+
+// applyQueuedAheadOfExit applies the messages queued ahead of the
+// WorkerResult of exitingIssueID, evaluating the in-flight token
+// ceiling for every applied event except those of exitingIssueID: that
+// run has already ended, so a figure it delivered can no longer be
+// stopped in flight.
+func (o *Orchestrator) applyQueuedAheadOfExit(ctx context.Context, exitingIssueID string) {
+	applyQueued(o.agentEventCh, func(msg agentEventMsg) {
+		o.applyAgentEvent(ctx, msg, msg.IssueID != exitingIssueID)
+	})
+	applyQueued(o.selfReviewCh, o.applySelfReviewProgress)
+}
+
+// handleWorkerExit applies the messages queued ahead of workerExit, so
+// they land on the run that queued them rather than on whatever entry
+// its issue holds once the exit is handled, then hands workerExit to
+// HandleWorkerExit.
+func (o *Orchestrator) handleWorkerExit(ctx context.Context, workerExit WorkerResult) {
+	o.applyQueuedAheadOfExit(ctx, workerExit.IssueID)
+
+	cfg := o.workflowManager.Config()
+	HandleWorkerExit(o.state, workerExit, HandleWorkerExitParams{
+		Store:                             o.store,
+		MaxRetryBackoffMS:                 cfg.Agent.MaxRetryBackoffMS,
+		MaxConsecutiveAbsences:            cfg.Agent.MaxConsecutiveAbsences,
+		HandoffParkingLabel:               o.handoffParkingLabel,
+		OnRetryFire:                       o.onRetryFire,
+		Ctx:                               ctx,
+		Logger:                            o.logger,
+		BeforeRemoveHook:                  cfg.Hooks.BeforeRemove,
+		HookTimeoutMS:                     cfg.Hooks.TimeoutMS,
+		TrackerAdapter:                    o.trackerAdapter,
+		HandoffState:                      cfg.Tracker.HandoffState,
+		NoChangeState:                     cfg.Tracker.NoChangeState,
+		ActiveStates:                      cfg.Tracker.ActiveStates,
+		TerminalStates:                    cfg.Tracker.TerminalStates,
+		Metrics:                           o.metrics,
+		HostPool:                          o.hostPool,
+		CommentsConfig:                    cfg.Tracker.Comments,
+		CIProvider:                        o.ciProvider,
+		SCMAdapter:                        o.scmAdapter,
+		AutoMergeReactionConfigured:       o.autoMergeReactionConfigured,
+		BotReviewReactionConfigured:       o.botReviewReactionConfigured,
+		MergeConflictReactionConfigured:   o.mergeConflictReactionConfigured,
+		LabelReviewReactionConfigured:     o.labelReviewReactionConfigured,
+		LabelFixReactionConfigured:        o.labelFixReactionConfigured,
+		MergeCompletionReactionConfigured: o.mergeCompletionReactionConfigured,
+	})
+	o.updateGauges(time.Now())
+	o.notifyObservers()
+}
+
 // Run enters the event loop, blocks until ctx is cancelled, and returns.
 // Must be called from a single goroutine. On context cancellation the
 // tick timer is stopped and a draining shutdown begins: all running
@@ -458,36 +551,7 @@ func (o *Orchestrator) Run(ctx context.Context) {
 			tickTimer.Reset(time.Duration(o.state.PollIntervalMS) * time.Millisecond)
 
 		case workerExit := <-o.workerExitCh:
-			cfg := o.workflowManager.Config()
-			HandleWorkerExit(o.state, workerExit, HandleWorkerExitParams{
-				Store:                             o.store,
-				MaxRetryBackoffMS:                 cfg.Agent.MaxRetryBackoffMS,
-				MaxConsecutiveAbsences:            cfg.Agent.MaxConsecutiveAbsences,
-				HandoffParkingLabel:               o.handoffParkingLabel,
-				OnRetryFire:                       o.onRetryFire,
-				Ctx:                               ctx,
-				Logger:                            o.logger,
-				BeforeRemoveHook:                  cfg.Hooks.BeforeRemove,
-				HookTimeoutMS:                     cfg.Hooks.TimeoutMS,
-				TrackerAdapter:                    o.trackerAdapter,
-				HandoffState:                      cfg.Tracker.HandoffState,
-				NoChangeState:                     cfg.Tracker.NoChangeState,
-				ActiveStates:                      cfg.Tracker.ActiveStates,
-				TerminalStates:                    cfg.Tracker.TerminalStates,
-				Metrics:                           o.metrics,
-				HostPool:                          o.hostPool,
-				CommentsConfig:                    cfg.Tracker.Comments,
-				CIProvider:                        o.ciProvider,
-				SCMAdapter:                        o.scmAdapter,
-				AutoMergeReactionConfigured:       o.autoMergeReactionConfigured,
-				BotReviewReactionConfigured:       o.botReviewReactionConfigured,
-				MergeConflictReactionConfigured:   o.mergeConflictReactionConfigured,
-				LabelReviewReactionConfigured:     o.labelReviewReactionConfigured,
-				LabelFixReactionConfigured:        o.labelFixReactionConfigured,
-				MergeCompletionReactionConfigured: o.mergeCompletionReactionConfigured,
-			})
-			o.updateGauges(time.Now())
-			o.notifyObservers()
+			o.handleWorkerExit(ctx, workerExit)
 
 		case issueID := <-o.retryTimerCh:
 			cfg := o.workflowManager.Config()
@@ -518,20 +582,10 @@ func (o *Orchestrator) Run(ctx context.Context) {
 			o.notifyObservers()
 
 		case msg := <-o.agentEventCh:
-			HandleAgentEvent(o.state, msg.IssueID, msg.Event, o.logger, o.metrics)
-			o.maybeWriteIncrementalMetadata(ctx, msg.IssueID, msg.Event)
-			enforceInFlightTokenCeiling(ctx, o.state, msg.IssueID, msg.Event, o.store, o.metrics, o.logger)
+			o.applyAgentEvent(ctx, msg, true)
 
 		case msg := <-o.selfReviewCh:
-			if entry, ok := o.state.Running[msg.IssueID]; ok {
-				if msg.Message == "self_review_done" {
-					entry.SelfReviewActive = false
-					entry.SelfReviewIteration = 0
-				} else {
-					entry.SelfReviewActive = true
-					entry.SelfReviewIteration = msg.Iteration
-				}
-			}
+			o.applySelfReviewProgress(msg)
 
 		case req := <-o.snapshotCh:
 			snap := RuntimeSnapshot(o.state, time.Now())
@@ -1429,6 +1483,9 @@ func (o *Orchestrator) drainRunningWorkers() {
 	for len(o.state.Running) > 0 {
 		select {
 		case workerExit := <-o.workerExitCh:
+			applyQueued(o.agentEventCh, func(msg agentEventMsg) {
+				o.applyAgentEvent(drainCtx, msg, false)
+			})
 			cfg := o.workflowManager.Config()
 			HandleWorkerExit(o.state, workerExit, HandleWorkerExitParams{
 				Store:                             o.store,
@@ -1460,8 +1517,7 @@ func (o *Orchestrator) drainRunningWorkers() {
 			o.notifyObservers()
 
 		case msg := <-o.agentEventCh:
-			HandleAgentEvent(o.state, msg.IssueID, msg.Event, o.logger, o.metrics)
-			o.maybeWriteIncrementalMetadata(drainCtx, msg.IssueID, msg.Event)
+			o.applyAgentEvent(drainCtx, msg, false)
 
 		case req := <-o.snapshotCh:
 			snap := RuntimeSnapshot(o.state, time.Now())
