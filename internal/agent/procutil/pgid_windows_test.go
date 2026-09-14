@@ -122,6 +122,38 @@ func TestKillProcessGroup_KillsChildAndGrandchild(t *testing.T) {
 	}
 }
 
+// TestKillProcessGroupReportingLeftover_ReapedFailOpenEntry pins that a
+// launch registered without a Job Object reports no cleanup error once the
+// reap has already waited for its direct child. That is the order the reap
+// runs in, so os.Process.Kill answers os.ErrProcessDone for it, and
+// reporting that would raise the cleanup warning on every launch that ran
+// without a Job Object and exited cleanly.
+func TestKillProcessGroupReportingLeftover_ReapedFailOpenEntry(t *testing.T) {
+	t.Parallel()
+
+	cmd := exec.Command("cmd.exe", "/C", "exit 0")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("cmd.Start() = %v", err)
+	}
+	pid := cmd.Process.Pid
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("cmd.Wait() = %v, want nil", err)
+	}
+
+	// A zero handle is what startAndAssign registers when Job Object
+	// creation or assignment failed and the launch ran without one.
+	registerJobAssignment(pid, cmd.Process, 0)
+	t.Cleanup(func() { jobs.Delete(pid) })
+
+	leftover, err := killProcessGroupReportingLeftover(pid)
+	if err != nil {
+		t.Errorf("killProcessGroupReportingLeftover(%d) error = %v, want nil for an already-reaped child", pid, err)
+	}
+	if leftover {
+		t.Error("leftover = true, want false (no Job Object, so no membership was read)")
+	}
+}
+
 func TestSignalGraceful_ConsoleProcess(t *testing.T) {
 	t.Parallel()
 

@@ -3,6 +3,7 @@
 package procutil
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -117,8 +118,17 @@ func killProcessGroupReportingLeftover(pid int) (leftover bool, err error) {
 	}
 	entry := v.(*jobEntry)
 	if entry.job == 0 {
-		if entry.proc != nil {
-			return false, entry.proc.Kill()
+		if entry.proc == nil {
+			return false, nil
+		}
+		// The reap waits for the direct child before it gets here, so the
+		// kill almost always finds it already gone. That is the outcome
+		// the kill was asked for, not a failure to reach it, and
+		// reporting it would raise the cleanup warning on every launch
+		// that ran without a Job Object. The Unix path maps ESRCH to nil
+		// for the same reason.
+		if killErr := entry.proc.Kill(); killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
+			return false, killErr
 		}
 		return false, nil
 	}
