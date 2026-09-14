@@ -117,6 +117,7 @@ func TestFakeRuntime_Hang(t *testing.T) {
 func TestFakeRuntime_RemovableWhileAnotherRuns(t *testing.T) {
 	t.Parallel()
 
+	idle := agenttest.FakeRuntime(t, t.TempDir(), "idle", agenttest.OutputScenario, agenttest.Output{})
 	running := agenttest.FakeRuntime(t, t.TempDir(), "running", agenttest.OutputScenario, agenttest.Output{Hang: true})
 	cmd := exec.Command(running) //nolint:gosec // running is a fake runtime under t.TempDir()
 	if err := cmd.Start(); err != nil {
@@ -127,7 +128,6 @@ func TestFakeRuntime_RemovableWhileAnotherRuns(t *testing.T) {
 		_ = cmd.Wait()
 	})
 
-	idle := agenttest.FakeRuntime(t, t.TempDir(), "idle", agenttest.OutputScenario, agenttest.Output{})
 	if err := os.Remove(idle); err != nil {
 		t.Errorf("os.Remove(%q) while another fake runtime runs = %v, want nil", idle, err)
 	}
