@@ -369,10 +369,10 @@ func TestRunJobDrain(t *testing.T) {
 		defer cleanup()
 		startCaptureTestHeldMember(t, job)
 
-		origBound, origTerm := jobDrainBound, terminateJobObjectFunc
-		defer func() { jobDrainBound, terminateJobObjectFunc = origBound, origTerm }()
+		origBound, origTerm := groupDrainBound, terminateJobObjectFunc
+		defer func() { groupDrainBound, terminateJobObjectFunc = origBound, origTerm }()
 
-		jobDrainBound = 200 * time.Millisecond
+		groupDrainBound = 200 * time.Millisecond
 		terminateJobObjectFunc = func(windows.Handle, uint32) error { return nil }
 
 		// runJobDrain itself never calls scanSurvivorsFunc: D2's survivor
@@ -403,10 +403,10 @@ func TestRunJobDrain(t *testing.T) {
 		defer cleanup()
 		startCaptureTestHeldMember(t, job)
 
-		origBound, origTerm := jobDrainBound, terminateJobObjectFunc
-		defer func() { jobDrainBound, terminateJobObjectFunc = origBound, origTerm }()
+		origBound, origTerm := groupDrainBound, terminateJobObjectFunc
+		defer func() { groupDrainBound, terminateJobObjectFunc = origBound, origTerm }()
 		wantErr := errors.New("injected termination failure")
-		jobDrainBound = 200 * time.Millisecond
+		groupDrainBound = 200 * time.Millisecond
 		terminateJobObjectFunc = func(windows.Handle, uint32) error { return wantErr }
 
 		result := runJobDrain(job)
@@ -875,11 +875,11 @@ func TestDrainCaptureJob_TeardownRecordAndSurvivorScan(t *testing.T) {
 		job, _ := newCaptureTestJob(t)
 		cmd := newCaptureTestHeldMember(t, job)
 
-		origBound, origTerm, origScan := jobDrainBound, terminateJobObjectFunc, scanSurvivorsFunc
-		defer func() { jobDrainBound, terminateJobObjectFunc, scanSurvivorsFunc = origBound, origTerm, origScan }()
+		origBound, origTerm, origScan := groupDrainBound, terminateJobObjectFunc, scanSurvivorsFunc
+		defer func() { groupDrainBound, terminateJobObjectFunc, scanSurvivorsFunc = origBound, origTerm, origScan }()
 
 		var scanCalls int
-		jobDrainBound = 200 * time.Millisecond
+		groupDrainBound = 200 * time.Millisecond
 		terminateJobObjectFunc = func(windows.Handle, uint32) error { return nil }
 		scanSurvivorsFunc = func(uint32, []uint32) ([]jobSurvivor, error) {
 			scanCalls++
@@ -919,7 +919,7 @@ func TestDrainCaptureJob_TeardownRecordAndSurvivorScan(t *testing.T) {
 		spy := &captureWinLogSpy{}
 		logger := slog.New(spy)
 
-		// The real termination settles the job well within jobDrainBound.
+		// The real termination settles the job well within groupDrainBound.
 		drainCaptureJob(uintptr(job), cmd, time.Now(), 0, logger)
 
 		if scanCalls != 0 {

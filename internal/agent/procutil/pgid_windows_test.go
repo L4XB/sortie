@@ -296,3 +296,57 @@ func TestWasSignaled_JobTermination_IsSignaled(t *testing.T) {
 		t.Errorf("WasSignaled(job-terminated) = false, want true")
 	}
 }
+
+// TestDrainJobObject pins that drainJobObject resends job termination on
+// every poll, the same reason TestKillProcessGroupReportingLeftover_ResendsUntilGone
+// resends on Unix, and reports a non-nil error once groupDrainBound
+// elapses with a member jobHasRunningMember still finds live, rather than
+// returning as soon as the first termination call was accepted.
+//
+// Cannot run on this host; on the CI Windows job this reddens under a
+// mutation that makes drainJobObject return right after the first
+// terminateJobObjectFunc call succeeds, without checking
+// jobHasRunningMember or looping: the "resends" subtest's call count
+// would drop to 1 and its nil-error check would fail, since the held
+// member newCaptureTestHeldMember started is still running.
+//
+// groupDrainBound and terminateJobObjectFunc are mutated, so this test
+// does not run in parallel with the package's other parallel tests.
+func TestDrainJobObject(t *testing.T) {
+	t.Run("resends termination while a member is held live and reports the bound-elapsed failure", func(t *testing.T) {
+		job, cleanup := newCaptureTestJob(t)
+		defer cleanup()
+		startCaptureTestHeldMember(t, job)
+
+		origBound, origTerm := groupDrainBound, terminateJobObjectFunc
+		defer func() { groupDrainBound, terminateJobObjectFunc = origBound, origTerm }()
+
+		var calls int
+		groupDrainBound = 200 * time.Millisecond
+		terminateJobObjectFunc = func(windows.Handle, uint32) error {
+			calls++
+			return nil
+		}
+
+		err := drainJobObject(4242, job)
+
+		if err == nil {
+			t.Fatal("drainJobObject() error = nil, want non-nil once the bound elapses with a member still running")
+		}
+		if calls <= 1 {
+			t.Errorf("terminateJobObjectFunc call count = %d, want > 1 (drainJobObject must resend, not terminate once)", calls)
+		}
+	})
+
+	t.Run("real termination settles the job", func(t *testing.T) {
+		job, cleanup := newCaptureTestJob(t)
+		defer cleanup()
+		startCaptureTestHeldMember(t, job)
+
+		err := drainJobObject(0, job)
+
+		if err != nil {
+			t.Errorf("drainJobObject() error = %v, want nil (the real termination settles the job)", err)
+		}
+	})
+}

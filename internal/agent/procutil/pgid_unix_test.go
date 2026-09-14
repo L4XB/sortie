@@ -233,3 +233,161 @@ func TestSetGroupCancel_CancelReachesDescendant(t *testing.T) {
 		t.Errorf("SetGroupCancel(): descendant %d still alive after cancellation, want gone", descendantPID)
 	}
 }
+
+// TestKillProcessGroupReportingLeftover_ReturnsPromptlyOnceGone pins that
+// the wait returns as soon as the group reports itself gone rather than
+// always paying groupDrainBound in full: an already-exited, already-reaped
+// group answers ESRCH on the first send, well inside a shortened bound.
+//
+// groupDrainBound is mutated, so this test does not run in parallel with
+// the package's other parallel tests.
+func TestKillProcessGroupReportingLeftover_ReturnsPromptlyOnceGone(t *testing.T) {
+	cmd := fakeRuntimeCmd(t, agenttest.Output{})
+	SetProcessGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("cmd.Start() = %v", err)
+	}
+	pid := cmd.Process.Pid
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("cmd.Wait() = %v, want nil", err)
+	}
+
+	origBound := groupDrainBound
+	t.Cleanup(func() { groupDrainBound = origBound })
+	groupDrainBound = 500 * time.Millisecond
+
+	start := time.Now()
+	leftover, err := killProcessGroupReportingLeftover(pid)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Errorf("killProcessGroupReportingLeftover(%d) error = %v, want nil (an empty group answers ESRCH)", pid, err)
+	}
+	if leftover {
+		t.Errorf("killProcessGroupReportingLeftover(%d) leftover = %t, want false", pid, leftover)
+	}
+	if elapsed >= groupDrainBound/2 {
+		t.Errorf("killProcessGroupReportingLeftover(%d) took %v, want well under the %v drain bound", pid, elapsed, groupDrainBound)
+	}
+}
+
+// TestKillProcessGroupReportingLeftover_ResendsUntilGone pins that the
+// wait resends the group signal rather than sending it once: a process
+// joining the group after the first signal is the reason the loop exists,
+// so a leftover member that only stops answering after several sends must
+// still be observed gone.
+//
+// groupKillFunc and groupDrainBound are mutated, so this test does not run
+// in parallel with the package's other parallel tests.
+func TestKillProcessGroupReportingLeftover_ResendsUntilGone(t *testing.T) {
+	origBound, origKill := groupDrainBound, groupKillFunc
+	t.Cleanup(func() { groupDrainBound, groupKillFunc = origBound, origKill })
+
+	groupDrainBound = time.Second
+	const wantCalls = 4
+	var calls int
+	groupKillFunc = func(int, syscall.Signal) error {
+		calls++
+		if calls < wantCalls {
+			return nil
+		}
+		return syscall.ESRCH
+	}
+
+	leftover, err := killProcessGroupReportingLeftover(4242)
+
+	if err != nil {
+		t.Errorf("killProcessGroupReportingLeftover() error = %v, want nil once the group reports gone", err)
+	}
+	if !leftover {
+		t.Error("leftover = false, want true (a member answered before the group reported gone)")
+	}
+	if calls != wantCalls {
+		t.Errorf("groupKillFunc call count = %d, want %d (the wait must resend a member gained after the first signal, not signal once)", calls, wantCalls)
+	}
+}
+
+// TestKillProcessGroupReportingLeftover_BoundElapsed pins that a group
+// that keeps answering past groupDrainBound is reported as a non-nil
+// error, and that the wait does not run away past the bound: it stops
+// within about one extra poll interval of it, not several multiples.
+//
+// groupKillFunc and groupDrainBound are mutated, so this test does not run
+// in parallel with the package's other parallel tests.
+func TestKillProcessGroupReportingLeftover_BoundElapsed(t *testing.T) {
+	origBound, origKill := groupDrainBound, groupKillFunc
+	t.Cleanup(func() { groupDrainBound, groupKillFunc = origBound, origKill })
+
+	groupDrainBound = 200 * time.Millisecond
+	var calls int
+	groupKillFunc = func(int, syscall.Signal) error {
+		calls++
+		return nil
+	}
+
+	start := time.Now()
+	leftover, err := killProcessGroupReportingLeftover(4242)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("killProcessGroupReportingLeftover() error = nil, want non-nil once the group keeps answering past the drain bound")
+	}
+	if !leftover {
+		t.Error("leftover = false, want true (a member answered at least once)")
+	}
+	if calls <= 1 {
+		t.Errorf("groupKillFunc call count = %d, want > 1 (the wait must resend, not signal once)", calls)
+	}
+	if overrun := elapsed - groupDrainBound; overrun > 10*groupDrainPollInterval {
+		t.Errorf("killProcessGroupReportingLeftover() took %v, %v over the %v drain bound, want at most about one poll interval (%v) over", elapsed, overrun, groupDrainBound, groupDrainPollInterval)
+	}
+}
+
+// TestStartReaper_DoneWaitsForGroupDrain pins the user-visible half of the
+// defect: StartReaper's Done must not close, and therefore a launch's
+// outcome must not be published, while killProcessGroupReportingLeftover
+// is still resending because a group member has not yet confirmed gone.
+// The direct child here exits almost immediately, so any premature close
+// of Done would come from not waiting on the group drain.
+//
+// groupKillFunc is mutated, so this test does not run in parallel with the
+// package's other parallel tests.
+func TestStartReaper_DoneWaitsForGroupDrain(t *testing.T) {
+	cmd := fakeRuntimeCmd(t, agenttest.Output{})
+	SetProcessGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("cmd.Start() = %v", err)
+	}
+
+	origKill := groupKillFunc
+	t.Cleanup(func() { groupKillFunc = origKill })
+	unlock := make(chan struct{})
+	var calls int
+	groupKillFunc = func(int, syscall.Signal) error {
+		calls++
+		if calls < 3 {
+			return nil
+		}
+		<-unlock
+		return syscall.ESRCH
+	}
+
+	r := StartReaper(cmd)
+
+	select {
+	case <-r.Done():
+		t.Fatal("Done() closed before the process group drain was allowed to finish")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(unlock)
+
+	select {
+	case <-r.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("Done() did not close after the process group drain was allowed to finish")
+	}
+	if calls < 3 {
+		t.Errorf("groupKillFunc call count = %d, want >= 3 (the drain must resend before Done closes)", calls)
+	}
+}
