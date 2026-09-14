@@ -33,10 +33,15 @@ type turnCounterOutput struct {
 	Stdout      string
 }
 
+// fakeScenarios collects every non-default fake-runtime scenario this
+// package's tests register. Platform-specific test files add their own
+// entries via init.
+var fakeScenarios = map[string]agenttest.Scenario{
+	turnCounterScenario: agenttest.Typed(runTurnCounterScenario),
+}
+
 func TestMain(m *testing.M) {
-	agenttest.Main(m, map[string]agenttest.Scenario{
-		turnCounterScenario: agenttest.Typed(runTurnCounterScenario),
-	})
+	agenttest.Main(m, fakeScenarios)
 }
 
 func runTurnCounterScenario(_ []string, params turnCounterOutput) int {
@@ -430,7 +435,7 @@ func TestCheckAuth_GhPresentButUnauthenticated(t *testing.T) {
 		t.Setenv(env, "")
 	}
 
-	err := checkAuth(context.Background())
+	err := checkAuth(context.Background(), 5*time.Second)
 	requireAgentError(t, err, domain.ErrAgentNotFound)
 }
 
@@ -448,7 +453,7 @@ func TestCheckAuth_WhitespaceOnlyToken(t *testing.T) {
 	// Point PATH to an unauthenticated fake gh so the fallback also fails.
 	t.Setenv("PATH", fakeGhBinaryDir(t))
 
-	err := checkAuth(context.Background())
+	err := checkAuth(context.Background(), 5*time.Second)
 	requireAgentError(t, err, domain.ErrAgentNotFound)
 }
 

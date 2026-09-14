@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -70,19 +71,15 @@ func (w *cappedWriter) String() string {
 }
 
 func generateWorkspaceDiff(ctx context.Context, workspacePath string, maxDiffBytes int) (diff string, originalSize int, truncated bool, err error) {
-	// Stage intent-to-add so new files appear in the diff.
-	intentCmd := exec.CommandContext(ctx, "git", "add", "--intent-to-add", ".")
-	intentCmd.Dir = workspacePath
-	_ = intentCmd.Run() // best-effort
+	// Stage intent-to-add so new files appear in the diff. Best-effort:
+	// its outcome is ignored, as before.
+	intentCmd := workspace.GitCommand(ctx, workspacePath, "add", "--intent-to-add", ".")
+	_, _ = procutil.RunCapture(intentCmd, procutil.DefaultStopGrace, procutil.CaptureParams{})
 
-	cmd := exec.CommandContext(ctx, "git", "diff", "HEAD")
-	cmd.Dir = workspacePath
-	output, cmdErr := cmd.CombinedOutput()
+	output, cmdErr := runGitDiffCombined(ctx, workspacePath, "diff", "HEAD")
 	if cmdErr != nil {
 		// Fallback: try without HEAD (empty repo with staged files).
-		cmd2 := exec.CommandContext(ctx, "git", "diff")
-		cmd2.Dir = workspacePath
-		output2, err2 := cmd2.CombinedOutput()
+		output2, err2 := runGitDiffCombined(ctx, workspacePath, "diff")
 		if err2 != nil {
 			return "", 0, false, fmt.Errorf("git diff failed: %w (fallback: %w)", cmdErr, err2)
 		}
@@ -98,6 +95,22 @@ func generateWorkspaceDiff(ctx context.Context, workspacePath string, maxDiffByt
 	return string(output), originalSize, truncated, nil
 }
 
+// runGitDiffCombined runs a Git diff command with stdout and stderr
+// merged into one sink, matching the combined-output shape the
+// self-review prompt has always embedded.
+func runGitDiffCombined(ctx context.Context, workspacePath string, args ...string) ([]byte, error) {
+	cmd := workspace.GitCommand(ctx, workspacePath, args...)
+	var combined bytes.Buffer
+	result, err := procutil.RunCapture(cmd, procutil.DefaultStopGrace, procutil.CaptureParams{Stdout: &combined, Stderr: &combined})
+	if err != nil {
+		return nil, err
+	}
+	if result.WaitErr != nil {
+		return combined.Bytes(), result.WaitErr
+	}
+	return combined.Bytes(), nil
+}
+
 func runSingleVerification(ctx context.Context, command, workspacePath string, timeoutMS int, logger *slog.Logger, metrics domain.Metrics) domain.VerificationResult {
 	var cmdCtx context.Context
 	var cancel context.CancelFunc
@@ -110,52 +123,38 @@ func runSingleVerification(ctx context.Context, command, workspacePath string, t
 
 	cmd := exec.CommandContext(cmdCtx, "sh", "-c", command) //nolint:gosec // command comes from operator-controlled config
 	cmd.Dir = workspacePath
-	// The verification command's real work always runs as a grandchild of
-	// this shell, so a cancelled or timed-out run has to be signalled
-	// across the whole group: os/exec's default reaches the shell alone
-	// and leaves the build running. The wait delay this installs also lets
-	// cmd.Wait return when Go's internal I/O goroutines are still blocked
-	// on a pipe read, which they can be on Windows after the subprocess is
-	// killed.
-	procutil.SetGroupCancel(cmd, procutil.DefaultStopGrace)
 
-	// Use cappedWriter for stdout/stderr instead of StdoutPipe/StderrPipe.
-	// On Windows, ReadFile on a pipe can remain blocked after the subprocess
-	// is killed, causing wg.Wait() to hang before cmd.Wait() is reached.
-	// Assigning direct writers lets Go manage the internal pipe goroutines
-	// and the wait delay ensures Wait returns even if those goroutines are
-	// stuck.
+	// cappedWriter never blocks the writing subprocess, so RunCapture's
+	// reader goroutines never stall on a full buffer.
 	var stdoutBuf, stderrBuf cappedWriter
 	stdoutBuf.max = int(domain.MaxVerificationOutputBytes)
 	stderrBuf.max = int(domain.MaxVerificationOutputBytes)
-	cmd.Stdout = &stdoutBuf
-	cmd.Stderr = &stderrBuf
 
 	start := time.Now()
-	if err := cmd.Start(); err != nil {
-		duration := time.Since(start)
+	result, startErr := procutil.RunCapture(cmd, procutil.DefaultStopGrace, procutil.CaptureParams{
+		Stdout: &stdoutBuf,
+		Stderr: &stderrBuf,
+		Logger: logger,
+	})
+	duration := time.Since(start)
+
+	if startErr != nil {
 		logger.Warn("verification command failed to start",
 			slog.String("command", command),
-			slog.Any("error", err),
+			slog.Any("error", startErr),
 		)
 		return domain.VerificationResult{
 			Command:        command,
 			ExitCode:       -1,
 			DurationMS:     duration.Milliseconds(),
-			ExecutionError: err.Error(),
+			ExecutionError: startErr.Error(),
 		}
 	}
 
-	err := cmd.Wait()
-	duration := time.Since(start)
-
 	metrics.ObserveSelfReviewVerificationDuration(command, duration.Seconds())
 
-	// os/exec escalates a cancellation to a force kill of the direct child
-	// alone, so reap the group here on every cancelled outcome and not
-	// only on the timeout that reports TimedOut below.
-	if cmdCtx.Err() != nil && cmd.Process != nil {
-		_ = procutil.KillProcessGroup(cmd.Process.Pid)
+	if result.TerminatedLeftovers && cmdCtx.Err() == nil {
+		logger.Info(procutil.LeftoversTerminatedMessage, slog.String("command", command)) //nolint:sloglint // procutil.LeftoversTerminatedMessage is a fixed string constant
 	}
 
 	if cmdCtx.Err() == context.DeadlineExceeded {
@@ -174,8 +173,8 @@ func runSingleVerification(ctx context.Context, command, workspacePath string, t
 	}
 
 	exitCode := 0
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
+	if result.WaitErr != nil {
+		if exitErr, ok := errors.AsType[*exec.ExitError](result.WaitErr); ok {
 			exitCode = exitErr.ExitCode()
 		} else {
 			return domain.VerificationResult{
@@ -184,7 +183,7 @@ func runSingleVerification(ctx context.Context, command, workspacePath string, t
 				Stdout:         stdoutBuf.String(),
 				Stderr:         stderrBuf.String(),
 				DurationMS:     duration.Milliseconds(),
-				ExecutionError: err.Error(),
+				ExecutionError: result.WaitErr.Error(),
 			}
 		}
 	}

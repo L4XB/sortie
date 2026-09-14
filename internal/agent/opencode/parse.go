@@ -1,6 +1,7 @@
 package opencode
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/agent/sshutil"
 )
 
@@ -202,13 +204,21 @@ func queryExportUsage(ctx context.Context, state *sessionState, sinceUnixMS int6
 	cmd.Dir = state.target.WorkspacePath
 	cmd.Env = env
 
-	stdout, err := cmd.Output()
-	if err != nil {
+	var stdout bytes.Buffer
+	result, startErr := procutil.RunCapture(cmd, procutil.StopGrace(state.agentConfig.StopGraceMS), procutil.CaptureParams{
+		Stdout: &stdout,
+		Logger: state.logger(),
+	})
+	if startErr != nil || result.WaitErr != nil {
+		err := startErr
+		if err == nil {
+			err = result.WaitErr
+		}
 		state.logger().Warn("failed to export opencode usage", slog.Any("error", err))
 		return exportUsage{}
 	}
 
-	usage := parseExportOutput(stdout, sessionID, sinceUnixMS)
+	usage := parseExportOutput(stdout.Bytes(), sessionID, sinceUnixMS)
 	if usage.InputTokens == 0 && usage.OutputTokens == 0 {
 		state.logger().Warn("no assistant token usage found in opencode export")
 	}
@@ -263,15 +273,23 @@ func queryModelNotFound(ctx context.Context, state *sessionState) (message strin
 	cmd.Dir = state.target.WorkspacePath
 	cmd.Env = env
 
-	stdout, err := cmd.Output()
-	if err != nil {
+	var stdout bytes.Buffer
+	result, startErr := procutil.RunCapture(cmd, procutil.StopGrace(state.agentConfig.StopGraceMS), procutil.CaptureParams{
+		Stdout: &stdout,
+		Logger: state.logger(),
+	})
+	if startErr != nil || result.WaitErr != nil {
+		err := startErr
+		if err == nil {
+			err = result.WaitErr
+		}
 		state.logger().Warn("failed to list opencode models", slog.Any("error", err))
 		return "", false
 	}
 
 	// Model identifiers are provider/model slugs without whitespace, so the
 	// catalog collapses to one entry per field regardless of line endings.
-	entries := strings.Fields(string(stdout))
+	entries := strings.Fields(stdout.String())
 	if len(entries) == 0 || slices.Contains(entries, model) {
 		return "", false
 	}

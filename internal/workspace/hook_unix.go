@@ -32,7 +32,9 @@ import (
 //   - "timeout": subprocess exceeded TimeoutMS or parent ctx cancelled
 //
 // Output is always captured and truncated to [MaxHookOutputBytes],
-// even on failure, so callers can log diagnostic output.
+// even on failure, so callers can log diagnostic output. The hook's
+// process tree is terminated at its exit, whatever the exit status: a
+// process the script leaves running does not outlive it.
 func RunHook(ctx context.Context, params HookParams) (HookResult, error) {
 	if err := validateParams(params); err != nil {
 		return HookResult{}, err
@@ -43,38 +45,37 @@ func RunHook(ctx context.Context, params HookParams) (HookResult, error) {
 
 	cmd := exec.CommandContext(hookCtx, "sh", "-c", params.Script) //nolint:gosec // G204: hook scripts are from trusted workflow configuration
 	cmd.Dir = params.Dir
-
-	// Place the shell and all descendants in a new process group so
-	// timeout termination kills the entire tree, not just the shell.
-	procutil.SetProcessGroup(cmd)
-
-	// Kill the entire process group when the context expires instead
-	// of only the direct child, preventing orphaned grandchildren. A
-	// hook that overran its timeout has already had its whole budget,
-	// so this path force-kills rather than signalling gracefully first.
-	cmd.Cancel = func() error {
-		return procutil.KillProcessGroup(cmd.Process.Pid)
-	}
-	// Allow child processes time to exit and release I/O pipes after
-	// the group signal before Go forcibly closes pipes.
-	cmd.WaitDelay = 3 * time.Second
-
 	cmd.Env = hookEnv(params.Env)
 
-	buf := &limitedBuffer{max: MaxHookOutputBytes}
-	cmd.Stdout = buf
-	cmd.Stderr = buf
+	// A hook that overran its timeout, or whose caller cancelled ctx,
+	// has already had its whole budget, so cancellation force-kills
+	// the tree rather than signalling gracefully first.
+	procutil.SetGroupKill(cmd)
 
-	err := cmd.Run()
+	buf := &limitedBuffer{max: MaxHookOutputBytes}
+	capture, startErr := procutil.StartCapture(cmd, procutil.CaptureParams{Stdout: buf, Stderr: buf})
+
+	var (
+		waitErr  error
+		leftover bool
+	)
+	if startErr == nil {
+		result := capture.Wait()
+		waitErr = result.WaitErr
+		leftover = result.TerminatedLeftovers && hookCtx.Err() == nil
+	}
 	output := buf.String()
 
-	if err == nil {
-		return HookResult{Output: output}, nil
+	if startErr == nil && waitErr == nil {
+		return HookResult{Output: output, TerminatedLeftovers: leftover}, nil
 	}
 
 	// Check context error BEFORE *exec.ExitError. A process killed by
-	// SIGKILL (timeout) also produces an ExitError with signal status.
-	// Checking context first ensures correct classification.
+	// SIGKILL (timeout) also produces an ExitError with signal status,
+	// and a context already done when StartCapture ran keeps cmd from
+	// starting at all, reporting the same context error a Wait
+	// failure would. Checking context first ensures correct
+	// classification in both cases.
 	if hookCtx.Err() == context.DeadlineExceeded {
 		return HookResult{}, &HookError{
 			Op:       "timeout",
@@ -95,21 +96,33 @@ func RunHook(ctx context.Context, params HookParams) (HookResult, error) {
 		}
 	}
 
-	if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
+	if startErr != nil {
 		return HookResult{}, &HookError{
-			Op:       "run",
+			Op:       "start",
 			Script:   truncateScript(params.Script),
-			ExitCode: exitErr.ExitCode(),
+			ExitCode: -1,
 			Output:   output,
-			Err:      err,
+			Err:      startErr,
+		}
+	}
+
+	if exitErr, ok := errors.AsType[*exec.ExitError](waitErr); ok {
+		return HookResult{}, &HookError{
+			Op:                  "run",
+			Script:              truncateScript(params.Script),
+			ExitCode:            exitErr.ExitCode(),
+			Output:              output,
+			TerminatedLeftovers: leftover,
+			Err:                 waitErr,
 		}
 	}
 
 	return HookResult{}, &HookError{
-		Op:       "start",
-		Script:   truncateScript(params.Script),
-		ExitCode: -1,
-		Output:   output,
-		Err:      err,
+		Op:                  "start",
+		Script:              truncateScript(params.Script),
+		ExitCode:            -1,
+		Output:              output,
+		TerminatedLeftovers: leftover,
+		Err:                 waitErr,
 	}
 }

@@ -9,10 +9,10 @@
 package copilot
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/logging"
 	"github.com/sortie-ai/sortie/internal/registry"
@@ -266,19 +267,27 @@ func (a *CopilotAdapter) StartSession(ctx context.Context, params domain.StartSe
 
 	// Canary check and auth preflight are local-mode only.
 	if target.RemoteCommand == "" {
+		stopGrace := procutil.StopGrace(params.AgentConfig.StopGraceMS)
+
 		canaryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
-		out, canaryErr := exec.CommandContext(canaryCtx, target.Command, "--version").CombinedOutput() //nolint:gosec // target.Command from LookPath
-		if canaryErr != nil {
+		cmd := exec.CommandContext(canaryCtx, target.Command, "--version") //nolint:gosec // target.Command from LookPath
+		var combined bytes.Buffer
+		result, startErr := procutil.RunCapture(cmd, stopGrace, procutil.CaptureParams{Stdout: &combined, Stderr: &combined})
+		if startErr != nil || result.WaitErr != nil {
+			canaryErr := startErr
+			if canaryErr == nil {
+				canaryErr = result.WaitErr
+			}
 			return domain.Session{}, &domain.AgentError{
 				Kind:    domain.ErrAgentNotFound,
 				Message: "copilot binary found but not functional; ensure Node.js 22+ is available",
 				Err:     canaryErr,
 			}
 		}
-		slog.Debug("copilot version check passed", slog.String("version", strings.TrimSpace(string(out))))
+		slog.Debug("copilot version check passed", slog.String("version", strings.TrimSpace(combined.String())))
 
-		if authErr := checkAuth(ctx); authErr != nil {
+		if authErr := checkAuth(ctx, stopGrace); authErr != nil {
 			return domain.Session{}, authErr
 		}
 	}
@@ -516,7 +525,7 @@ func (a *CopilotAdapter) StartSession(ctx context.Context, params domain.StartSe
 // checkAuth validates that at least one GitHub authentication source
 // is available in the environment. Returns nil on success or an
 // [domain.AgentError] if no source is found.
-func checkAuth(ctx context.Context) error {
+func checkAuth(ctx context.Context, stopGrace time.Duration) error {
 	for _, env := range []string{"COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"} {
 		if strings.TrimSpace(os.Getenv(env)) != "" {
 			return nil
@@ -528,10 +537,9 @@ func checkAuth(ctx context.Context) error {
 		defer cancel()
 
 		cmd := exec.CommandContext(authCtx, "gh", "auth", "status") //nolint:gosec // fixed args
-		cmd.Stdout = io.Discard
-		cmd.Stderr = io.Discard
+		result, startErr := procutil.RunCapture(cmd, stopGrace, procutil.CaptureParams{})
 
-		if err := cmd.Run(); err == nil && authCtx.Err() == nil {
+		if startErr == nil && result.WaitErr == nil && authCtx.Err() == nil {
 			slog.Warn("no GitHub token env var set; relying on gh auth for Copilot CLI authentication")
 			return nil
 		}

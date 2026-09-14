@@ -10,8 +10,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
-	"time"
+
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
 )
 
 // ErrNotGitWorkspace identifies a workspace that cannot provide a Git
@@ -186,24 +188,43 @@ func hashUntrackedFile(dst io.Writer, path string) error {
 	}
 }
 
-func runGit(ctx context.Context, dir string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, "git", args...) //nolint:gosec // executable is the fixed git binary; only its argument vector varies
+// GitCommand returns a git command for args that runs in dir. On
+// Windows it disables the filesystem monitor: a monitor daemon a query
+// starts stays in the launch's process containment and ends at the
+// reap, so it would answer no later query, and every later query would
+// start another one for nothing. On Linux and macOS the monitor
+// detaches from the launch and keeps running, so the operator's own
+// setting is left alone there.
+func GitCommand(ctx context.Context, dir string, args ...string) *exec.Cmd {
+	argv := args
+	if runtime.GOOS == "windows" {
+		argv = append([]string{"-c", "core.fsmonitor=false"}, args...)
+	}
+	cmd := exec.CommandContext(ctx, "git", argv...) //nolint:gosec // executable is the fixed git binary; only its argument vector varies
 	cmd.Dir = dir
+	return cmd
+}
+
+func runGit(ctx context.Context, dir string, args ...string) ([]byte, error) {
+	cmd := GitCommand(ctx, dir, args...)
 	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
-	// Git can leave a child holding the output pipe — a submodule process, a
-	// filter, a credential helper. Without a wait delay, killing git on a
-	// cancelled context would still block the caller until that child exits,
-	// so the caller's deadline would not bound this call.
-	cmd.WaitDelay = 3 * time.Second
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	output, err := cmd.Output()
-	if err != nil {
+
+	var stdout, stderr bytes.Buffer
+	result, startErr := procutil.RunCapture(cmd, procutil.DefaultStopGrace, procutil.CaptureParams{Stdout: &stdout, Stderr: &stderr})
+
+	reportErr := startErr
+	if reportErr == nil {
+		reportErr = result.WaitErr
+	}
+	if reportErr != nil {
 		message := strings.TrimSpace(stderr.String())
 		if message != "" {
-			return output, fmt.Errorf("git %s: %s: %w", args[0], message, err)
+			return stdout.Bytes(), fmt.Errorf("git %s: %s: %w", args[0], message, reportErr)
 		}
-		return output, fmt.Errorf("git %s: %w", args[0], err)
+		return stdout.Bytes(), fmt.Errorf("git %s: %w", args[0], reportErr)
 	}
-	return output, nil
+	if !result.OutputComplete {
+		return stdout.Bytes(), fmt.Errorf("git %s: output did not complete within %s", args[0], procutil.DefaultDrainGrace)
+	}
+	return stdout.Bytes(), nil
 }

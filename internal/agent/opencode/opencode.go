@@ -234,7 +234,7 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 	cmd.Dir = state.target.WorkspacePath
 	cmd.Env = env
 
-	pipes, err := procutil.StartWithOwnedPipes(cmd)
+	pipes, err := procutil.StartWithOwnedPipes(cmd, logger)
 	if err != nil {
 		state.mu.Unlock()
 
@@ -259,7 +259,7 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 				Message: "create stderr pipe",
 				Err:     startErr.Err,
 			}
-		default: // procutil.StageProcessStart
+		default: // procutil.StageProcessStart, procutil.StageProcessResume
 			return domain.TurnResult{}, &domain.AgentError{
 				Kind:    domain.ErrResponseError,
 				Message: "start opencode subprocess",
@@ -282,10 +282,6 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 	}
 	state.active = runtime
 	state.mu.Unlock()
-
-	if assignErr := procutil.AssignProcess(cmd.Process.Pid, cmd.Process); assignErr != nil {
-		logger.Warn("process group assignment failed", slog.Any("error", assignErr))
-	}
 
 	runtime.stderrCollector = procutil.NewStderrCollector(pipes.Stderr, logger)
 	runtime.reader = procutil.NewStdoutReader(pipes.Stdout, logger)
