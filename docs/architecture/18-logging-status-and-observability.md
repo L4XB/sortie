@@ -31,6 +31,8 @@ An issue entering the per-issue budget-exhausted set, on either the poll tick's 
 
 The in-flight token ceiling adds four records of its own, beyond the hold record above, so budget observability covers a run already in flight and not only a re-dispatch that never starts. A dispatch emits at most one of the two freeze records, never both. A dispatch whose resolved usage arrival reports no figure at all emits one `Warn` record, message `"token ceiling cannot bound this run"`, carrying `agent_kind`, `usage_arrival`, and `budget_tokens`, and also `error` when the baseline read failed on the same dispatch. A dispatch whose arrival does report figures but whose baseline read fails emits one `Warn` record instead, message `"prior token spend unknown, token ceiling bounds this session only"`, carrying `error` and `budget_tokens`. A run the arrival cannot bound never gets the second record, because the ceiling does not bound that session either and saying so would contradict the first. A confirming read that fails while a running session is over the pre-filter, and whose session has not reached the ceiling on its own spend, emits one `Warn` record, message `"in-flight token ceiling check failed, run continues"`, carrying `error` and `budget_tokens`, at most once per run regardless of how many failing reads follow. A running session the ceiling stops emits one `Warn` record, message `"run stopped by token ceiling"`, carrying `reason`, `used_tokens`, `budget_tokens`, `issue_tokens_completed`, `session_tokens`, `sum_source`, and `ceiling_setting`, once per run. `sum_source` is `confirmed_read` when a read established the completed sum and `session_spend_alone` when the session's own spend reached the ceiling and no read was needed; `unmeasured_sessions` joins the record only in the first case, because only a read supplies that count.
 
+A running session whose resolved usage arrival is `none` and whose runtime reports a usage figure, on an event or a turn result, emits one `Warn` record per run, message `"token usage discarded: agent kind declares this session reports none"`, carrying `agent_kind`, and the figure is discarded as Section 13.5 states.
+
 The tracker comment this same hold posts is recorded separately, at the write site rather than alongside the log record above. A successful write emits one `Info` record, message `"budget hold notice posted"`, carrying the standard issue context fields. A failed write emits one `Warn` record, message `"budget hold notice failed"`, carrying the standard issue context fields and `error`, and does not suppress the log record above.
 
 The periodic workspace sweep emits exactly one summary record per pass, at `Info` level, message `"sweep: pass complete"`, on every pass that produced a candidate set, including a pass over zero keys, a pass whose tracker read failed, and a pass that removed nothing. This is deliberate: a sweep that finds nothing to remove and says nothing is indistinguishable from a sweep that is not running at all, which is the failure mode this record exists to close. The record carries thirteen attributes:
@@ -70,7 +72,7 @@ If the implementation exposes a synchronous runtime snapshot (for dashboards or 
 
 - `running` (list of running session rows)
 - each running row should include `turn_count`
-- each running row should include `tokens_measured`, meaning at least one usage measurement has been reported so far in that session
+- each running row should include `tokens_measured`, meaning at least one usage measurement the orchestrator records has been reported so far in that session; it stays false throughout for a session whose resolved `usage_arrival` is `none`, whatever its runtime reports
 - each running row should include `usage_arrival` and `usage_attribution`, the usage-reporting disposition resolved for that session's kind, passthrough, and launch mode, frozen at dispatch
 - each running row should include `tokens_pending`, true only when the frozen arrival settles at most one figure per turn, the session is measured, and the turn that figure would settle for is still in flight
 - each running row should include `api_requests_measured`, true when the row's `api_request_count` is a count of model API requests the session measured
@@ -81,6 +83,9 @@ If the implementation exposes a synchronous runtime snapshot (for dashboards or 
   - `total_tokens`
   - `cache_read_tokens`
   - `seconds_running` (aggregate runtime seconds as of snapshot time, including active sessions)
+  - `unmeasured_sessions` (cumulative count of ended sessions whose usage was never recorded; persisted alongside the counters above and restored on startup, so it names what they excluded across every restart, not just the current process)
+  - `running_unreported` (count of the current running set whose kind reports usage but no figure has arrived yet)
+  - `running_non_reporting` (count of the current running set whose kind reports no usage at all, so it never will)
 - `rate_limits` (latest coding-agent rate limit payload, if available)
 - `budget_exhausted_count` (number of issues currently blocked by a re-dispatch budget; always present)
 - `budget_exhausted` (list of blocked-issue records, sorted by identifier; always present, empty when the set is empty). Each record carries the issue's ID and identifier, the reason (`token_budget` or `session_budget`; `token_budget` takes precedence over `session_budget` when one issue reaches both gates), the used and budgeted session and token counts, and the time the hold began. The set is rebuilt per tick from those two gates (Section 8.4) and also updated by the retry lane when it discovers a hold between ticks.
@@ -105,7 +110,7 @@ A figure can be missing for two distinct reasons: the database predates the sche
 
 ### 13.5 Session Metrics and Token Accounting
 
-A run is measured when the runtime reported at least one usage figure for the session and the adapter carried it into the recorded counters, or when the worker never entered an agent turn, because a run that launched no agent spent exactly zero. A run is unmeasured when an agent turn began and no usage figure ever arrived; its recorded token figures are zero and that zero carries no information. A measurement of zero is a measured run whose reported figures are zero, which is a legitimate statement recorded as measured.
+A run is measured when the runtime reported at least one usage figure for the session and the adapter carried it into the recorded counters, or when the worker never entered an agent turn, because a run that launched no agent spent exactly zero. A run is unmeasured when an agent turn began and no usage figure ever arrived; its recorded token figures are zero and that zero carries no information. A measurement of zero is a measured run whose reported figures are zero, which is a legitimate statement recorded as measured. A figure reported for a session whose resolved usage arrival is `none` is not a measurement: it enters no token counter, persisted row, or reporting surface, and the run stays unmeasured unless it never entered an agent turn.
 
 The run record carries this distinction alongside the four token counters. An unmeasured run contributes nothing to any token counter and is excluded from cost pricing. It advances no Prometheus token counter and creates no series, the same as a run that never emitted a usage event.
 
@@ -241,7 +246,10 @@ Minimum endpoints:
         "output_tokens": 2400,
         "total_tokens": 7400,
         "cache_read_tokens": 1500,
-        "seconds_running": 1834.2
+        "seconds_running": 1834.2,
+        "unmeasured_sessions": 3,
+        "running_unreported": 1,
+        "running_non_reporting": 1
       },
       "rate_limits": null
     }
@@ -330,6 +338,7 @@ API design notes:
 - Implementations may add fields, but should avoid breaking existing fields within a version.
 - On a running row, `api_request_count` is `null` exactly when `api_requests_measured` is false, the four members of `tokens` are `null` exactly when `tokens_measured` is false, and `requests_by_model` is absent on the first condition and when the attribution names no model.
 - Sortie deviates from the field-stability note above for those five figures, narrowing each from an integer to a nullable one, because a consumer reading a number cannot tell a measured zero from an unmeasured one. A typed consumer is forced to handle the null; an untyped one, in a language where `null` coerces to `0` in arithmetic, is no worse off than it was.
+- `active_estimated_cost_usd`, an implementation extension beyond the baseline shape above, sums the estimated cost of running, measured sessions whose agent kind has a configured token rate; it is omitted when no running, measured session prices. `cost_unpriced_running` sits beside it and counts the running, measured sessions the sum leaves out for want of a rate. It is present, zero included, whenever a token rate is configured for any agent kind, and omitted otherwise, so its presence alone tells a consumer whether cost pricing is configured at all.
 - Endpoints should be read-only except for operational triggers like `/refresh`.
 - Unsupported methods on defined routes should return `405 Method Not Allowed`.
 - API errors should use a JSON envelope such as `{"error":{"code":"...","message":"..."}}`.

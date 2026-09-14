@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The dashboard and `GET /api/v1/state` now disclose, by reason, how many sessions the token and cost totals leave out: `running_unreported` for a running session that has not reported usage yet, `running_non_reporting` for a running session whose agent reports no usage at all, `unmeasured_sessions` for an already-ended session whose usage was never recorded, and `cost_unpriced_running` for a session `Est. Cost` excludes because no rate is configured for its agent. The dashboard's footer note for each reason now reads correctly for a single session instead of always using the plural. The already-ended count survives a restart and, once upgraded, also counts sessions recorded before the upgrade.
+  ([#1066](https://github.com/sortie-ai/sortie/issues/1066))
+
 ### Fixed
 
 - A coding-agent subprocess that spawns a descendant inheriting its standard output handle no longer wedges the turn, leaks the process, or loses buffered standard error, across the `claude-code`, `copilot-cli`, `kiro`, and `opencode` agent kinds. The `codex` app-server adapter no longer discards the runtime's last messages when it reaps the subprocess, and now also ends a turn or a session within a bound when the runtime dies while a descendant still holds the output handle. The `agent-client-protocol` adapter takes the same subprocess pipe ownership and releases those pipes as the last step of its teardown, and now also ends a turn or a session within a bound when its runtime exits while a descendant still holds the output handle.
@@ -26,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The `cost_budget` agent tool now counts the tokens the running session has already spent, so `used_tokens` and `remaining_tokens` reflect that spend against `agent.max_tokens` while the session is still working, and `used_tokens_complete` stays `false` until that spend has been recorded. Previously the running session was left out, so the first session on an issue read zero spend throughout.
   ([#1074](https://github.com/sortie-ai/sortie/issues/1074))
+
+- If an agent runtime reports token usage for a session shown as reporting no token usage, Sortie now ignores it instead of adding it to the dashboard's token and cost totals, the JSON API's totals, and `sortie stats`, and counting it against `agent.max_tokens`. Sortie logs one warning per run naming the agent kind when it ignores such a report.
+  ([#1066](https://github.com/sortie-ai/sortie/issues/1066))
 
 ### Changed
 

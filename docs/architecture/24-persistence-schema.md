@@ -60,7 +60,7 @@ A row with `tokens_measured = 0` always carries zero in all four token columns; 
 
 The token columns mirror those on `session_metadata`. The per-issue token budget (`agent.max_tokens`) sums `total_tokens` here; the other three are recorded for parity and future use. The in-flight lane that stops a run mid-turn adds the running session's own live in-memory total to that sum, rather than waiting for the session's own row to land. The `session_metadata` write cadence changed to throttled-incremental during a running session (at most one write per issue per two seconds, on the orchestrator event loop) so the `cost_budget` tool can read in-flight spend before the session's `run_history` row exists.
 
-`tokens_measured` is not mirrored onto `session_metadata`, and does not need to be. The throttled in-flight write is gated on a usage-bearing event, so while a session runs its row comes into existence exactly when that session has reported a measurement, and the presence of a row whose `dispatch_id` matches the running session's dispatch ID is itself the measurement signal the `cost_budget` tool reads. A running session with no matching row is what makes that tool's `used_tokens_complete` false, on the same footing as a completed run with `tokens_measured = 0`. The unconditional write at session exit is outside that window: it stores an empty `dispatch_id` and runs before the run's `run_history` row is written.
+`tokens_measured` is not mirrored onto `session_metadata`, and does not need to be. The throttled in-flight write is gated on a usage-bearing event, so while a session runs its row comes into existence exactly when that session has reported a measurement the orchestrator records, which a session resolving `none` never has, and the presence of a row whose `dispatch_id` matches the running session's dispatch ID is itself the measurement signal the `cost_budget` tool reads. A running session with no matching row is what makes that tool's `used_tokens_complete` false, on the same footing as a completed run with `tokens_measured = 0`. The unconditional write at session exit is outside that window: it stores an empty `dispatch_id` and runs before the run's `run_history` row is written.
 
 The request count needs a column of its own for the reason the token measurement does not. The argument above rests on the in-flight write being gated on a usage-bearing event, so the row's existence is itself the token measurement signal. That gate fires for a kind that reports usage only when a turn ends too, and such a kind counts turns rather than requests, so the row's existence says nothing about whether the request-counting path ran. `api_requests_measured` is what says it. A row written before migration 016 reads `0`, because its count was written by the unconditional rule that column exists to qualify; the row self-heals on that issue's next session.
 
@@ -91,7 +91,10 @@ The request count needs a column of its own for the reason the token measurement
 | `total_tokens`      | INTEGER |                                   |
 | `cache_read_tokens` | INTEGER | Cumulative cache-read tokens (migration 002) |
 | `seconds_running`   | REAL    | Cumulative runtime seconds        |
+| `unmeasured_sessions` | INTEGER | Cumulative count of ended sessions whose usage was never recorded, backfilled from `run_history` for pre-migration rows (migration 018) |
 | `updated_at`        | TEXT    | ISO-8601 timestamp                |
+
+`unmeasured_sessions` names what the four token columns above already exclude: a session whose worker entered an agent turn and never got a usage figure, whatever the reason. It is incremented once per such session at the same write that updates the token columns, so a restart restores both together and neither can drift ahead of the other.
 
 **`reaction_fingerprints`**: cross-restart reaction deduplication (migration 008)
 
