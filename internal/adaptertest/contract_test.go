@@ -552,10 +552,14 @@ const contractSinkTypeOwner = "contractBoundedSinkTypes"
 // top-level function and method whose result list includes *exec.Cmd
 // or exec.Cmd: a function is keyed by "importPath.Name", a method by
 // its bare name alone, since a call site names a method with no
-// receiver-type qualifier.
+// receiver-type qualifier. producerPaths holds the import path of
+// every indexed function, letting a caller recognize a file as able to
+// reach a command through a constructor it never names by declaration,
+// only by import.
 type contractCmdIndex struct {
-	funcs   map[string]bool
-	methods map[string]bool
+	funcs         map[string]bool
+	methods       map[string]bool
+	producerPaths map[string]bool
 }
 
 // contractCmdFields records, for one package's non-test files, every
@@ -626,6 +630,7 @@ func contractBuildCmdIndex(file *ast.File, importPath string, idx *contractCmdIn
 				idx.methods[d.Name.Name] = true
 			} else {
 				idx.funcs[importPath+"."+d.Name.Name] = true
+				idx.producerPaths[importPath] = true
 			}
 		case *ast.GenDecl:
 			if d.Tok != token.TYPE {
@@ -1011,6 +1016,16 @@ func checkContractCaptureSinkFields(fset *token.FileSet, lit *ast.CompositeLit, 
 // import outright, once, keeps a file that hides a command constructor
 // or a sink type behind a dot import from silently passing this rule
 // the way naming the four import paths this used to check did not.
+//
+// A file that imports none of os/exec, os, syscall, windows, or
+// procutil can still reach an exec.Cmd by calling a constructor
+// declared in another walked package - workspace.GitCommand called
+// from a file that imports only "workspace", never "os/exec" - so the
+// early return below also stays open when idx.producerPaths names one
+// of file's own imports. A file naming none of the five imports and no
+// producer's import path plainly cannot violate rule CAPTURE or rule
+// SINK, since it can neither construct nor receive a command, and is
+// skipped at the cost this rule was built to avoid paying.
 func checkContractCaptureFile(fset *token.FileSet, file *ast.File, importPath, dirName string, idx *contractCmdIndex, fields contractCmdFields) []contractViolation {
 	var violations []contractViolation
 
@@ -1033,14 +1048,22 @@ func checkContractCaptureFile(fset *token.FileSet, file *ast.File, importPath, d
 	syscallName := resolveContractImportName(file, "syscall")
 	winName := resolveContractImportName(file, "golang.org/x/sys/windows")
 	procName := resolveContractImportName(file, contractProcutilImportPath)
-	if execName == "" && osName == "" && syscallName == "" && winName == "" && procName == "" {
+	aliasPaths := contractFileImportAliases(file)
+	importsCmdProducer := false
+	for _, path := range aliasPaths {
+		if idx.producerPaths[path] {
+			importsCmdProducer = true
+			break
+		}
+	}
+	if execName == "" && osName == "" && syscallName == "" && winName == "" && procName == "" && !importsCmdProducer {
 		return violations
 	}
-	aliasPaths := contractFileImportAliases(file)
 	bytesName := resolveContractImportName(file, "bytes")
 	checkSinks := procName != "" && !contractExempt(dirName, ruleSINK)
+	hasCmd := execName != "" || importsCmdProducer
 
-	if execName != "" {
+	if hasCmd {
 		ast.Inspect(file, func(n ast.Node) bool {
 			assign, ok := n.(*ast.AssignStmt)
 			if !ok {
@@ -1088,7 +1111,7 @@ func checkContractCaptureFile(fset *token.FileSet, file *ast.File, importPath, d
 				return true
 			}
 
-			if execName != "" {
+			if hasCmd {
 				switch sel.Sel.Name {
 				case "Output", "CombinedOutput", "StdoutPipe", "StderrPipe":
 					violations = append(violations, contractViolation{
@@ -1108,7 +1131,7 @@ func checkContractCaptureFile(fset *token.FileSet, file *ast.File, importPath, d
 			}
 
 			if sel.Sel.Name == "Wait" {
-				if execName != "" && contractExprIsCmdBound(execName, idx, importPath, aliasPaths, cmdNames, fields, sel.X) {
+				if hasCmd && contractExprIsCmdBound(execName, idx, importPath, aliasPaths, cmdNames, fields, sel.X) {
 					violations = append(violations, contractViolation{
 						pos:  fset.Position(call.Pos()),
 						text: "waits on an exec.Cmd directly; call " + contractCaptureOwner,
@@ -1159,7 +1182,7 @@ func checkContractCaptureFile(fset *token.FileSet, file *ast.File, importPath, d
 // contractWalkRoot already parsed: this is one more pass over files
 // already held in memory, not a second walk of the tree.
 func contractBuildModuleCmdIndex(walked []contractWalkedPackage) (*contractCmdIndex, contractCmdFields) {
-	idx := &contractCmdIndex{funcs: map[string]bool{}, methods: map[string]bool{}}
+	idx := &contractCmdIndex{funcs: map[string]bool{}, methods: map[string]bool{}, producerPaths: map[string]bool{}}
 	fields := contractCmdFields{}
 	for _, w := range walked {
 		for _, file := range w.pkg.files {
@@ -3962,6 +3985,88 @@ func runGitDiff(ctx context.Context, workspacePath string, args ...string) error
 	const wantSubstr = "waits on an exec.Cmd directly"
 	if !strings.Contains(got[0].text, wantSubstr) {
 		t.Errorf("violations = %+v, want one containing %q", got, wantSubstr)
+	}
+}
+
+// TestCheckContractCapture_DetectsProducerOnlyImportViolations is the
+// negative control for the hole checkContractCaptureFile's early return
+// left open: a file that reaches a command through a cross-package
+// constructor never has to import os/exec, os, syscall, windows, or
+// procutil itself, so naming none of those five was wrongly treated as
+// proof the file could not violate rule CAPTURE. The consumer here
+// drops every import the sibling constructor tests keep around it -
+// os/exec included - leaving only the producer's own import, and waits
+// on the result directly the same way those tests' consumers do.
+// Before the producer-path check joined the early return's condition,
+// an overlay run against a pre-fix copy of this file confirmed this
+// case reported zero violations.
+func TestCheckContractCapture_DetectsProducerOnlyImportViolations(t *testing.T) {
+	t.Parallel()
+
+	const producerSrc = `package workspace
+
+import (
+	"context"
+	"os/exec"
+)
+
+func GitCommand(ctx context.Context, dir string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = dir
+	return cmd
+}
+`
+
+	const consumerSrc = `package orchestrator
+
+import (
+	"context"
+
+	"github.com/sortie-ai/sortie/internal/workspace"
+)
+
+func runGitDiff(ctx context.Context, workspacePath string, args ...string) error {
+	cmd := workspace.GitCommand(ctx, workspacePath, args...)
+	return cmd.Wait()
+}
+`
+
+	fset := token.NewFileSet()
+	producerFile, err := parser.ParseFile(fset, "workspace.go", producerSrc, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parser.ParseFile(producer): %v", err)
+	}
+	consumerFile, err := parser.ParseFile(fset, "orchestrator.go", consumerSrc, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parser.ParseFile(consumer): %v", err)
+	}
+
+	producerPkg := contractPackage{
+		dirName:    "workspace",
+		importPath: "github.com/sortie-ai/sortie/internal/workspace",
+		files:      []*ast.File{producerFile},
+	}
+	consumerPkg := contractPackage{
+		dirName:    "orchestrator",
+		importPath: contractOrchestratorPath,
+		files:      []*ast.File{consumerFile},
+	}
+
+	walked := []contractWalkedPackage{{pkg: producerPkg}, {pkg: consumerPkg}}
+	idx, fields := contractBuildModuleCmdIndex(walked)
+
+	got := checkContractCapture(fset, consumerPkg, idx, fields)
+	if len(got) != 1 {
+		t.Fatalf("checkContractCapture() on a producer-only-import caller of a cross-package constructor returned %d violations, want 1: %+v", len(got), got)
+	}
+	const wantSubstr = "waits on an exec.Cmd directly"
+	if !strings.Contains(got[0].text, wantSubstr) {
+		t.Errorf("violations = %+v, want one containing %q", got, wantSubstr)
+	}
+
+	producerGot := checkContractCapture(fset, producerPkg, idx, fields)
+	if len(producerGot) != 0 {
+		t.Errorf("checkContractCapture() on the constructor's own package returned %d violations, want 0: %+v", len(producerGot), producerGot)
 	}
 }
 
