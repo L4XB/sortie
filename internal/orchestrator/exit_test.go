@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -499,8 +500,7 @@ func TestHandleWorkerExit_UsageReconciliation_DroppedTrailingEvent(t *testing.T)
 
 	// The worker's own mirror observed more than the entry's last
 	// processed event: the trailing token_usage event never reached
-	// HandleAgentEvent (a full agentEventCh, or delivery after the
-	// entry was already removed).
+	// HandleAgentEvent because a full agentEventCh dropped it.
 	workerUsage := domain.TokenUsage{InputTokens: 180, OutputTokens: 90, TotalTokens: 270, CacheReadTokens: 15}
 
 	HandleWorkerExit(state, WorkerResult{
@@ -675,6 +675,252 @@ func TestHandleWorkerExit_TokensMeasured(t *testing.T) {
 				run.InputTokens, run.OutputTokens, run.TotalTokens, run.CacheReadTokens)
 		}
 	})
+}
+
+// TestHandleWorkerExit_ModelNameReconciliation verifies that a
+// non-empty WorkerResult.ModelName always overwrites the entry's model
+// name, across every ExitKind, and an empty one leaves the entry's own
+// value untouched.
+func TestHandleWorkerExit_ModelNameReconciliation(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a non-empty result model name overwrites an empty entry across every exit kind", func(t *testing.T) {
+		t.Parallel()
+
+		for _, kind := range []WorkerExitKind{WorkerExitNormal, WorkerExitError, WorkerExitCancelled} {
+			t.Run(string(kind), func(t *testing.T) {
+				t.Parallel()
+
+				store := &mockExitStore{}
+				issueID := "ISSUE-MODEL-" + string(kind)
+				state := exitState(t, issueID, nil)
+				// entry.ModelName stays at its zero value.
+
+				HandleWorkerExit(state, WorkerResult{
+					IssueID:      issueID,
+					Identifier:   issueID + "-ident",
+					ExitKind:     kind,
+					AgentAdapter: "mock",
+					ModelName:    "m",
+				}, defaultExitParams(t, store))
+
+				if len(store.sessionMetadata) != 1 {
+					t.Fatalf("UpsertSessionMetadata called %d times, want 1", len(store.sessionMetadata))
+				}
+				if got := store.sessionMetadata[0].ModelName; got != "m" {
+					t.Errorf("SessionMetadata.ModelName = %q, want %q", got, "m")
+				}
+			})
+		}
+	})
+
+	t.Run("result model name wins over a non-empty entry", func(t *testing.T) {
+		t.Parallel()
+
+		store := &mockExitStore{}
+		state := exitState(t, "ISSUE-MODEL-AB", nil)
+		state.Running["ISSUE-MODEL-AB"].ModelName = "a"
+
+		HandleWorkerExit(state, WorkerResult{
+			IssueID:      "ISSUE-MODEL-AB",
+			Identifier:   "ISSUE-MODEL-AB-ident",
+			ExitKind:     WorkerExitNormal,
+			AgentAdapter: "mock",
+			ModelName:    "b",
+		}, defaultExitParams(t, store))
+
+		if got := store.sessionMetadata[0].ModelName; got != "b" {
+			t.Errorf("SessionMetadata.ModelName = %q, want %q (result overwrites entry)", got, "b")
+		}
+	})
+
+	t.Run("empty result model name leaves the entry's own value in place", func(t *testing.T) {
+		t.Parallel()
+
+		store := &mockExitStore{}
+		state := exitState(t, "ISSUE-MODEL-A-EMPTY", nil)
+		state.Running["ISSUE-MODEL-A-EMPTY"].ModelName = "a"
+
+		HandleWorkerExit(state, WorkerResult{
+			IssueID:      "ISSUE-MODEL-A-EMPTY",
+			Identifier:   "ISSUE-MODEL-A-EMPTY-ident",
+			ExitKind:     WorkerExitNormal,
+			AgentAdapter: "mock",
+		}, defaultExitParams(t, store))
+
+		if got := store.sessionMetadata[0].ModelName; got != "a" {
+			t.Errorf("SessionMetadata.ModelName = %q, want %q (unchanged when the result carries none)", got, "a")
+		}
+	})
+
+	t.Run("both empty persists empty", func(t *testing.T) {
+		t.Parallel()
+
+		store := &mockExitStore{}
+		state := exitState(t, "ISSUE-MODEL-EMPTY", nil)
+
+		HandleWorkerExit(state, WorkerResult{
+			IssueID:      "ISSUE-MODEL-EMPTY",
+			Identifier:   "ISSUE-MODEL-EMPTY-ident",
+			ExitKind:     WorkerExitNormal,
+			AgentAdapter: "mock",
+		}, defaultExitParams(t, store))
+
+		if got := store.sessionMetadata[0].ModelName; got != "" {
+			t.Errorf("SessionMetadata.ModelName = %q, want empty", got)
+		}
+	})
+}
+
+// TestHandleWorkerExit_RequestCountReconciliation verifies that the
+// persisted api_request_count is the max of the entry's own tally and
+// the worker's, never lowered by a worker figure behind the entry's
+// own, and the persisted figure stays gated by apiRequestsMeasured the
+// same way an unreconciled entry count already was.
+func TestHandleWorkerExit_RequestCountReconciliation(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a lower entry count is raised to the worker's, and measured turns true", func(t *testing.T) {
+		t.Parallel()
+
+		store := &mockExitStore{}
+		state := exitState(t, "ISSUE-REQ-RAISE", nil)
+		entry := state.Running["ISSUE-REQ-RAISE"]
+		entry.UsageArrival = registry.UsageArrivalIncremental
+		entry.TurnCount = 1
+		entry.APIRequestCount = 0
+
+		HandleWorkerExit(state, WorkerResult{
+			IssueID:         "ISSUE-REQ-RAISE",
+			Identifier:      "ISSUE-REQ-RAISE-ident",
+			ExitKind:        WorkerExitNormal,
+			AgentAdapter:    "mock",
+			APIRequestCount: 3,
+		}, defaultExitParams(t, store))
+
+		meta := store.sessionMetadata[0]
+		if !meta.APIRequestsMeasured {
+			t.Fatal("SessionMetadata.APIRequestsMeasured = false, want true")
+		}
+		if meta.APIRequestCount != 3 {
+			t.Errorf("SessionMetadata.APIRequestCount = %d, want 3", meta.APIRequestCount)
+		}
+	})
+
+	t.Run("a higher entry count is kept, the worker's lower figure never lowers it", func(t *testing.T) {
+		t.Parallel()
+
+		store := &mockExitStore{}
+		state := exitState(t, "ISSUE-REQ-KEEP", nil)
+		entry := state.Running["ISSUE-REQ-KEEP"]
+		entry.UsageArrival = registry.UsageArrivalIncremental
+		entry.TurnCount = 1
+		entry.APIRequestCount = 5
+
+		HandleWorkerExit(state, WorkerResult{
+			IssueID:         "ISSUE-REQ-KEEP",
+			Identifier:      "ISSUE-REQ-KEEP-ident",
+			ExitKind:        WorkerExitNormal,
+			AgentAdapter:    "mock",
+			APIRequestCount: 3,
+		}, defaultExitParams(t, store))
+
+		if got := store.sessionMetadata[0].APIRequestCount; got != 5 {
+			t.Errorf("SessionMetadata.APIRequestCount = %d, want 5 (entry's own higher tally)", got)
+		}
+	})
+
+	t.Run("a turn_end session still stores zero with the verdict false", func(t *testing.T) {
+		t.Parallel()
+
+		store := &mockExitStore{}
+		state := exitState(t, "ISSUE-REQ-TURNEND", nil)
+		entry := state.Running["ISSUE-REQ-TURNEND"]
+		entry.UsageArrival = registry.UsageArrivalTurnEnd
+
+		HandleWorkerExit(state, WorkerResult{
+			IssueID:         "ISSUE-REQ-TURNEND",
+			Identifier:      "ISSUE-REQ-TURNEND-ident",
+			ExitKind:        WorkerExitNormal,
+			AgentAdapter:    "mock",
+			APIRequestCount: 2,
+		}, defaultExitParams(t, store))
+
+		meta := store.sessionMetadata[0]
+		if meta.APIRequestsMeasured {
+			t.Error("SessionMetadata.APIRequestsMeasured = true, want false (turn_end never reports during the turn)")
+		}
+		if meta.APIRequestCount != 0 {
+			t.Errorf("SessionMetadata.APIRequestCount = %d, want 0", meta.APIRequestCount)
+		}
+	})
+}
+
+// TestHandleWorkerExit_ReconciliationNoOpWhenResultMatchesEntry verifies
+// that a WorkerResult whose Usage, UsageMeasured, ModelName, and
+// APIRequestCount already equal the entry's own totals reconciles to
+// exactly the same run_history, aggregate_metrics, and session_metadata
+// records as a result whose four values are zero: neither the token
+// counters nor the model name nor the request count move when the
+// worker's figure adds no new information over what the entry already
+// held.
+func TestHandleWorkerExit_ReconciliationNoOpWhenResultMatchesEntry(t *testing.T) {
+	t.Parallel()
+
+	buildRecords := func(t *testing.T, result WorkerResult) (persistence.RunHistory, persistence.AggregateMetrics, persistence.SessionMetadata) {
+		t.Helper()
+
+		store := &mockExitStore{}
+		state := exitState(t, "ISSUE-P4-NOOP", nil)
+		entry := state.Running["ISSUE-P4-NOOP"]
+		entry.UsageArrival = registry.UsageArrivalIncremental
+		entry.TurnCount = 1
+		entry.UsageMeasured = true
+		entry.ModelName = "m"
+		entry.APIRequestCount = 5
+		entry.AgentInputTokens = 100
+		entry.AgentOutputTokens = 50
+		entry.AgentTotalTokens = 150
+		entry.CacheReadTokens = 10
+		entry.LastReportedInputTokens = 100
+		entry.LastReportedOutputTokens = 50
+		entry.LastReportedTotalTokens = 150
+		entry.LastReportedCacheReadTokens = 10
+
+		result.IssueID = "ISSUE-P4-NOOP"
+		result.Identifier = "ISSUE-P4-NOOP-ident"
+		result.ExitKind = WorkerExitNormal
+		result.AgentAdapter = "mock"
+
+		HandleWorkerExit(state, result, defaultExitParams(t, store))
+
+		if len(store.runHistories) != 1 || len(store.metrics) != 1 || len(store.sessionMetadata) != 1 {
+			t.Fatalf("AppendRunHistory/UpsertAggregateMetrics/UpsertSessionMetadata called (%d, %d, %d) times, want (1, 1, 1)",
+				len(store.runHistories), len(store.metrics), len(store.sessionMetadata))
+		}
+		return store.runHistories[0], store.metrics[0], store.sessionMetadata[0]
+	}
+
+	matchingResult := WorkerResult{
+		Usage:           domain.TokenUsage{InputTokens: 100, OutputTokens: 50, TotalTokens: 150, CacheReadTokens: 10},
+		UsageMeasured:   true,
+		ModelName:       "m",
+		APIRequestCount: 5,
+	}
+	zeroResult := WorkerResult{}
+
+	matchingRun, matchingMetrics, matchingMeta := buildRecords(t, matchingResult)
+	zeroRun, zeroMetrics, zeroMeta := buildRecords(t, zeroResult)
+
+	if !reflect.DeepEqual(matchingRun, zeroRun) {
+		t.Errorf("RunHistory = %+v, want %+v (equal to the zero-result record)", matchingRun, zeroRun)
+	}
+	if !reflect.DeepEqual(matchingMetrics, zeroMetrics) {
+		t.Errorf("AggregateMetrics = %+v, want %+v (equal to the zero-result record)", matchingMetrics, zeroMetrics)
+	}
+	if !reflect.DeepEqual(matchingMeta, zeroMeta) {
+		t.Errorf("SessionMetadata = %+v, want %+v (equal to the zero-result record)", matchingMeta, zeroMeta)
+	}
 }
 
 func TestHandleWorkerExit_RetryableError(t *testing.T) {
@@ -9327,10 +9573,10 @@ func TestHandleWorkerExit_DeclaredRunSeedsReactionsReleasedOnTerminalReconcile(t
 }
 
 // TestHandleWorkerExit_RequestVerdictUsesWorkerTurnTally covers the
-// entry whose session_started is still queued on the agent event
-// channel when the exit arrives on its own. The entry's turn count
-// reads zero, which alone would store a session that really ran as a
-// measured zero; the worker's own tally is what prevents it.
+// entry whose session_started event a full agentEventCh dropped. The
+// entry's turn count reads zero, which alone would store a session
+// that really ran as a measured zero; the worker's own tally is what
+// prevents it.
 func TestHandleWorkerExit_RequestVerdictUsesWorkerTurnTally(t *testing.T) {
 	t.Parallel()
 

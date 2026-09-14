@@ -231,11 +231,22 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 	// Reconcile the entry's token totals from the worker's own figure
 	// before run_history, session_metadata, and aggregate_metrics are
 	// built below, so a trailing usage event dropped by a full
-	// agentEventCh or processed after this entry was removed cannot
-	// leave the recorded total lower than what the worker actually
-	// spent. applyUsageDelta's monotone-delta rule applies a zero delta
-	// when workerResult.Usage is already fully accounted for.
+	// agentEventCh cannot leave the recorded total lower than what the
+	// worker actually spent. applyUsageDelta's monotone-delta rule
+	// applies a zero delta when workerResult.Usage is already fully
+	// accounted for.
 	applyUsageDelta(state, entry, workerResult.Usage, metrics)
+
+	// Reconcile the entry's model name and request count from the
+	// worker's own figure the same way the token totals above are
+	// reconciled: the worker's mirror folded every event the entry
+	// applied, in the same order, plus any event a full agentEventCh
+	// dropped, so its non-empty model name and its request count are
+	// never behind the entry's own.
+	if workerResult.ModelName != "" {
+		entry.ModelName = workerResult.ModelName
+	}
+	entry.APIRequestCount = max(entry.APIRequestCount, workerResult.APIRequestCount)
 
 	// measured is the OR of the entry's own measurement flag and the
 	// worker's mirror, computed after the usage reconciliation above so
@@ -252,7 +263,8 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 
 	// Enrich with session context now that both sources are available.
 	// Prefer workerResult.SessionID (authoritative from the adapter) over
-	// entry.SessionID (depends on EventSessionStarted processing order).
+	// entry.SessionID, whose EventSessionStarted event a full
+	// agentEventCh may have dropped.
 	if sid := workerResult.SessionID; sid != "" {
 		log = logging.WithSession(log, sid)
 	} else if entry.SessionID != "" {
@@ -268,7 +280,7 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 
 	// Deferred workspace cleanup: reconciliation marks terminal issues with
 	// PendingCleanup so cleanup runs only after the worker has fully exited.
-	// Guarded on WorkspacePath being non-empty — if the worker exited before
+	// Guarded on WorkspacePath being non-empty; if the worker exited before
 	// workspace preparation, there is no directory to clean.
 	if entry.PendingCleanup && entry.WorkspacePath != "" {
 		if err := workspace.CleanupByPath(ctx, workspace.CleanupByPathParams{
@@ -551,8 +563,8 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 		sessionID = entry.SessionID
 	}
 	// The worker's own turn tally is taken alongside the entry's,
-	// because the entry's is fed by the agent event channel while this
-	// exit arrives on its own: a session_started still queued there
+	// because the entry's is fed by the agent event channel, which a
+	// full agentEventCh can drop a session_started event from: that
 	// would otherwise leave the count at zero and let a session that
 	// really ran be stored as a measured zero. The started tally is
 	// the one to take, because a turn that errored or was cancelled

@@ -31,8 +31,7 @@ func isTurnTerminalEvent(t domain.AgentEventType) bool {
 // token_usage events, to the global agent totals.
 //
 // HandleAgentEvent is a no-op when issueID is not present in
-// state.Running (the worker may exit before the orchestrator processes
-// a queued event).
+// state.Running.
 //
 // Must be called from the orchestrator's single-writer event loop
 // goroutine. Not safe for concurrent use.
@@ -184,7 +183,7 @@ func HandleAgentEvent(state *State, issueID string, event domain.AgentEvent, log
 		}
 
 		// Track model: prefer the event's model, fall back to last known.
-		model := event.Model
+		model := tokenUsageModel(event)
 		if model != "" {
 			entry.ModelName = model
 		} else {
@@ -259,6 +258,15 @@ func HandleAgentEvent(state *State, issueID string, event domain.AgentEvent, log
 // four sites apply the same usage-bearing-event condition.
 func hasUsage(usage domain.TokenUsage) bool {
 	return usage.InputTokens != 0 || usage.OutputTokens != 0 || usage.TotalTokens != 0 || usage.CacheReadTokens != 0
+}
+
+// tokenUsageModel returns the model name a token_usage event carries,
+// verbatim, or "" for an event of any other type.
+func tokenUsageModel(event domain.AgentEvent) string {
+	if event.Type != domain.EventTokenUsage {
+		return ""
+	}
+	return event.Model
 }
 
 // applyUsageDelta applies the monotone-delta token accounting rule to
