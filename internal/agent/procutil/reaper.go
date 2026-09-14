@@ -4,9 +4,10 @@ import "os/exec"
 
 // Reaper reaps one started subprocess and terminates its process group.
 type Reaper struct {
-	done     chan struct{}
-	err      error
-	leftover bool
+	done       chan struct{}
+	err        error
+	leftover   bool
+	cleanupErr error
 }
 
 // StartReaper starts one goroutine that waits for cmd to exit, kills its
@@ -17,7 +18,7 @@ func StartReaper(cmd *exec.Cmd) *Reaper {
 	r := &Reaper{done: make(chan struct{})}
 	go func() {
 		r.err = cmd.Wait()
-		r.leftover, _ = killProcessGroupReportingLeftover(cmd.Process.Pid) //nolint:errcheck,gosec // best-effort cleanup of surviving group members
+		r.leftover, r.cleanupErr = killProcessGroupReportingLeftover(cmd.Process.Pid)
 		CleanupProcess(cmd.Process.Pid)
 		close(r.done)
 	}()
@@ -40,4 +41,16 @@ func (r *Reaper) Err() error {
 // only after Done closed.
 func (r *Reaper) Leftover() bool {
 	return r.leftover
+}
+
+// CleanupErr returns the error the group termination reported, or nil
+// when it succeeded or found the group already gone. Call only after
+// Done closed.
+//
+// A non-nil value means the reap could not prove the process tree was
+// torn down, so a descendant may have survived it; Leftover reports
+// nothing about such a descendant, because the membership check runs
+// before the termination that failed.
+func (r *Reaper) CleanupErr() error {
+	return r.cleanupErr
 }
