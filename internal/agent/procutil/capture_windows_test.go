@@ -401,10 +401,12 @@ func TestRunJobDrain(t *testing.T) {
 	t.Run("failed termination is recorded but does not stop polling", func(t *testing.T) {
 		job, cleanup := newCaptureTestJob(t)
 		defer cleanup()
+		startCaptureTestHeldMember(t, job)
 
-		origTerm := terminateJobObjectFunc
-		defer func() { terminateJobObjectFunc = origTerm }()
+		origBound, origTerm := jobDrainBound, terminateJobObjectFunc
+		defer func() { jobDrainBound, terminateJobObjectFunc = origBound, origTerm }()
 		wantErr := errors.New("injected termination failure")
+		jobDrainBound = 200 * time.Millisecond
 		terminateJobObjectFunc = func(windows.Handle, uint32) error { return wantErr }
 
 		result := runJobDrain(job)
