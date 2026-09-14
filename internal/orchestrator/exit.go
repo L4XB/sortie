@@ -502,6 +502,9 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 		// The dispatch's row is cleared here, ahead of the run_history
 		// write below: once that row exists, a session_metadata row still
 		// keyed to this dispatch would add the run's spend a second time.
+		// These are separate writes; a clear that fails while the append
+		// below still succeeds leaves that double count as an accepted
+		// risk rather than one this path corrects.
 		DispatchID:          "",
 		InputTokens:         entry.AgentInputTokens,
 		OutputTokens:        entry.AgentOutputTokens,
