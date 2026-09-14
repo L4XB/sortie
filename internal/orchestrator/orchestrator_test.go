@@ -1423,7 +1423,7 @@ func TestMakeWorkerFn(t *testing.T) {
 			Issue:      issue,
 		}
 
-		wfn := o.makeWorkerFn("", "", "", "", "", nil)
+		wfn := o.makeWorkerFn("", "", "", "", "", nil, registry.UsageArrivalUndeclared)
 
 		exitDone := make(chan struct{})
 		go func() {
@@ -1484,7 +1484,7 @@ func TestMakeWorkerFn(t *testing.T) {
 			Issue:      issue,
 		}
 
-		wfn := o.makeWorkerFn("", "", "", "", "", nil)
+		wfn := o.makeWorkerFn("", "", "", "", "", nil, registry.UsageArrivalUndeclared)
 
 		exitDone := make(chan struct{})
 		go func() {
@@ -1538,7 +1538,7 @@ func TestMakeWorkerFn(t *testing.T) {
 			SessionID:  "resume-sess-42",
 		}
 
-		wfn := o.makeWorkerFn("resume-sess-42", "", "", "", "", nil)
+		wfn := o.makeWorkerFn("resume-sess-42", "", "", "", "", nil, registry.UsageArrivalUndeclared)
 
 		exitDone := make(chan struct{})
 		go func() {
@@ -1592,7 +1592,7 @@ func TestMakeWorkerFn(t *testing.T) {
 			Issue:      issue,
 		}
 
-		wfn := o.makeWorkerFn("", "", "", "", "", nil)
+		wfn := o.makeWorkerFn("", "", "", "", "", nil, registry.UsageArrivalUndeclared)
 
 		exitDone := make(chan struct{})
 		go func() {
@@ -1644,7 +1644,7 @@ func TestMakeWorkerFn(t *testing.T) {
 			Issue:      issue,
 		}
 
-		wfn := o.makeWorkerFn("", "", "", "", "", nil)
+		wfn := o.makeWorkerFn("", "", "", "", "", nil, registry.UsageArrivalUndeclared)
 
 		exitDone := make(chan struct{})
 		go func() {
@@ -1723,7 +1723,7 @@ func TestMakeWorkerFn_DerivesPostureFromReactionKind(t *testing.T) {
 			})
 
 			issue := workerTestIssue()
-			wfn := o.makeWorkerFn("", "", "", "", tt.reactionKind, nil)
+			wfn := o.makeWorkerFn("", "", "", "", tt.reactionKind, nil, registry.UsageArrivalUndeclared)
 
 			exitDone := make(chan struct{})
 			go func() {
@@ -6197,6 +6197,34 @@ func TestMaybeWriteIncrementalMetadata(t *testing.T) {
 		}
 	})
 
+	t.Run("none arrival writes no row", func(t *testing.T) {
+		t.Parallel()
+
+		store := &stubStore{}
+		o, entry := incrementalWriteOrchestrator(t, store)
+		entry.UsageArrival = registry.UsageArrivalNone
+
+		o.maybeWriteIncrementalMetadata(ctx, "id-1", tokenUsageEvent(10, 20, 30, 5))
+
+		if writes := store.sessionWrites(); len(writes) != 0 {
+			t.Errorf("UpsertSessionMetadata calls = %d, want 0 (none arrival)", len(writes))
+		}
+	})
+
+	t.Run("incremental arrival writes once for the same event", func(t *testing.T) {
+		t.Parallel()
+
+		store := &stubStore{}
+		o, entry := incrementalWriteOrchestrator(t, store)
+		entry.UsageArrival = registry.UsageArrivalIncremental
+
+		o.maybeWriteIncrementalMetadata(ctx, "id-1", tokenUsageEvent(10, 20, 30, 5))
+
+		if writes := store.sessionWrites(); len(writes) != 1 {
+			t.Errorf("UpsertSessionMetadata calls = %d, want 1 (incremental arrival)", len(writes))
+		}
+	})
+
 	t.Run("DispatchID from the running entry is carried on every write", func(t *testing.T) {
 		t.Parallel()
 
@@ -7961,10 +7989,16 @@ func TestHandleTick_DispatchFreezesUsageDisposition(t *testing.T) {
 	// at the end of the test.
 	var runTurnStarted sync.WaitGroup
 	runTurnStarted.Add(2)
+	reportedUsage := domain.TokenUsage{InputTokens: 100, OutputTokens: 50, TotalTokens: 150, CacheReadTokens: 5}
 	trackedAdapter := &mockAgentAdapter{
 		runTurnFn: func(_ context.Context, sess domain.Session, _ domain.RunTurnParams) (domain.TurnResult, error) {
 			runTurnStarted.Done()
-			return domain.TurnResult{SessionID: sess.ID, ExitReason: domain.EventTurnCompleted}, nil
+			return domain.TurnResult{
+				SessionID:     sess.ID,
+				ExitReason:    domain.EventTurnCompleted,
+				Usage:         reportedUsage,
+				UsageMeasured: true,
+			}, nil
 		},
 	}
 
@@ -8036,6 +8070,23 @@ func TestHandleTick_DispatchFreezesUsageDisposition(t *testing.T) {
 	if narrowedEntry.UsageArrival != registry.UsageArrivalNone || narrowedEntry.UsageAttribution != registry.UsageAttributionNone {
 		t.Errorf("rule-routed entry (UsageArrival, UsageAttribution) = (%q, %q), want (%q, %q)",
 			narrowedEntry.UsageArrival, narrowedEntry.UsageAttribution, registry.UsageArrivalNone, registry.UsageAttributionNone)
+	}
+
+	exitResults := make(map[string]WorkerResult, 2)
+	for i := range 2 {
+		select {
+		case r := <-o.workerExitCh:
+			exitResults[r.IssueID] = r
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for worker exit %d/2", i+1)
+		}
+	}
+
+	if got := exitResults[defaultIssue.ID].Usage; got != reportedUsage {
+		t.Errorf("default-kind WorkerResult.Usage = %+v, want %+v (the reported figure)", got, reportedUsage)
+	}
+	if got := exitResults[narrowedIssue.ID].Usage; got != (domain.TokenUsage{}) {
+		t.Errorf("rule-routed (none) WorkerResult.Usage = %+v, want zero", got)
 	}
 }
 

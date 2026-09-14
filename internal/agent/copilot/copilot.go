@@ -109,8 +109,8 @@ type sessionState struct {
 
 	// recoveryUnavailable is set when this run cannot separate its own
 	// spend from a resumed session's prior spend after missing its
-	// first read attempt. Once set, the output-only provisional figure
-	// stands for the remainder of the run.
+	// first read attempt. Once set, recoverUsage returns nil, so no
+	// later turn of the run reports a usage figure.
 	recoveryUnavailable bool
 
 	// priorFinalizeOccurred is true once any turn of this run has
