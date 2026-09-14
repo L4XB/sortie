@@ -47,6 +47,37 @@ func testExportState(command, workspace string) *sessionState {
 func TestQueryExportSubprocess(t *testing.T) {
 	t.Parallel()
 
+	t.Run("a_cancelled_turn_context_does_not_cost_the_recovery", func(t *testing.T) {
+		t.Parallel()
+
+		// Every terminal path hands `recoverUsage` the TURN's context, and on
+		// the cancel path that context is the thing that just fired. The read
+		// timeout and the process-exit path can reach it after a cancellation
+		// too. The export is terminal work about a turn that already ran, so
+		// it must not inherit the caller's cancellation.
+		tmpDir := t.TempDir()
+		script, _ := writeExportScript(t, tmpDir, "export_usage.json", 0)
+		state := testExportState(script, tmpDir)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		// The hazard, measured rather than assumed: an attached query on this
+		// context recovers nothing at all.
+		if usage := queryExportUsage(ctx, state, 0); hasUsage(usage) {
+			t.Fatal("queryExportUsage recovered on a cancelled context; this test's premise is gone")
+		}
+
+		recovered := recoverUsage(ctx, state, 0)
+		if recovered == nil {
+			t.Fatal("recoverUsage = nil on a cancelled turn context, want the export's figures")
+		}
+		if recovered.Run.InputTokens != 1750 || recovered.Run.OutputTokens != 300 {
+			t.Errorf("Run = in:%d out:%d, want in:1750 out:300",
+				recovered.Run.InputTokens, recovered.Run.OutputTokens)
+		}
+	})
+
 	t.Run("local_subprocess_usage_extracted", func(t *testing.T) {
 		t.Parallel()
 

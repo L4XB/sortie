@@ -527,11 +527,7 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 			killTurnProcess(runtime)
 			_ = waitForProcess(runtime)
 			drainReaderBounded(runtime.reader, runtime.drainGrace)
-			// WithoutCancel because ctx is the thing that just fired:
-			// deriving the export's own timeout from it would cancel the
-			// query before it started, and the work whose cost we are
-			// recovering has already happened.
-			recovered := recoverUsage(context.WithoutCancel(ctx), state, turnWindow(state))
+			recovered := recoverUsage(ctx, state, turnWindow(state))
 			clearActive(state, runtime)
 			ev := agentcore.TurnEvidence{Terminal: agentcore.TerminalCancelled, TerminalMessage: "turn cancelled"}
 			result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, recovered)
@@ -891,7 +887,16 @@ func isMaskedServerError(message string) bool {
 // meant the same completed work reported a figure or reported nothing
 // depending only on which case of the select won.
 func recoverUsage(ctx context.Context, state *sessionState, sinceUnixMS int64) *agentcore.RecoveredUsage {
-	usage := queryExportUsage(ctx, state, sinceUnixMS)
+	// WithoutCancel: this runs after the turn is over, and on the cancel path
+	// `ctx` is the thing that just fired -- deriving the export's own timeout
+	// from it cancels the query before it starts, and the work whose cost is
+	// being recovered has already happened. The other terminal paths reach
+	// here with a context that CAN be cancelled too (the caller may cancel
+	// while the read timeout or the process exit is being handled), so the
+	// detach belongs here rather than at each call site, where the next
+	// terminal path added would have to remember it. Still bounded:
+	// `queryExportUsage` applies its own `exportTimeout`.
+	usage := queryExportUsage(context.WithoutCancel(ctx), state, sinceUnixMS)
 	if !hasUsage(usage) {
 		return nil
 	}

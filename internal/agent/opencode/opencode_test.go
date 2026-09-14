@@ -1488,6 +1488,69 @@ cat '`+runPath+`'`)
 	}
 }
 
+// TestRunTurn_UsageMeasured_TrueWhenTheExportIsAGenuineZero is the same
+// property as the test above on the COMPLETION path, for the export shape the
+// value-based check used to throw away: an assistant message whose tokens are
+// all zero. The terminal-turn tests all use non-zero exports, so none of them
+// would notice a finalizer that went back to reading the values.
+func TestRunTurn_UsageMeasured_TrueWhenTheExportIsAGenuineZero(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+
+	runFixture := loadFixture(t, "simple_turn.jsonl")
+	runPath := filepath.Join(tmpDir, "run.jsonl")
+	if err := os.WriteFile(runPath, runFixture, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	exportPath := filepath.Join(tmpDir, "export.json")
+	const export = `{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123",` +
+		`"providerID":"anthropic","modelID":"claude-sonnet-4-5",` +
+		`"tokens":{"input":0,"output":0,"total":0,"cache":{"read":0,"write":0}}}}]}`
+	if err := os.WriteFile(exportPath, []byte(export), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	script := writeOpenCodeScript(t, tmpDir, `case "$1" in
+  export) cat '`+exportPath+`'; exit 0;;
+esac
+cat '`+runPath+`'`)
+
+	a, _ := NewOpenCodeAdapter(map[string]any{})
+	session := mustStartSession(t, a, tmpDir, script)
+
+	events, result, err := collectEvents(t, a, session, "work")
+	if err != nil {
+		t.Fatalf("RunTurn() error = %v", err)
+	}
+
+	// A known zero is a MEASURED spend, not an unknown one -- that is the
+	// distinction the verdict exists to make.
+	if !result.UsageMeasured {
+		t.Error("UsageMeasured = false; the export was readable and reported zero")
+	}
+	if result.Usage.InputTokens != 0 || result.Usage.OutputTokens != 0 {
+		t.Errorf("Usage = in:%d out:%d, want in:0 out:0",
+			result.Usage.InputTokens, result.Usage.OutputTokens)
+	}
+
+	var usageEvents []domain.AgentEvent
+	for _, ev := range events {
+		if ev.Type == domain.EventTokenUsage {
+			usageEvents = append(usageEvents, ev)
+		}
+	}
+	if len(usageEvents) != 1 {
+		t.Fatalf("token-usage events = %d, want exactly 1", len(usageEvents))
+	}
+	// The model the export named rides along with the zero; dropping the
+	// recovery dropped this too.
+	if usageEvents[0].Model != "anthropic/claude-sonnet-4-5" {
+		t.Errorf("Model = %q, want the model the export named", usageEvents[0].Model)
+	}
+}
+
 // TestAssertUsageReporting proves opencode's registered
 // usage-reporting declaration (turn_end, per_model) against a real
 // event stream: one usage figure, carrying the exported model,
