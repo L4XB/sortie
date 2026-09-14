@@ -1194,6 +1194,57 @@ func TestHandleWorkerExit_NoBudgetStopForExitingRun(t *testing.T) {
 			t.Errorf("RunHistory.Error = %v, want it to contain %q", run.Error, stallErr.Error())
 		}
 	})
+
+	t.Run("a queued figure for an issue whose exit is already waiting records no budget stop", func(t *testing.T) {
+		t.Parallel()
+
+		o, store, spy, logBuf := budgetCeilingExemptionFixture(t)
+		var yCancels atomic.Int32
+		o.state.Running["X"] = &RunningEntry{
+			Identifier: "X-ident",
+			Issue:      domain.Issue{ID: "X", Identifier: "X-ident"},
+			StartedAt:  time.Now().UTC(),
+		}
+		o.state.Running["Y"] = &RunningEntry{
+			Identifier:           "Y-ident",
+			Issue:                domain.Issue{ID: "Y", Identifier: "Y-ident"},
+			StartedAt:            time.Now().UTC(),
+			IssueTokensCompleted: 90,
+			CancelFunc:           func() { yCancels.Add(1) },
+		}
+		o.state.Claimed["X"] = struct{}{}
+		o.state.Claimed["Y"] = struct{}{}
+		o.agentEventCh <- budgetCeilingCrossingEvent("Y")
+		o.workerExitCh <- WorkerResult{
+			IssueID:       "Y",
+			Identifier:    "Y-ident",
+			ExitKind:      WorkerExitNormal,
+			Usage:         domain.TokenUsage{TotalTokens: 30},
+			UsageMeasured: true,
+		}
+
+		o.handleWorkerExit(context.Background(), WorkerResult{
+			IssueID:    "X",
+			Identifier: "X-ident",
+			ExitKind:   WorkerExitNormal,
+		})
+
+		if len(spy.runsStoppedByBudget) != 0 {
+			t.Errorf("IncRunsStoppedByBudget calls = %v, want none", spy.runsStoppedByBudget)
+		}
+		if strings.Contains(logBuf.String(), "run stopped by token ceiling") {
+			t.Error(`log contains "run stopped by token ceiling", want no such record`)
+		}
+		if yCancels.Load() != 0 {
+			t.Errorf("Y's CancelFunc called %d times, want 0", yCancels.Load())
+		}
+		if len(store.runHistories) != 2 {
+			t.Fatalf("AppendRunHistory called %d times, want 2", len(store.runHistories))
+		}
+		if run := store.runHistories[1]; run.IssueID != "Y" || run.Status != "succeeded" {
+			t.Errorf("second RunHistory = {IssueID: %q, Status: %q}, want {IssueID: %q, Status: %q}", run.IssueID, run.Status, "Y", "succeeded")
+		}
+	})
 }
 
 // TestApplyQueuedAheadOfExit_EnforcesCeilingForOtherIssues pins the
@@ -1225,7 +1276,7 @@ func TestApplyQueuedAheadOfExit_EnforcesCeilingForOtherIssues(t *testing.T) {
 		o.agentEventCh <- budgetCeilingCrossingEvent("Y")
 		o.agentEventCh <- budgetCeilingCrossingEvent("X")
 
-		o.applyQueuedAheadOfExit(context.Background(), "X")
+		o.applyQueuedAheadOfExit(context.Background(), map[string]struct{}{"X": {}})
 
 		if got := len(spy.runsStoppedByBudget); got != 1 {
 			t.Fatalf("IncRunsStoppedByBudget called %d times, want 1: %v", got, spy.runsStoppedByBudget)
