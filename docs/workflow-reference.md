@@ -631,7 +631,7 @@ The self-review section configures an optional post-coding verification and iter
 
 **Turn Accounting:** `max_iterations: N` means up to `2N − 1` additional agent turns (N review turns + N−1 fix turns). For the default `max_iterations: 3`, this is up to 5 additional turns beyond the coding turn loop. Plan token budgets accordingly.
 
-**Process lifetime:** Each verification command's process group (its Job Object on Windows) is terminated when it exits, times out, or is cancelled, and its exit status alone decides whether it passed. When a command exits on its own and its termination reached a process it left running, Sortie logs one INFO record, `leftover processes terminated after the command exited`, carrying `command`.
+**Process lifetime:** Each verification command's process group (its Job Object on Windows) is terminated when it exits, times out, or is cancelled, and its exit status alone decides whether it passed. On Windows, a command whose Job Object could not be created still runs, with the failure logged, and that teardown then reaches only the command itself. When a command exits on its own and its termination reached a process it left running, Sortie logs one INFO record, `leftover processes terminated after the command exited`, carrying `command`.
 
 **Validation rules:**
 
@@ -2489,7 +2489,7 @@ Hooks execute as shell scripts in a local shell context:
 - **Working directory:** The per-issue workspace directory.
 - **Timeout:** Controlled by `hooks.timeout_ms` (default: 60,000 ms).
 - **Logging:** Hook start, completion, failures, and timeouts are logged by the orchestrator.
-- **Process lifetime:** When a hook's shell exits, whatever its exit status, Sortie terminates every process still in its process group (its Job Object on Windows). A background command inside the script ends with the hook: on Linux and macOS `&`, `nohup … &`, `( … & )`, and on Linux `systemd-run --scope`; on Windows `start /b`, `pg_ctl start`, and `pm2 start`. A process meant to outlive the hook needs a supervisor outside that tree:
+- **Process lifetime:** When a hook's shell exits, whatever its exit status, Sortie terminates every process still in its process group (its Job Object on Windows). On Windows, a hook whose Job Object could not be created still runs, with the failure logged, and that teardown then reaches only the shell itself. A background command inside the script ends with the hook: on Linux and macOS `&`, `nohup … &`, `( … & )`, and on Linux `systemd-run --scope`; on Windows `start /b`, `pg_ctl start`, and `pm2 start`. A process meant to outlive the hook needs a supervisor outside that tree:
 
   | Platform | Route | Prerequisite |
   | --- | --- | --- |
