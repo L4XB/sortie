@@ -163,4 +163,6 @@ Fields:
   - Compare states after `lowercase`.
 - `Session ID`
   - Opaque string assigned by the agent adapter. Composition is adapter-specific.
+- `Dispatch ID`
+  - Opaque string the orchestrator mints each time it dispatches an issue, never reused. Identifies that dispatch's running session to the tool server and in `session_metadata`. Differs from `Session ID` because a resumed session keeps its session ID across dispatches, while each dispatch mints its own dispatch ID.
 

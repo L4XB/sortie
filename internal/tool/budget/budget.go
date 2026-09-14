@@ -23,23 +23,23 @@ var inputSchema = json.RawMessage(`{
 // BudgetQueryFunc returns the per-issue completed-session token sum, the
 // completed-session count, and the running session's recorded token total.
 // The running-session total is taken from session_metadata only when its
-// stored session ID matches runningSessionID; otherwise it is 0.
+// stored dispatch ID matches runningDispatchID; otherwise it is 0.
 // Implementations make no external calls.
-type BudgetQueryFunc func(ctx context.Context, issueID string, runningSessionID string) (BudgetUsage, error)
+type BudgetQueryFunc func(ctx context.Context, issueID string, runningDispatchID string) (BudgetUsage, error)
 
 // BudgetUsage is the per-issue token accounting returned by a
 // [BudgetQueryFunc].
 type BudgetUsage struct {
 	CompletedTotalTokens int64 // SUM(total_tokens) over run_history rows for the issue.
 	CompletedSessions    int   // COUNT(*) of run_history rows for the issue.
-	RunningTotalTokens   int64 // session_metadata.total_tokens when session_id matches; else 0.
+	RunningTotalTokens   int64 // session_metadata.total_tokens when dispatch_id matches; else 0.
 
 	// UnmeasuredSessions is the count of the issue's run_history rows
 	// with tokens_measured = 0.
 	UnmeasuredSessions int
 
 	// RunningMeasured is true when a session_metadata row was found
-	// whose session ID matches the running session ID, which is the
+	// whose dispatch ID matches the running dispatch ID, which is the
 	// same condition that gates RunningTotalTokens.
 	RunningMeasured bool
 }
@@ -47,11 +47,11 @@ type BudgetUsage struct {
 // BudgetTool implements [domain.AgentTool] for the cost_budget tool.
 // Construct via [New]; safe for concurrent use after construction.
 type BudgetTool struct {
-	query            BudgetQueryFunc
-	issueID          string
-	runningSessionID string
-	budgetTokens     int
-	budgetSessions   int
+	query             BudgetQueryFunc
+	issueID           string
+	runningDispatchID string
+	budgetTokens      int
+	budgetSessions    int
 }
 
 // costBudgetResponse is the JSON result of the cost_budget tool. The field
@@ -66,14 +66,15 @@ type costBudgetResponse struct {
 	UsedTokensComplete bool   `json:"used_tokens_complete"`
 }
 
-// New returns a [BudgetTool] for the given issue and running session.
+// New returns a [BudgetTool] for the given issue and running dispatch.
 //
 // budgetTokens and budgetSessions are the configured agent ceilings,
-// where 0 means unlimited. runningSessionID is the live session ID
-// delivered to the sidecar out of band; an empty value contributes no
-// running-session spend. New panics if query is nil or issueID is empty
-// (programming errors).
-func New(query BudgetQueryFunc, issueID string, runningSessionID string, budgetTokens int, budgetSessions int) *BudgetTool {
+// where 0 means unlimited. runningDispatchID is the live dispatch ID
+// delivered to the sidecar out of band; an empty runningDispatchID
+// contributes no running-session spend and makes used_tokens_complete
+// false. New panics if query is nil or issueID is empty (programming
+// errors).
+func New(query BudgetQueryFunc, issueID string, runningDispatchID string, budgetTokens int, budgetSessions int) *BudgetTool {
 	if query == nil {
 		panic("budget.New: query must not be nil")
 	}
@@ -81,11 +82,11 @@ func New(query BudgetQueryFunc, issueID string, runningSessionID string, budgetT
 		panic("budget.New: issueID must not be empty")
 	}
 	return &BudgetTool{
-		query:            query,
-		issueID:          issueID,
-		runningSessionID: runningSessionID,
-		budgetTokens:     budgetTokens,
-		budgetSessions:   budgetSessions,
+		query:             query,
+		issueID:           issueID,
+		runningDispatchID: runningDispatchID,
+		budgetTokens:      budgetTokens,
+		budgetSessions:    budgetSessions,
 	}
 }
 
@@ -97,8 +98,8 @@ func (t *BudgetTool) Description() string {
 	return "Returns cumulative token spend for the current issue and the remaining token " +
 		"budget. Use this to decide whether to skip an expensive step, return partial work, " +
 		"or hand off before the token ceiling stops this run in flight or blocks a further " +
-		"session. A false used_tokens_complete means some sessions could not be measured, so " +
-		"used_tokens is a lower bound."
+		"session. A false used_tokens_complete means some sessions could not be measured or " +
+		"the running session's spend is not included yet, so used_tokens is a lower bound."
 }
 
 // InputSchema returns the JSON Schema for cost_budget input.
@@ -115,7 +116,7 @@ func (t *BudgetTool) InputSchema() json.RawMessage {
 // Query failures are returned as a JSON error response with a nil Go
 // error. Only internal marshal failures produce a non-nil Go error.
 func (t *BudgetTool) Execute(ctx context.Context, _ json.RawMessage) (json.RawMessage, error) {
-	usage, err := t.query(ctx, t.issueID, t.runningSessionID)
+	usage, err := t.query(ctx, t.issueID, t.runningDispatchID)
 	if err != nil {
 		return toolresult.Failure("query_failed", err.Error())
 	}
@@ -128,7 +129,7 @@ func (t *BudgetTool) Execute(ctx context.Context, _ json.RawMessage) (json.RawMe
 	}
 
 	usedTokensComplete := usage.UnmeasuredSessions == 0 &&
-		(t.runningSessionID == "" || usage.RunningMeasured)
+		t.runningDispatchID != "" && usage.RunningMeasured
 
 	return toolresult.Success(costBudgetResponse{
 		UsedTokens:         usedTokens,

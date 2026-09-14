@@ -301,6 +301,27 @@ func TestBudgetTool_Execute_UsedTokensComplete(t *testing.T) {
 		}
 	})
 
+	t.Run("empty running dispatch id keeps the reading incomplete even when the query reports RunningMeasured", func(t *testing.T) {
+		t.Parallel()
+
+		query := func(_ context.Context, _ string, _ string) (BudgetUsage, error) {
+			return BudgetUsage{
+				CompletedTotalTokens: 500,
+				CompletedSessions:    2,
+				UnmeasuredSessions:   0,
+				RunningTotalTokens:   0,
+				RunningMeasured:      true,
+			}, nil
+		}
+		tool := New(query, "10042", "", 1000, 5)
+
+		resp := executeOK(t, tool)
+
+		if resp.UsedTokensComplete {
+			t.Error("data.used_tokens_complete = true, want false (empty running dispatch id)")
+		}
+	})
+
 	t.Run("running session id supplied but no matching row leaves the reading incomplete", func(t *testing.T) {
 		t.Parallel()
 

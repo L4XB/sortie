@@ -59,6 +59,9 @@ var migration015SQL string
 //go:embed sql/016_session_metadata_requests_measured.sql
 var migration016SQL string
 
+//go:embed sql/017_session_metadata_dispatch_id.sql
+var migration017SQL string
+
 var migrations = []Migration{
 	{Version: 1, Description: "core persistence tables", SQL: migration001SQL},
 	{Version: 2, Description: "extended token metrics", SQL: migration002SQL},
@@ -76,4 +79,5 @@ var migrations = []Migration{
 	{Version: 14, Description: "parked issues held out of primary dispatch", SQL: migration014SQL},
 	{Version: 15, Description: "budget hold notices for cross-restart tracker-comment dedup", SQL: migration015SQL},
 	{Version: 16, Description: "api_requests_measured column on session_metadata", SQL: migration016SQL},
+	{Version: 17, Description: "dispatch_id column on session_metadata", SQL: migration017SQL},
 }

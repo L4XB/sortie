@@ -44,9 +44,13 @@ type SessionToolParams struct {
 	// notify_operator envelope context only.
 	Identifier string
 
-	// SessionID is the running-session id used by cost_budget to add the
-	// live session's spend. It gates no tool's registration.
+	// SessionID is the running-session id. It gates no tool's
+	// registration; it feeds only the notify_operator envelope.
 	SessionID string
+
+	// DispatchID is cost_budget's running-session match key. It gates
+	// no tool's registration; it feeds only cost_budget.
+	DispatchID string
 
 	// Attempt is the retry or continuation attempt number for the
 	// notify_operator envelope context, or nil on the first run. It gates
@@ -127,7 +131,7 @@ func BuildSessionToolRegistry(ctx context.Context, logger *slog.Logger, params S
 		} else {
 			store = openedStore
 			reg.Register(history.New(buildHistoryQuery(store), params.IssueID))
-			reg.Register(budget.New(buildBudgetQuery(store), params.IssueID, params.SessionID, params.MaxTokens, params.MaxSessions))
+			reg.Register(budget.New(buildBudgetQuery(store), params.IssueID, params.DispatchID, params.MaxTokens, params.MaxSessions))
 		}
 	}
 

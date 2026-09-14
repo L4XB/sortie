@@ -221,9 +221,10 @@ func TestMCPServerShortHelp(t *testing.T) {
 
 // seedBudgetStore creates a migrated SQLite database with two completed
 // run_history rows (400 + 200 total tokens) for issue "iss-1" and a
-// session_metadata row for the live session "sess-live" carrying 150 total
-// tokens, then reopens it read-only as the sidecar does.
-func seedBudgetStore(t *testing.T) *persistence.Store {
+// session_metadata row for the live session "sess-live" carrying 150
+// total tokens and the given dispatch ID, then reopens it read-only as
+// the sidecar does.
+func seedBudgetStore(t *testing.T, dispatchID string) *persistence.Store {
 	t.Helper()
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "budget.db")
@@ -256,6 +257,7 @@ func seedBudgetStore(t *testing.T) *persistence.Store {
 	meta := persistence.SessionMetadata{
 		IssueID:     "iss-1",
 		SessionID:   "sess-live",
+		DispatchID:  dispatchID,
 		TotalTokens: 150,
 		UpdatedAt:   "2026-03-19T10:02:00Z",
 	}
@@ -282,12 +284,12 @@ func seedBudgetStore(t *testing.T) *persistence.Store {
 func TestBuildBudgetQuery(t *testing.T) {
 	t.Parallel()
 
-	t.Run("matching running session id adds running total", func(t *testing.T) {
+	t.Run("matching running dispatch id adds running total", func(t *testing.T) {
 		t.Parallel()
 
-		query := buildBudgetQuery(seedBudgetStore(t))
+		query := buildBudgetQuery(seedBudgetStore(t, "dispatch-live"))
 
-		usage, err := query(context.Background(), "iss-1", "sess-live")
+		usage, err := query(context.Background(), "iss-1", "dispatch-live")
 		if err != nil {
 			t.Fatalf("buildBudgetQuery query: %v", err)
 		}
@@ -298,18 +300,18 @@ func TestBuildBudgetQuery(t *testing.T) {
 			t.Errorf("CompletedSessions = %d, want 2", usage.CompletedSessions)
 		}
 		if usage.RunningTotalTokens != 150 {
-			t.Errorf("RunningTotalTokens = %d, want 150 (session_id matches)", usage.RunningTotalTokens)
+			t.Errorf("RunningTotalTokens = %d, want 150 (dispatch_id matches)", usage.RunningTotalTokens)
 		}
 	})
 
-	t.Run("stale session row with different id is excluded", func(t *testing.T) {
+	t.Run("stale dispatch row with different id is excluded", func(t *testing.T) {
 		t.Parallel()
 
-		query := buildBudgetQuery(seedBudgetStore(t))
+		query := buildBudgetQuery(seedBudgetStore(t, "dispatch-live"))
 
-		// The stored row belongs to "sess-live"; the live session is a
+		// The stored row belongs to "dispatch-live"; the live dispatch is a
 		// newer one, so the stale row must not be double counted.
-		usage, err := query(context.Background(), "iss-1", "sess-new")
+		usage, err := query(context.Background(), "iss-1", "dispatch-new")
 		if err != nil {
 			t.Fatalf("buildBudgetQuery query: %v", err)
 		}
@@ -317,30 +319,50 @@ func TestBuildBudgetQuery(t *testing.T) {
 			t.Errorf("CompletedTotalTokens = %d, want 600", usage.CompletedTotalTokens)
 		}
 		if usage.RunningTotalTokens != 0 {
-			t.Errorf("RunningTotalTokens = %d, want 0 (stale session row)", usage.RunningTotalTokens)
+			t.Errorf("RunningTotalTokens = %d, want 0 (stale dispatch row)", usage.RunningTotalTokens)
 		}
 	})
 
-	t.Run("empty running session id contributes zero", func(t *testing.T) {
+	t.Run("session_id match with a cleared dispatch_id contributes nothing", func(t *testing.T) {
 		t.Parallel()
 
-		query := buildBudgetQuery(seedBudgetStore(t))
+		// The row's session_id equals the value queried below, mirroring
+		// the pre-dispatch-ID session-exit write, but buildBudgetQuery
+		// MUST NOT match on session_id.
+		query := buildBudgetQuery(seedBudgetStore(t, ""))
+
+		usage, err := query(context.Background(), "iss-1", "sess-live")
+		if err != nil {
+			t.Fatalf("buildBudgetQuery query: %v", err)
+		}
+		if usage.RunningTotalTokens != 0 {
+			t.Errorf("RunningTotalTokens = %d, want 0 (dispatch_id cleared, not a session_id match)", usage.RunningTotalTokens)
+		}
+		if usage.RunningMeasured {
+			t.Error("RunningMeasured = true, want false")
+		}
+	})
+
+	t.Run("empty running dispatch id contributes zero", func(t *testing.T) {
+		t.Parallel()
+
+		query := buildBudgetQuery(seedBudgetStore(t, ""))
 
 		usage, err := query(context.Background(), "iss-1", "")
 		if err != nil {
 			t.Fatalf("buildBudgetQuery query: %v", err)
 		}
 		if usage.RunningTotalTokens != 0 {
-			t.Errorf("RunningTotalTokens = %d, want 0 (no running session id)", usage.RunningTotalTokens)
+			t.Errorf("RunningTotalTokens = %d, want 0 (no running dispatch id)", usage.RunningTotalTokens)
 		}
 	})
 
 	t.Run("issue with no history returns zero usage", func(t *testing.T) {
 		t.Parallel()
 
-		query := buildBudgetQuery(seedBudgetStore(t))
+		query := buildBudgetQuery(seedBudgetStore(t, "dispatch-live"))
 
-		usage, err := query(context.Background(), "iss-none", "sess-live")
+		usage, err := query(context.Background(), "iss-none", "dispatch-live")
 		if err != nil {
 			t.Fatalf("buildBudgetQuery query: %v", err)
 		}
@@ -392,8 +414,8 @@ func seedBudgetMeasurementStore(t *testing.T) *persistence.Store {
 	}
 
 	metas := []persistence.SessionMetadata{
-		{IssueID: "iss-mixed", SessionID: "sess-mixed-live", TotalTokens: 50, UpdatedAt: "2026-03-19T10:02:00Z"},
-		{IssueID: "iss-zero", SessionID: "sess-zero-live", TotalTokens: 0, UpdatedAt: "2026-03-19T10:02:00Z"},
+		{IssueID: "iss-mixed", SessionID: "sess-mixed-live", DispatchID: "dispatch-mixed-live", TotalTokens: 50, UpdatedAt: "2026-03-19T10:02:00Z"},
+		{IssueID: "iss-zero", SessionID: "sess-zero-live", DispatchID: "dispatch-zero-live", TotalTokens: 0, UpdatedAt: "2026-03-19T10:02:00Z"},
 	}
 	for _, meta := range metas {
 		if err := rw.UpsertSessionMetadata(ctx, meta); err != nil {
@@ -429,7 +451,7 @@ func TestBuildBudgetQuery_Measurement(t *testing.T) {
 
 		query := buildBudgetQuery(seedBudgetMeasurementStore(t))
 
-		usage, err := query(context.Background(), "iss-mixed", "sess-mixed-live")
+		usage, err := query(context.Background(), "iss-mixed", "dispatch-mixed-live")
 		if err != nil {
 			t.Fatalf("buildBudgetQuery query: %v", err)
 		}
@@ -440,7 +462,7 @@ func TestBuildBudgetQuery_Measurement(t *testing.T) {
 			t.Errorf("CompletedTotalTokens = %d, want 400 (the unmeasured row contributes zero)", usage.CompletedTotalTokens)
 		}
 		if !usage.RunningMeasured {
-			t.Error("RunningMeasured = false, want true (session_metadata row matches the running session id)")
+			t.Error("RunningMeasured = false, want true (session_metadata row matches the running dispatch id)")
 		}
 		if usage.RunningTotalTokens != 50 {
 			t.Errorf("RunningTotalTokens = %d, want 50", usage.RunningTotalTokens)
@@ -452,7 +474,7 @@ func TestBuildBudgetQuery_Measurement(t *testing.T) {
 
 		query := buildBudgetQuery(seedBudgetMeasurementStore(t))
 
-		usage, err := query(context.Background(), "iss-mixed", "sess-does-not-exist")
+		usage, err := query(context.Background(), "iss-mixed", "dispatch-does-not-exist")
 		if err != nil {
 			t.Fatalf("buildBudgetQuery query: %v", err)
 		}
@@ -469,7 +491,7 @@ func TestBuildBudgetQuery_Measurement(t *testing.T) {
 
 		query := buildBudgetQuery(seedBudgetMeasurementStore(t))
 
-		usage, err := query(context.Background(), "iss-zero", "sess-zero-live")
+		usage, err := query(context.Background(), "iss-zero", "dispatch-zero-live")
 		if err != nil {
 			t.Fatalf("buildBudgetQuery query: %v", err)
 		}
@@ -486,6 +508,111 @@ func TestBuildBudgetQuery_Measurement(t *testing.T) {
 			t.Errorf("CompletedTotalTokens = %d, want 500", usage.CompletedTotalTokens)
 		}
 	})
+}
+
+// TestSessionToolParamsFromEnv covers env-to-SessionToolParams mapping:
+// every variable runMCPServer read before the dispatch ID change maps to
+// the same field, SORTIE_DISPATCH_ID maps to DispatchID, and a
+// map-backed getenv fully determines the result while the process
+// environment holds different SORTIE_* values.
+//
+// No t.Parallel: uses t.Setenv which is incompatible with t.Parallel.
+func TestSessionToolParamsFromEnv(t *testing.T) {
+	env := map[string]string{
+		"SORTIE_WORKSPACE":          "/ws",
+		"SORTIE_DB_PATH":            "/db.sqlite",
+		"SORTIE_ISSUE_ID":           "issue-1",
+		"SORTIE_ISSUE_IDENTIFIER":   "PROJ-1",
+		"SORTIE_SESSION_ID":         "sess-1",
+		"SORTIE_DISPATCH_ID":        "dispatch-1",
+		"SORTIE_ATTEMPT":            "3",
+		"SORTIE_SESSION_AGENT_KIND": "mock",
+	}
+	getenv := func(key string) string { return env[key] }
+
+	// The process environment holds different SORTIE_* values than the
+	// map, so a result that matches the map rather than the process
+	// proves getenv is the only source consulted.
+	t.Setenv("SORTIE_WORKSPACE", "/process-ws")
+	t.Setenv("SORTIE_DB_PATH", "/process-db.sqlite")
+	t.Setenv("SORTIE_ISSUE_ID", "process-issue")
+	t.Setenv("SORTIE_ISSUE_IDENTIFIER", "PROC-1")
+	t.Setenv("SORTIE_SESSION_ID", "process-sess")
+	t.Setenv("SORTIE_DISPATCH_ID", "process-dispatch")
+	t.Setenv("SORTIE_ATTEMPT", "9")
+	t.Setenv("SORTIE_SESSION_AGENT_KIND", "process-agent")
+
+	cfg := config.ServiceConfig{
+		Tracker: config.TrackerConfig{Project: "PROJ"},
+		Agent:   config.AgentConfig{MaxTokens: 1000, MaxSessions: 5},
+	}
+	tracker := &stubTrackerAdapter{}
+
+	params := sessionToolParamsFromEnv(getenv, cfg, tracker)
+
+	if params.WorkspacePath != "/ws" {
+		t.Errorf("WorkspacePath = %q, want %q", params.WorkspacePath, "/ws")
+	}
+	if params.DBPath != "/db.sqlite" {
+		t.Errorf("DBPath = %q, want %q", params.DBPath, "/db.sqlite")
+	}
+	if params.IssueID != "issue-1" {
+		t.Errorf("IssueID = %q, want %q", params.IssueID, "issue-1")
+	}
+	if params.Identifier != "PROJ-1" {
+		t.Errorf("Identifier = %q, want %q", params.Identifier, "PROJ-1")
+	}
+	if params.SessionID != "sess-1" {
+		t.Errorf("SessionID = %q, want %q", params.SessionID, "sess-1")
+	}
+	if params.DispatchID != "dispatch-1" {
+		t.Errorf("DispatchID = %q, want %q", params.DispatchID, "dispatch-1")
+	}
+	if params.Attempt == nil || *params.Attempt != 3 {
+		t.Errorf("Attempt = %v, want pointer to 3", params.Attempt)
+	}
+	if params.AgentKind != "mock" {
+		t.Errorf("AgentKind = %q, want %q", params.AgentKind, "mock")
+	}
+	if params.Project != "PROJ" {
+		t.Errorf("Project = %q, want %q", params.Project, "PROJ")
+	}
+	if params.MaxTokens != 1000 {
+		t.Errorf("MaxTokens = %d, want 1000", params.MaxTokens)
+	}
+	if params.MaxSessions != 5 {
+		t.Errorf("MaxSessions = %d, want 5", params.MaxSessions)
+	}
+	if params.TrackerAdapter != tracker {
+		t.Error("TrackerAdapter does not equal the adapter passed in")
+	}
+}
+
+// TestSessionToolParamsFromEnv_Attempt covers the SORTIE_ATTEMPT parse
+// rule in isolation: a non-integer value and an absent value both leave
+// Attempt nil, matching runMCPServer's behavior before this change.
+func TestSessionToolParamsFromEnv_Attempt(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		env  map[string]string
+	}{
+		{"absent leaves Attempt nil", map[string]string{}},
+		{"non-integer leaves Attempt nil", map[string]string{"SORTIE_ATTEMPT": "not-a-number"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			getenv := func(key string) string { return tt.env[key] }
+			params := sessionToolParamsFromEnv(getenv, config.ServiceConfig{}, nil)
+			if params.Attempt != nil {
+				t.Errorf("Attempt = %v, want nil", *params.Attempt)
+			}
+		})
+	}
 }
 
 func TestBuildNotifyTool_EmptyBackends_ReturnsNilNil(t *testing.T) {

@@ -1800,6 +1800,90 @@ func TestHandleWorkerExit_SessionMetadataPersisted(t *testing.T) {
 	}
 }
 
+// orderRecordingExitStore wraps mockExitStore and records the call
+// order of UpsertSessionMetadata and AppendRunHistory, so a test can
+// assert their relative order.
+type orderRecordingExitStore struct {
+	mockExitStore
+	callOrder []string
+}
+
+var _ WorkerExitStore = (*orderRecordingExitStore)(nil)
+
+func (s *orderRecordingExitStore) UpsertSessionMetadata(ctx context.Context, meta persistence.SessionMetadata) error {
+	s.callOrder = append(s.callOrder, "UpsertSessionMetadata")
+	return s.mockExitStore.UpsertSessionMetadata(ctx, meta)
+}
+
+func (s *orderRecordingExitStore) AppendRunHistory(ctx context.Context, run persistence.RunHistory) (persistence.RunHistory, error) {
+	s.callOrder = append(s.callOrder, "AppendRunHistory")
+	return s.mockExitStore.AppendRunHistory(ctx, run)
+}
+
+// TestHandleWorkerExit_SessionExitWriteOrder covers the session-exit
+// write order and the empty DispatchID: the session-exit write clears
+// DispatchID unconditionally and completes before AppendRunHistory is
+// called, and AppendRunHistory still runs once when the session-exit
+// write fails.
+func TestHandleWorkerExit_SessionExitWriteOrder(t *testing.T) {
+	t.Parallel()
+
+	t.Run("session-exit write precedes the run_history append and clears DispatchID", func(t *testing.T) {
+		t.Parallel()
+
+		store := &orderRecordingExitStore{}
+		state := exitState(t, "SM-ORDER", nil)
+		entry := state.Running["SM-ORDER"]
+		entry.DispatchID = "dispatch-order-1"
+		entry.SessionID = "ses-order"
+		params := defaultExitParams(t, &store.mockExitStore)
+		params.Store = store
+
+		HandleWorkerExit(state, WorkerResult{
+			IssueID:      "SM-ORDER",
+			Identifier:   "SM-ORDER-ident",
+			ExitKind:     WorkerExitNormal,
+			SessionID:    "ses-order",
+			AgentAdapter: "mock",
+		}, params)
+
+		if len(store.sessionMetadata) != 1 {
+			t.Fatalf("UpsertSessionMetadata called %d times, want 1", len(store.sessionMetadata))
+		}
+		if got := store.sessionMetadata[0].DispatchID; got != "" {
+			t.Errorf("SessionMetadata.DispatchID = %q, want empty (session-exit write always clears it)", got)
+		}
+
+		if len(store.callOrder) != 2 || store.callOrder[0] != "UpsertSessionMetadata" || store.callOrder[1] != "AppendRunHistory" {
+			t.Errorf("call order = %v, want [UpsertSessionMetadata AppendRunHistory]", store.callOrder)
+		}
+	})
+
+	t.Run("AppendRunHistory still runs once when the session-exit write fails", func(t *testing.T) {
+		t.Parallel()
+
+		store := &orderRecordingExitStore{}
+		store.upsertSessionMetadataErr = fmt.Errorf("disk full")
+		state := exitState(t, "SM-ORDER-ERR", nil)
+		params := defaultExitParams(t, &store.mockExitStore)
+		params.Store = store
+
+		HandleWorkerExit(state, WorkerResult{
+			IssueID:      "SM-ORDER-ERR",
+			Identifier:   "SM-ORDER-ERR-ident",
+			ExitKind:     WorkerExitNormal,
+			AgentAdapter: "mock",
+		}, params)
+
+		if len(store.runHistories) != 1 {
+			t.Fatalf("AppendRunHistory called %d times, want 1 (still runs after a failed session-exit write)", len(store.runHistories))
+		}
+		if len(store.callOrder) != 2 || store.callOrder[0] != "UpsertSessionMetadata" || store.callOrder[1] != "AppendRunHistory" {
+			t.Errorf("call order = %v, want [UpsertSessionMetadata AppendRunHistory]", store.callOrder)
+		}
+	})
+}
+
 func TestHandleWorkerExit_SessionMetadataNilPID(t *testing.T) {
 	t.Parallel()
 

@@ -1336,6 +1336,67 @@ func TestUpsertSessionMetadata_APIRequestsMeasuredRoundTrip(t *testing.T) {
 	}
 }
 
+// TestUpsertSessionMetadata_DispatchIDRoundTrip asserts that DispatchID
+// round-trips through UpsertSessionMetadata and both LoadSessionMetadata
+// and LoadAllSessionMetadata, and that an update carrying "" replaces a
+// stored non-empty value.
+func TestUpsertSessionMetadata_DispatchIDRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	s := openTestStore(t)
+	migrateOrFatal(t, s)
+	ctx := context.Background()
+
+	meta := SessionMetadata{
+		IssueID:    "ISS-DISPATCH",
+		SessionID:  "sess-abc",
+		DispatchID: "dispatch-abc",
+		UpdatedAt:  "2026-03-19T10:00:00Z",
+	}
+	if err := s.UpsertSessionMetadata(ctx, meta); err != nil {
+		t.Fatalf("UpsertSessionMetadata: %v", err)
+	}
+
+	got, found, err := s.LoadSessionMetadata(ctx, "ISS-DISPATCH")
+	if err != nil {
+		t.Fatalf("LoadSessionMetadata: %v", err)
+	}
+	if !found {
+		t.Fatal("expected found=true, got false")
+	}
+	if got.DispatchID != "dispatch-abc" {
+		t.Errorf("DispatchID = %q, want %q", got.DispatchID, "dispatch-abc")
+	}
+
+	all, err := s.LoadAllSessionMetadata(ctx)
+	if err != nil {
+		t.Fatalf("LoadAllSessionMetadata: %v", err)
+	}
+	if len(all) != 1 {
+		t.Fatalf("LoadAllSessionMetadata() len = %d, want 1", len(all))
+	}
+	if all[0].DispatchID != "dispatch-abc" {
+		t.Errorf("LoadAllSessionMetadata()[0].DispatchID = %q, want %q", all[0].DispatchID, "dispatch-abc")
+	}
+
+	meta.DispatchID = ""
+	meta.UpdatedAt = "2026-03-19T11:00:00Z"
+	if err := s.UpsertSessionMetadata(ctx, meta); err != nil {
+		t.Fatalf("UpsertSessionMetadata (clear): %v", err)
+	}
+
+	got, found, err = s.LoadSessionMetadata(ctx, "ISS-DISPATCH")
+	if err != nil {
+		t.Fatalf("LoadSessionMetadata (after clear): %v", err)
+	}
+	if !found {
+		t.Fatal("expected found=true, got false")
+	}
+	if got.DispatchID != "" {
+		t.Errorf("DispatchID after an update carrying \"\" = %q, want empty", got.DispatchID)
+	}
+}
+
 func TestLoadSessionMetadata_NotFound(t *testing.T) {
 	t.Parallel()
 
