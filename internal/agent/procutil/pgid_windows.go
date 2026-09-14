@@ -160,7 +160,12 @@ func killProcessGroupReportingLeftover(pid int) (leftover bool, err error) {
 		return false, nil
 	}
 
-	leftover = jobHasRunningMember(entry.job)
+	// A member list that could not be read leaves the leftover report
+	// with nothing to report: the INFO record it feeds names processes
+	// this teardown observed alive, so a launch that left none behind
+	// must not raise it on a query that failed. The drain below reports
+	// that same failure as a teardown it could not confirm.
+	leftover, _ = jobHasRunningMember(entry.job)
 	err = drainJobObject(pid, entry.job)
 	// A failing CloseHandle means the handle was already invalid, which
 	// leaves the caller nothing to act on; the drain result is the one
@@ -179,19 +184,26 @@ func killProcessGroupReportingLeftover(pid int) (leftover bool, err error) {
 // killProcessGroupReportingLeftover already used for the leftover
 // report.
 //
-// A non-nil error means either a termination call itself failed, or
-// the job still held a running member when the bound ran out; either
-// way a descendant may have survived the reap.
+// A non-nil error means a termination call itself failed, or the job
+// still held a running member when the bound ran out, or its member
+// list could not be read for the whole of that bound; either way a
+// descendant may have survived the reap. Only a member list that was
+// read and held no running member returns nil, so a query that fails
+// leaves the job unconfirmed rather than drained.
 func drainJobObject(pid int, job windows.Handle) error {
 	deadline := time.Now().Add(groupDrainBound)
 	for {
 		if termErr := terminateJobObjectFunc(job, jobTerminateExitCode); termErr != nil {
 			return termErr
 		}
-		if !jobHasRunningMember(job) {
+		running, queryErr := jobHasRunningMember(job)
+		if queryErr == nil && !running {
 			return nil
 		}
 		if !time.Now().Before(deadline) {
+			if queryErr != nil {
+				return fmt.Errorf("job object for process %d could not be confirmed empty within the %s drain bound: %w", pid, groupDrainBound, queryErr)
+			}
 			return fmt.Errorf("job object for process %d still had a running member after the %s drain bound", pid, groupDrainBound)
 		}
 		time.Sleep(groupDrainPollInterval)
@@ -362,17 +374,23 @@ func queryImageBaseName(process windows.Handle) (string, error) {
 // finds running. A process the list names but that has already exited
 // (including the reap's own direct child) is signaled rather than
 // timed out, and does not count.
-func jobHasRunningMember(job windows.Handle) bool {
+//
+// A non-nil error means the member list itself could not be read, so
+// neither answer is established: false then means the job was not
+// observed to hold a running member, never that it was observed empty.
+// Only a caller that may treat an unread list the way it treats a
+// confirmed-empty one may discard the error.
+func jobHasRunningMember(job windows.Handle) (bool, error) {
 	pids, err := jobMemberPIDs(job)
 	if err != nil {
-		return false
+		return false, err
 	}
 	for _, pid := range pids {
 		if memberIsRunning(job, pid) {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // isConsoleHostImage reports whether name, a process image base name,
