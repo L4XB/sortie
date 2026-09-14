@@ -310,27 +310,27 @@ func (c *Capture) Wait() CaptureResult {
 // awaitStreams blocks until every stream has reached end of file or
 // c.drainGrace has passed, and reports which happened first.
 func (c *Capture) awaitStreams() bool {
-	done := make(chan struct{})
-	go func() {
+	if c.drainGrace <= 0 {
 		for _, s := range c.streams {
 			<-s.done
 		}
-		close(done)
-	}()
-
-	if c.drainGrace <= 0 {
-		<-done
 		return true
 	}
 
+	// One timer spans the streams, so the grace bounds the drain as a
+	// whole rather than each stream in turn. Waiting here rather than in
+	// a helper goroutine is what keeps an abandoned stream from leaving
+	// a goroutine parked forever on a channel that never closes.
 	timer := time.NewTimer(c.drainGrace)
 	defer timer.Stop()
-	select {
-	case <-done:
-		return true
-	case <-timer.C:
-		return false
+	for _, s := range c.streams {
+		select {
+		case <-s.done:
+		case <-timer.C:
+			return false
+		}
 	}
+	return true
 }
 
 // RunCapture calls [SetGroupCancel](cmd, stopGrace), then StartCapture,
