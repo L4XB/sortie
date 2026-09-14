@@ -112,6 +112,14 @@ type exportUsage struct {
 	CacheReadTokens int64
 	Model           string
 	Cost            float64
+
+	// Recovered reports whether the export produced a figure at all,
+	// which is not the same question as whether that figure is non-zero.
+	// The runtime's assistant message carries `tokens` as a required
+	// object rather than one present only when something was spent, so a
+	// turn that genuinely cost zero exports the same shape as any other
+	// and must not read back as "nothing was recovered".
+	Recovered bool
 }
 
 func parseRunEvent(line []byte) (rawRunEvent, error) {
@@ -365,6 +373,7 @@ func parseExportOutput(data []byte, sessionID string, sinceUnixMS int64) exportU
 	}
 
 	sum.TotalTokens = sum.InputTokens + sum.OutputTokens
+	sum.Recovered = true
 	return sum
 }
 

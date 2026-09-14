@@ -527,9 +527,14 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 			killTurnProcess(runtime)
 			_ = waitForProcess(runtime)
 			drainReaderBounded(runtime.reader, runtime.drainGrace)
+			// WithoutCancel because ctx is the thing that just fired:
+			// deriving the export's own timeout from it would cancel the
+			// query before it started, and the work whose cost we are
+			// recovering has already happened.
+			recovered := recoverUsage(context.WithoutCancel(ctx), state, turnWindow(state))
 			clearActive(state, runtime)
 			ev := agentcore.TurnEvidence{Terminal: agentcore.TerminalCancelled, TerminalMessage: "turn cancelled"}
-			result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, nil)
+			result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, recovered)
 			if agentErr != nil {
 				return result, agentErr
 			}
@@ -552,13 +557,14 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 			_ = waitForProcess(runtime)
 			drainReaderBounded(runtime.reader, runtime.drainGrace)
 			procutil.EmitWarnLines(runtime.stderrCollector.Lines(), state.logger())
+			recovered := recoverUsage(ctx, state, turnWindow(state))
 			clearActive(state, runtime)
 			ev := agentcore.TurnEvidence{
 				Terminal:          agentcore.TerminalFailure,
 				TerminalErrorKind: domain.ErrResponseTimeout,
 				TerminalMessage:   "timed out waiting for first opencode json event",
 			}
-			result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, nil)
+			result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, recovered)
 			if agentErr != nil {
 				return result, agentErr
 			}
@@ -594,23 +600,7 @@ func (a *OpenCodeAdapter) StopSession(ctx context.Context, session domain.Sessio
 // not reset the read timer the way a stdout line does, neither of which is
 // a regression because the warning has never actually reached stdout.
 func (a *OpenCodeAdapter) finalizeExitedTurn(ctx context.Context, state *sessionState, runtime *turnRuntime, emit func(domain.AgentEvent), exit waitResult) (domain.TurnResult, error) {
-	window := int64(0)
-	if !state.createdSession {
-		window = state.runStartedAtMS
-	}
-	usage := queryExportUsage(ctx, state, window)
-
-	var recovered *agentcore.RecoveredUsage
-	if hasUsage(usage) {
-		recovered = &agentcore.RecoveredUsage{
-			Run: domain.TokenUsage{
-				InputTokens:     usage.InputTokens,
-				OutputTokens:    usage.OutputTokens,
-				CacheReadTokens: usage.CacheReadTokens,
-			},
-			Model: usage.Model,
-		}
-	}
+	recovered := recoverUsage(ctx, state, turnWindow(state))
 
 	clearActive(state, runtime)
 	stderrLines := runtime.stderrCollector.Lines()
@@ -891,8 +881,47 @@ func isMaskedServerError(message string) bool {
 	return strings.TrimSpace(message) == maskedServerErrorMessage
 }
 
+// recoverUsage runs the session export and returns what it recovered, or
+// nil when it recovered nothing.
+//
+// Every path that ends a turn needs this, not only the one where the
+// subprocess exited on its own: by the time a cancelled or timed-out turn
+// gets here the process has already been killed and waited for, and its
+// session export is just as readable as after a normal exit. Leaving it out
+// meant the same completed work reported a figure or reported nothing
+// depending only on which case of the select won.
+func recoverUsage(ctx context.Context, state *sessionState, sinceUnixMS int64) *agentcore.RecoveredUsage {
+	usage := queryExportUsage(ctx, state, sinceUnixMS)
+	if !hasUsage(usage) {
+		return nil
+	}
+	return &agentcore.RecoveredUsage{
+		Run: domain.TokenUsage{
+			InputTokens:     usage.InputTokens,
+			OutputTokens:    usage.OutputTokens,
+			CacheReadTokens: usage.CacheReadTokens,
+		},
+		Model: usage.Model,
+	}
+}
+
+// turnWindow is the timestamp the export filters messages by: the turn's
+// own start for a session this adapter did not create, and none at all for
+// one it did, where every message in the session belongs to this run.
+func turnWindow(state *sessionState) int64 {
+	if state.createdSession {
+		return 0
+	}
+	return state.runStartedAtMS
+}
+
+// hasUsage reports whether the export recovered a figure, not whether that
+// figure is non-zero. The value-based test it replaces threw away a
+// successful recovery whose messages all reported zero tokens, and with it
+// the model the export named -- so a KNOWN zero spend was reported as an
+// UNKNOWN one, which is the distinction the measured verdict exists to make.
 func hasUsage(usage exportUsage) bool {
-	return usage.InputTokens > 0 || usage.OutputTokens > 0 || usage.TotalTokens > 0 || usage.CacheReadTokens > 0
+	return usage.Recovered
 }
 
 // drainLinesBounded takes whatever the reader has already produced and
