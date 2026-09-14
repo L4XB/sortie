@@ -642,7 +642,10 @@
         &middot; Est. Cost: {{if .EstimatedCostUSD}}{{.EstimatedCostUSD}}{{else}}&mdash;{{end}}{{end}}
       </div>
       {{if .HasTokenRates}}<div>Cost estimates are based on configured token rates and may differ from actual provider billing.</div>{{end}}
-      {{if .UnmeasuredRunningCount}}<div>{{.UnmeasuredRunningCount}} running sessions have not reported token usage; the totals above exclude them.</div>{{end}}
+      {{if .RunningUnreportedNote}}<div>{{.RunningUnreportedNote}}</div>{{end}}
+      {{if .RunningNonReportingNote}}<div>{{.RunningNonReportingNote}}</div>{{end}}
+      {{if .EndedUnmeasuredNote}}<div>{{.EndedUnmeasuredNote}}</div>{{end}}
+      {{if .CostUnpricedNote}}<div>{{.CostUnpricedNote}}</div>{{end}}
       <div>Auto-refresh every 5s</div>
     </footer>
     <script>

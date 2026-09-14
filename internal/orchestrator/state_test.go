@@ -2298,6 +2298,60 @@ func TestRuntimeSnapshot_UsageDispositionFields(t *testing.T) {
 	}
 }
 
+// TestRuntimeSnapshot_AgentTotalsExclusionCounts verifies RunningUnreported
+// and RunningNonReporting partition the running set by mutually exclusive
+// reasons, leaving a measured session in neither.
+func TestRuntimeSnapshot_AgentTotalsExclusionCounts(t *testing.T) {
+	t.Parallel()
+
+	fixedNow := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
+
+	state := NewState(5000, 4, 0, nil, AgentTotals{UnmeasuredSessions: 5})
+	state.Running["unreported-inc"] = &RunningEntry{
+		Identifier:   "PROJ-1",
+		Issue:        domain.Issue{ID: "unreported-inc", State: "In Progress"},
+		StartedAt:    fixedNow.Add(-time.Minute),
+		UsageArrival: registry.UsageArrivalIncremental,
+	}
+	state.Running["unreported-turnend"] = &RunningEntry{
+		Identifier:   "PROJ-2",
+		Issue:        domain.Issue{ID: "unreported-turnend", State: "In Progress"},
+		StartedAt:    fixedNow.Add(-time.Minute),
+		UsageArrival: registry.UsageArrivalTurnEnd,
+	}
+	state.Running["no-arrival-1"] = &RunningEntry{
+		Identifier:   "PROJ-3",
+		Issue:        domain.Issue{ID: "no-arrival-1", State: "In Progress"},
+		StartedAt:    fixedNow.Add(-time.Minute),
+		UsageArrival: registry.UsageArrivalNone,
+	}
+	state.Running["no-arrival-2"] = &RunningEntry{
+		Identifier:   "PROJ-4",
+		Issue:        domain.Issue{ID: "no-arrival-2", State: "In Progress"},
+		StartedAt:    fixedNow.Add(-time.Minute),
+		UsageArrival: registry.UsageArrivalNone,
+	}
+	state.Running["measured"] = &RunningEntry{
+		Identifier:    "PROJ-5",
+		Issue:         domain.Issue{ID: "measured", State: "In Progress"},
+		StartedAt:     fixedNow.Add(-time.Minute),
+		UsageArrival:  registry.UsageArrivalIncremental,
+		UsageMeasured: true,
+	}
+
+	result := RuntimeSnapshot(state, fixedNow)
+
+	if result.AgentTotals.RunningUnreported != 2 {
+		t.Errorf("AgentTotals.RunningUnreported = %d, want 2", result.AgentTotals.RunningUnreported)
+	}
+	if result.AgentTotals.RunningNonReporting != 2 {
+		t.Errorf("AgentTotals.RunningNonReporting = %d, want 2", result.AgentTotals.RunningNonReporting)
+	}
+	if result.AgentTotals.UnmeasuredSessions != 5 {
+		t.Errorf("AgentTotals.UnmeasuredSessions = %d, want 5 (passthrough of the persisted counter)", result.AgentTotals.UnmeasuredSessions)
+	}
+}
+
 // TestApiRequestsMeasured walks the arrival/attribution rule table: an
 // arrival that does not report during the turn is always unmeasured,
 // and for incremental a positive raw count is always measured while a

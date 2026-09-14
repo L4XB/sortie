@@ -376,6 +376,65 @@ func TestHandleWorkerExit_NormalExit(t *testing.T) {
 // TestHandleWorkerExit_RunHistoryTokenColumns verifies the exit path copies
 // the running entry's accumulated token counters into the run_history row,
 // matching the totals it writes to session_metadata.
+// TestHandleWorkerExit_NoneArrivalDiscardIsPreserved needs no dedicated
+// gate because both sources already exclude none-arrival entries.
+func TestHandleWorkerExit_NoneArrivalDiscardIsPreserved(t *testing.T) {
+	t.Parallel()
+
+	store := &mockExitStore{}
+	state := exitState(t, "ISS-NONE-EXIT", nil)
+	entry := state.Running["ISS-NONE-EXIT"]
+	entry.UsageArrival = registry.UsageArrivalNone
+
+	HandleAgentEvent(state, "ISS-NONE-EXIT", domain.AgentEvent{
+		Type:      domain.EventTokenUsage,
+		Timestamp: time.Now().UTC(),
+		Model:     "discarded-model",
+		Usage:     domain.TokenUsage{InputTokens: 120, OutputTokens: 30, TotalTokens: 150, CacheReadTokens: 10},
+	}, discardLogger(), nil)
+
+	HandleWorkerExit(state, WorkerResult{
+		IssueID:      "ISS-NONE-EXIT",
+		Identifier:   "ISS-NONE-EXIT-ident",
+		ExitKind:     WorkerExitNormal,
+		AgentAdapter: "mock",
+	}, defaultExitParams(t, store))
+
+	if len(store.runHistories) != 1 {
+		t.Fatalf("AppendRunHistory called %d times, want 1", len(store.runHistories))
+	}
+	run := store.runHistories[0]
+	if run.TokensMeasured {
+		t.Error("RunHistory.TokensMeasured = true, want false")
+	}
+	if run.InputTokens != 0 || run.OutputTokens != 0 || run.TotalTokens != 0 || run.CacheReadTokens != 0 {
+		t.Errorf("RunHistory tokens = (%d, %d, %d, %d), want all zero",
+			run.InputTokens, run.OutputTokens, run.TotalTokens, run.CacheReadTokens)
+	}
+
+	if len(store.sessionMetadata) != 1 {
+		t.Fatalf("UpsertSessionMetadata called %d times, want 1", len(store.sessionMetadata))
+	}
+	meta := store.sessionMetadata[0]
+	if meta.InputTokens != 0 || meta.OutputTokens != 0 || meta.TotalTokens != 0 || meta.CacheReadTokens != 0 {
+		t.Errorf("SessionMetadata tokens = (%d, %d, %d, %d), want all zero",
+			meta.InputTokens, meta.OutputTokens, meta.TotalTokens, meta.CacheReadTokens)
+	}
+	if meta.ModelName != "" {
+		t.Errorf("SessionMetadata.ModelName = %q, want empty", meta.ModelName)
+	}
+	if meta.APIRequestsMeasured {
+		t.Error("SessionMetadata.APIRequestsMeasured = true, want false")
+	}
+
+	if state.AgentTotals.InputTokens != 0 || state.AgentTotals.OutputTokens != 0 ||
+		state.AgentTotals.TotalTokens != 0 || state.AgentTotals.CacheReadTokens != 0 {
+		t.Errorf("State.AgentTotals token components = (%d, %d, %d, %d), want all zero (unchanged since before dispatch)",
+			state.AgentTotals.InputTokens, state.AgentTotals.OutputTokens,
+			state.AgentTotals.TotalTokens, state.AgentTotals.CacheReadTokens)
+	}
+}
+
 func TestHandleWorkerExit_RunHistoryTokenColumns(t *testing.T) {
 	t.Parallel()
 
@@ -1431,6 +1490,188 @@ func TestHandleWorkerExit_RuntimeSecondsAccounting(t *testing.T) {
 	}
 	if store.metrics[0].SecondsRunning != want {
 		t.Errorf("AggregateMetrics.SecondsRunning = %f, want %f", store.metrics[0].SecondsRunning, want)
+	}
+}
+
+// TestHandleWorkerExit_UnmeasuredSessionsCounter verifies the counter
+// increments only when neither the entry nor the result report a measurement.
+func TestHandleWorkerExit_UnmeasuredSessionsCounter(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name            string
+		entryMeasured   bool
+		entryArrival    registry.UsageArrival
+		resultMeasured  bool
+		wantIncremented bool
+	}{
+		{
+			name:            "neither source measured: increments",
+			wantIncremented: true,
+		},
+		{
+			name:            "arrival none, never measured: increments",
+			entryArrival:    registry.UsageArrivalNone,
+			wantIncremented: true,
+		},
+		{
+			name:            "entry itself measured: does not increment",
+			entryMeasured:   true,
+			wantIncremented: false,
+		},
+		{
+			name:            "measurement recovered only from WorkerResult: does not increment",
+			resultMeasured:  true,
+			wantIncremented: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			store := &mockExitStore{}
+			state := exitState(t, "ISSUE-CTR", nil)
+			state.Running["ISSUE-CTR"].UsageMeasured = tt.entryMeasured
+			state.Running["ISSUE-CTR"].UsageArrival = tt.entryArrival
+			state.AgentTotals.UnmeasuredSessions = 5
+
+			HandleWorkerExit(state, WorkerResult{
+				IssueID:       "ISSUE-CTR",
+				Identifier:    "ISSUE-CTR-ident",
+				ExitKind:      WorkerExitNormal,
+				AgentAdapter:  "mock",
+				UsageMeasured: tt.resultMeasured,
+			}, defaultExitParams(t, store))
+
+			want := int64(5)
+			if tt.wantIncremented {
+				want = 6
+			}
+			if state.AgentTotals.UnmeasuredSessions != want {
+				t.Errorf("AgentTotals.UnmeasuredSessions = %d, want %d", state.AgentTotals.UnmeasuredSessions, want)
+			}
+
+			if len(store.metrics) != 1 {
+				t.Fatalf("UpsertAggregateMetrics called %d times, want 1", len(store.metrics))
+			}
+			if store.metrics[0].UnmeasuredSessions != want {
+				t.Errorf("persisted AggregateMetrics.UnmeasuredSessions = %d, want %d", store.metrics[0].UnmeasuredSessions, want)
+			}
+		})
+	}
+}
+
+// TestHandleWorkerExit_UnmeasuredSessionsAccumulatesAcrossExits verifies the
+// counter accumulates only for unmeasured exits across multiple calls.
+func TestHandleWorkerExit_UnmeasuredSessionsAccumulatesAcrossExits(t *testing.T) {
+	t.Parallel()
+
+	store := &mockExitStore{}
+	state := NewState(5000, 4, 0, nil, AgentTotals{})
+
+	for _, issueID := range []string{"ISSUE-A", "ISSUE-B", "ISSUE-C"} {
+		state.Running[issueID] = &RunningEntry{
+			Identifier: issueID + "-ident",
+			StartedAt:  baseTime,
+		}
+		state.Claimed[issueID] = struct{}{}
+	}
+
+	// ISSUE-B alone reports a measurement.
+	measured := map[string]bool{"ISSUE-B": true}
+
+	for _, issueID := range []string{"ISSUE-A", "ISSUE-B", "ISSUE-C"} {
+		HandleWorkerExit(state, WorkerResult{
+			IssueID:       issueID,
+			Identifier:    issueID + "-ident",
+			ExitKind:      WorkerExitNormal,
+			AgentAdapter:  "mock",
+			UsageMeasured: measured[issueID],
+		}, defaultExitParams(t, store))
+	}
+
+	if state.AgentTotals.UnmeasuredSessions != 2 {
+		t.Errorf("AgentTotals.UnmeasuredSessions = %d, want 2 (ISSUE-A and ISSUE-C)", state.AgentTotals.UnmeasuredSessions)
+	}
+}
+
+// TestHandleWorkerExit_UnmeasuredSessionsSurvivesRestart verifies the counter
+// is reconstructed from the persisted row after reopening the store.
+func TestHandleWorkerExit_UnmeasuredSessionsSurvivesRestart(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	dbPath := t.TempDir() + "/test.db"
+
+	store1, err := persistence.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("persistence.Open: %v", err)
+	}
+	if err := store1.Migrate(ctx); err != nil {
+		t.Fatalf("store1.Migrate: %v", err)
+	}
+
+	state1 := NewState(5000, 4, 0, nil, AgentTotals{})
+	state1.Running["ISSUE-RESTART"] = &RunningEntry{
+		Identifier: "PROJ-RESTART",
+		StartedAt:  baseTime,
+	}
+	state1.Claimed["ISSUE-RESTART"] = struct{}{}
+
+	HandleWorkerExit(state1, WorkerResult{
+		IssueID:      "ISSUE-RESTART",
+		Identifier:   "PROJ-RESTART",
+		ExitKind:     WorkerExitNormal,
+		AgentAdapter: "mock",
+	}, HandleWorkerExitParams{
+		Store:             store1,
+		MaxRetryBackoffMS: 300_000,
+		OnRetryFire:       noopRetryFire,
+		NowFunc:           func() time.Time { return baseTime.Add(60 * time.Second) },
+		Logger:            discardLogger(),
+		Ctx:               ctx,
+	})
+
+	if state1.AgentTotals.UnmeasuredSessions != 1 {
+		t.Fatalf("AgentTotals.UnmeasuredSessions before restart = %d, want 1", state1.AgentTotals.UnmeasuredSessions)
+	}
+
+	if err := store1.Close(); err != nil {
+		t.Fatalf("store1.Close: %v", err)
+	}
+
+	store2, err := persistence.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("persistence.Open (reopen): %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store2.Close(); err != nil {
+			t.Errorf("store2.Close: %v", err)
+		}
+	})
+
+	metrics, found, err := store2.LoadAggregateMetrics(ctx, "agent_totals")
+	if err != nil {
+		t.Fatalf("LoadAggregateMetrics after reopening: %v", err)
+	}
+	if !found {
+		t.Fatal("LoadAggregateMetrics after reopening: found = false, want true")
+	}
+	if metrics.UnmeasuredSessions != 1 {
+		t.Errorf("reloaded AggregateMetrics.UnmeasuredSessions = %d, want 1", metrics.UnmeasuredSessions)
+	}
+
+	state2 := NewState(5000, 4, 0, nil, AgentTotals{
+		InputTokens:        metrics.InputTokens,
+		OutputTokens:       metrics.OutputTokens,
+		TotalTokens:        metrics.TotalTokens,
+		CacheReadTokens:    metrics.CacheReadTokens,
+		SecondsRunning:     metrics.SecondsRunning,
+		UnmeasuredSessions: metrics.UnmeasuredSessions,
+	})
+	if state2.AgentTotals.UnmeasuredSessions != 1 {
+		t.Errorf("post-restart State.AgentTotals.UnmeasuredSessions = %d, want 1", state2.AgentTotals.UnmeasuredSessions)
 	}
 }
 

@@ -22,6 +22,12 @@ type stateResponse struct {
 	AgentTotals            orchestrator.SnapshotAgentTotals `json:"agent_totals"`
 	RateLimits             map[string]any                   `json:"rate_limits"`
 	ActiveEstimatedCostUSD *float64                         `json:"active_estimated_cost_usd,omitempty"`
+
+	// CostUnpricedRunning counts running, measured sessions
+	// ActiveEstimatedCostUSD excludes for lacking a configured rate.
+	// Present, zero included, when any agent kind has a rate
+	// configured; omitted otherwise.
+	CostUnpricedRunning *int `json:"cost_unpriced_running,omitempty"`
 }
 
 type stateCounts struct {
@@ -249,22 +255,11 @@ func toStateResponse(snap orchestrator.RuntimeSnapshotResult, tokenRates TokenRa
 	}
 
 	if len(tokenRates) > 0 {
-		var total float64
-		anySet := false
-		for _, e := range snap.Running {
-			if !e.UsageMeasured {
-				continue
-			}
-			if rc, ok := tokenRates[e.AgentKind]; ok {
-				if c := EstimateCost(e.AgentInputTokens, e.AgentOutputTokens, e.CacheReadTokens, &rc); c != nil {
-					total += *c
-					anySet = true
-				}
-			}
-		}
+		total, anySet, unpriced := activeCostTotal(snap.Running, tokenRates)
 		if anySet {
 			resp.ActiveEstimatedCostUSD = &total
 		}
+		resp.CostUnpricedRunning = &unpriced
 	}
 
 	return resp
