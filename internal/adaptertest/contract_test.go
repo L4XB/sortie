@@ -115,6 +115,7 @@ const (
 	ruleSTOPGRACE contractRule = "STOPGRACE"
 	ruleCAPTURE   contractRule = "CAPTURE"
 	ruleSINK      contractRule = "SINK"
+	ruleREAPER    contractRule = "REAPER"
 )
 
 // Family roots and the orchestrator path rule IMPORT matches an import
@@ -1266,6 +1267,88 @@ func checkContractStopGrace(fset *token.FileSet, file *ast.File) []contractViola
 			pos:  fset.Position(sel.Pos()),
 			text: "references procutil.DefaultStopGrace directly; call " + contractStopGraceOwner,
 		})
+		return true
+	})
+	return violations
+}
+
+// contractReaperLoggerHint is what checkContractReaperLogger's message
+// tells a caller to pass instead of the two forbidden shapes.
+const contractReaperLoggerHint = "a logger the call site already holds, in a local variable or a struct field"
+
+// contractCallsSlogDefault reports whether expr is a call to
+// slogIdent.Default, or a call chained onto one (e.g.
+// slog.Default().With(...)), by recursing into the receiver of each
+// chained call.
+func contractCallsSlogDefault(expr ast.Expr, slogIdent string) bool {
+	call, ok := expr.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	if ident, ok := sel.X.(*ast.Ident); ok && ident.Name == slogIdent && sel.Sel.Name == "Default" {
+		return true
+	}
+	return contractCallsSlogDefault(sel.X, slogIdent)
+}
+
+// checkContractReaperLogger reports a violation for every
+// procutil.StartReaper call in file whose second argument is the nil
+// literal or a call to slog.Default() (with or without a chained
+// With), rather than a logger the call site already holds. StartReaper
+// logs the one CaptureCleanupWarning record for a reap whose group
+// termination cannot prove the process tree gone, and either forbidden
+// shape routes that record away from the logger the caller was built
+// with: nil falls back to StartReaper's own package-level default, and
+// a fresh slog.Default() call reaches the same default directly,
+// bypassing whatever component-scoped or session-scoped logger the
+// call site actually owns.
+func checkContractReaperLogger(fset *token.FileSet, file *ast.File) []contractViolation {
+	procutilIdent := resolveContractImportName(file, contractProcutilImportPath)
+	if procutilIdent == "" {
+		return nil
+	}
+	// See checkContractStopGrace for why a dot import is reported at the
+	// import itself rather than chased through bare identifiers.
+	if procutilIdent == "." {
+		return []contractViolation{{
+			pos:  fset.Position(importPos(file, contractProcutilImportPath)),
+			text: "dot-imports procutil, which hides a StartReaper call from this rule; import it by name",
+		}}
+	}
+	slogIdent := resolveContractImportName(file, "log/slog")
+
+	var violations []contractViolation
+	ast.Inspect(file, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		ident, isIdent := sel.X.(*ast.Ident)
+		if !isIdent || ident.Name != procutilIdent || sel.Sel.Name != "StartReaper" || len(call.Args) != 2 {
+			return true
+		}
+		arg := call.Args[1]
+		if nilIdent, isNilIdent := arg.(*ast.Ident); isNilIdent && nilIdent.Name == "nil" {
+			violations = append(violations, contractViolation{
+				pos:  fset.Position(call.Pos()),
+				text: "calls procutil.StartReaper with a nil logger; pass " + contractReaperLoggerHint,
+			})
+			return true
+		}
+		if slogIdent != "" && contractCallsSlogDefault(arg, slogIdent) {
+			violations = append(violations, contractViolation{
+				pos:  fset.Position(call.Pos()),
+				text: "calls procutil.StartReaper with slog.Default() rather than " + contractReaperLoggerHint,
+			})
+		}
 		return true
 	})
 	return violations
@@ -2558,8 +2641,11 @@ func contractWalkCaptureAndTeardown(t *testing.T, fset *token.FileSet) []contrac
 // cancellation directly, outside procutil and the named test-support
 // packages (rule CAPTURE); passes a CaptureParams.Stdout or
 // CaptureParams.Stderr that does not resolve to nil or a type
-// contractBoundedSinkTypes admits (rule SINK); or assigns an exec.Cmd
-// teardown field by hand (rule TEARDOWN).
+// contractBoundedSinkTypes admits (rule SINK); assigns an exec.Cmd
+// teardown field by hand (rule TEARDOWN); or calls
+// procutil.StartReaper with a nil logger or a fresh slog.Default()
+// call rather than a logger the call site already holds (rule
+// REAPER).
 func TestContractCaptureAndTeardown(t *testing.T) {
 	fset := token.NewFileSet()
 	walked := contractWalkCaptureAndTeardown(t, fset)
@@ -2574,6 +2660,13 @@ func TestContractCaptureAndTeardown(t *testing.T) {
 		if !contractExempt(w.pkg.dirName, ruleTEARDOWN) {
 			for _, file := range w.pkg.files {
 				for _, v := range checkContractTeardown(fset, file) {
+					t.Errorf("%s: %s", v.pos, v.text)
+				}
+			}
+		}
+		if !contractExempt(w.pkg.dirName, ruleREAPER) {
+			for _, file := range w.pkg.files {
+				for _, v := range checkContractReaperLogger(fset, file) {
 					t.Errorf("%s: %s", v.pos, v.text)
 				}
 			}
@@ -3740,6 +3833,200 @@ func run(cmd *exec.Cmd) error {
 	}
 }
 
+// TestCheckContractReaperLogger_DetectsViolations pins rule REAPER's
+// own logic against inline source fixtures, independent of the current
+// state of any package under cmd/ or internal/, so a regression is
+// caught even when every real launch site happens to comply. The
+// clean fixtures are the negative control: a call that already passes
+// a logger the call site holds, whether in a local variable or a
+// struct field, or through a chained slog.Default().With(...) already
+// bound to a local before the call, must report no violation, so the
+// rule is proven not to fire on the shape every real call site uses.
+func TestCheckContractReaperLogger_DetectsViolations(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		src        string
+		wantCount  int
+		wantSubstr string
+	}{
+		{
+			name: "a nil logger is rejected",
+			src: `package fixture
+
+import (
+	"os/exec"
+
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
+)
+
+func run(cmd *exec.Cmd) {
+	procutil.StartReaper(cmd, nil)
+}
+`,
+			wantCount:  1,
+			wantSubstr: "nil logger",
+		},
+		{
+			name: "a bare slog.Default() call is rejected",
+			src: `package fixture
+
+import (
+	"log/slog"
+	"os/exec"
+
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
+)
+
+func run(cmd *exec.Cmd) {
+	procutil.StartReaper(cmd, slog.Default())
+}
+`,
+			wantCount:  1,
+			wantSubstr: "slog.Default()",
+		},
+		{
+			name: "a chained slog.Default().With(...) call is rejected",
+			src: `package fixture
+
+import (
+	"log/slog"
+	"os/exec"
+
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
+)
+
+func run(cmd *exec.Cmd) {
+	procutil.StartReaper(cmd, slog.Default().With(slog.String("component", "fixture-adapter")))
+}
+`,
+			wantCount:  1,
+			wantSubstr: "slog.Default()",
+		},
+		{
+			name: "a renamed procutil import does not evade the nil check",
+			src: `package fixture
+
+import (
+	"os/exec"
+
+	proc "github.com/sortie-ai/sortie/internal/agent/procutil"
+)
+
+func run(cmd *exec.Cmd) {
+	proc.StartReaper(cmd, nil)
+}
+`,
+			wantCount:  1,
+			wantSubstr: "nil logger",
+		},
+		{
+			name: "a dot-imported procutil is rejected outright",
+			src: `package fixture
+
+import (
+	"os/exec"
+
+	. "github.com/sortie-ai/sortie/internal/agent/procutil"
+)
+
+func run(cmd *exec.Cmd) {
+	StartReaper(cmd, nil)
+}
+`,
+			wantCount:  1,
+			wantSubstr: "dot-imports procutil",
+		},
+		{
+			name: "a local variable logger is accepted",
+			src: `package fixture
+
+import (
+	"log/slog"
+	"os/exec"
+
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
+)
+
+func run(cmd *exec.Cmd, logger *slog.Logger) {
+	procutil.StartReaper(cmd, logger)
+}
+`,
+			wantCount: 0,
+		},
+		{
+			name: "a struct field logger is accepted",
+			src: `package fixture
+
+import (
+	"os/exec"
+
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
+)
+
+type session struct {
+	logger any
+}
+
+func (s *session) run(cmd *exec.Cmd) {
+	procutil.StartReaper(cmd, s.logger)
+}
+`,
+			wantCount: 0,
+		},
+		{
+			name: "slog.Default() bound to a local before the call is accepted",
+			src: `package fixture
+
+import (
+	"log/slog"
+	"os/exec"
+
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
+)
+
+func run(cmd *exec.Cmd) {
+	logger := slog.Default().With(slog.String("component", "fixture-adapter"))
+	procutil.StartReaper(cmd, logger)
+}
+`,
+			wantCount: 0,
+		},
+		{
+			name: "a file that never imports procutil is untouched",
+			src: `package fixture
+
+func run() int { return 1 }
+`,
+			wantCount: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fset := token.NewFileSet()
+			file, err := parser.ParseFile(fset, "fixture.go", tt.src, parser.SkipObjectResolution)
+			if err != nil {
+				t.Fatalf("parser.ParseFile: %v", err)
+			}
+
+			got := checkContractReaperLogger(fset, file)
+
+			if len(got) != tt.wantCount {
+				t.Errorf("checkContractReaperLogger() returned %d violations, want %d: %+v", len(got), tt.wantCount, got)
+			}
+			if tt.wantSubstr != "" && !slices.ContainsFunc(got, func(v contractViolation) bool {
+				return strings.Contains(v.text, tt.wantSubstr)
+			}) {
+				t.Errorf("violations = %+v, want one containing %q", got, tt.wantSubstr)
+			}
+		})
+	}
+}
+
 // TestCheckContractCapture_DetectsCrossPackageConstructorViolations pins
 // that rule CAPTURE binds a call to a constructor declared in another
 // walked package, not only one declared in the caller's own package.
@@ -4322,11 +4609,11 @@ func TestContractStopGraceRule_StalenessGuardCatchesRealBreaks(t *testing.T) {
 }
 
 // TestContractCaptureAndTeardownRule_AppliesAndStaysCurrent guards
-// rules CAPTURE, SINK, and TEARDOWN against going stale: each fails
-// when it was evaluated for no non-exempt file under internal/agent,
-// internal/orchestrator, or internal/workspace, or when a
-// contractAllowlist entry naming it names a directory the walk did not
-// find.
+// rules CAPTURE, SINK, TEARDOWN, and REAPER against going stale: each
+// fails when it was evaluated for no non-exempt file under
+// internal/agent, internal/orchestrator, or internal/workspace, or
+// when a contractAllowlist entry naming it names a directory the walk
+// did not find.
 func TestContractCaptureAndTeardownRule_AppliesAndStaysCurrent(t *testing.T) {
 	fset := token.NewFileSet()
 	walked := contractWalkCaptureAndTeardown(t, fset)
@@ -4342,6 +4629,8 @@ func TestContractCaptureAndTeardownRule_AppliesAndStaysCurrent(t *testing.T) {
 	contractCheckWideRuleAllowlist(t, ruleSINK, found)
 	contractCheckWideRuleEvaluated(t, ruleTEARDOWN, walked)
 	contractCheckWideRuleAllowlist(t, ruleTEARDOWN, found)
+	contractCheckWideRuleEvaluated(t, ruleREAPER, walked)
+	contractCheckWideRuleAllowlist(t, ruleREAPER, found)
 }
 
 // TestContractCaptureAndTeardownRule_StalenessGuardCatchesRealBreaks
@@ -4354,7 +4643,7 @@ func TestContractCaptureAndTeardownRule_AppliesAndStaysCurrent(t *testing.T) {
 // contractAllowlist, which a concurrently-running fixture test also
 // reads, so neither subtest runs in parallel.
 func TestContractCaptureAndTeardownRule_StalenessGuardCatchesRealBreaks(t *testing.T) {
-	for _, rule := range []contractRule{ruleCAPTURE, ruleSINK, ruleTEARDOWN} {
+	for _, rule := range []contractRule{ruleCAPTURE, ruleSINK, ruleTEARDOWN, ruleREAPER} {
 		t.Run(string(rule)+": zero files evaluated under a required root", func(t *testing.T) {
 			walked := []contractWalkedPackage{
 				{pkg: contractPackage{dirName: "fixture", importPath: "github.com/sortie-ai/sortie/internal/tracker/fixture"}},

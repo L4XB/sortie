@@ -131,7 +131,7 @@ func newParkedTeardownFixture(t *testing.T, withStderrHolder bool) *parkedTeardo
 	}
 	state.stderrCollector = procutil.NewStderrCollector(pipes.Stderr, state.logger)
 
-	reaper := procutil.StartReaper(cmd)
+	reaper := procutil.StartReaper(cmd, state.logger)
 	state.waitCh = reaper.Done()
 
 	state.inbox = jsonrpc.NewInbox[pumpItem]()
@@ -585,7 +585,7 @@ func newGracefulTeardownSession(t *testing.T, script, readyPath string, logger *
 	state.conn = jsonrpc.NewConn(stdinPipe, pipes.Stdout, jsonrpc.Deliver(state.inbox, wrapPumpMessage),
 		jsonrpc.WithVersionMember(), jsonrpc.WithMaxLineBytes(8<<20))
 
-	reaper := procutil.StartReaper(cmd)
+	reaper := procutil.StartReaper(cmd, state.logger)
 	state.waitCh = reaper.Done()
 
 	go runPump(state)
