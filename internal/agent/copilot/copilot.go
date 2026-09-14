@@ -539,7 +539,12 @@ func checkAuth(ctx context.Context, stopGrace time.Duration) error {
 		cmd := exec.CommandContext(authCtx, "gh", "auth", "status") //nolint:gosec // fixed args
 		result, startErr := procutil.RunCapture(cmd, stopGrace, procutil.CaptureParams{})
 
-		if startErr == nil && result.WaitErr == nil && authCtx.Err() == nil {
+		// A clean wait already proves gh exited on its own: a context
+		// that expired while it ran would have terminated it. Reading
+		// the context here instead would reject a successful check
+		// whenever a descendant held the captured output past the
+		// deadline, and report the account as unauthenticated.
+		if startErr == nil && result.WaitErr == nil {
 			slog.Warn("no GitHub token env var set; relying on gh auth for Copilot CLI authentication")
 			return nil
 		}

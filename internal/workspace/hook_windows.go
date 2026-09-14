@@ -53,13 +53,22 @@ func RunHook(ctx context.Context, params HookParams) (HookResult, error) {
 	capture, startErr := procutil.StartCapture(cmd, procutil.CaptureParams{Stdout: buf, Stderr: buf})
 
 	var (
-		waitErr  error
-		leftover bool
+		waitErr       error
+		leftover      bool
+		endedOnItsOwn bool
 	)
 	if startErr == nil {
 		result := capture.Wait()
 		waitErr = result.WaitErr
-		leftover = result.TerminatedLeftovers && hookCtx.Err() == nil
+		// The capture drains output after the direct child is reaped,
+		// and the job drain adds to that wait, so a descendant that
+		// outlives the script can carry the context past its deadline
+		// once the script itself has already finished. The wait records
+		// which of the two happened; the context read below no longer
+		// can. Leftovers a script that ended on its own left behind are
+		// the ones worth reporting.
+		endedOnItsOwn = !procutil.StoppedByCancellation(waitErr)
+		leftover = result.TerminatedLeftovers && endedOnItsOwn
 	}
 	output := buf.String()
 
@@ -72,8 +81,11 @@ func RunHook(ctx context.Context, params HookParams) (HookResult, error) {
 	// context already done when StartCapture ran, or done during the
 	// resume window, keeps the hook from ever running, reporting the
 	// same context error a Wait failure would. Checking context first
-	// ensures correct classification in every case.
-	if hookCtx.Err() == context.DeadlineExceeded {
+	// ensures correct classification in every case. A script that
+	// reached its own exit is excluded: its status is the answer,
+	// whatever the context says once the drain that followed it has
+	// returned.
+	if !endedOnItsOwn && hookCtx.Err() == context.DeadlineExceeded {
 		return HookResult{}, &HookError{
 			Op:       "timeout",
 			Script:   truncateScript(params.Script),
@@ -83,7 +95,7 @@ func RunHook(ctx context.Context, params HookParams) (HookResult, error) {
 		}
 	}
 
-	if hookCtx.Err() == context.Canceled {
+	if !endedOnItsOwn && hookCtx.Err() == context.Canceled {
 		return HookResult{}, &HookError{
 			Op:       "timeout",
 			Script:   truncateScript(params.Script),

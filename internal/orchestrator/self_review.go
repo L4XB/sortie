@@ -153,11 +153,18 @@ func runSingleVerification(ctx context.Context, command, workspacePath string, t
 
 	metrics.ObserveSelfReviewVerificationDuration(command, duration.Seconds())
 
-	if result.TerminatedLeftovers && cmdCtx.Err() == nil {
+	// RunCapture drains output after the direct child is reaped, so a
+	// descendant that outlives the command can carry the context past
+	// its deadline once the command itself has already finished. The
+	// wait records which of the two happened; the context read here no
+	// longer can.
+	endedOnItsOwn := !procutil.StoppedByCancellation(result.WaitErr)
+
+	if result.TerminatedLeftovers && endedOnItsOwn {
 		logger.Info(procutil.LeftoversTerminatedMessage, slog.String("command", command)) //nolint:sloglint // procutil.LeftoversTerminatedMessage is a fixed string constant
 	}
 
-	if cmdCtx.Err() == context.DeadlineExceeded {
+	if !endedOnItsOwn && cmdCtx.Err() == context.DeadlineExceeded {
 		logger.Info("verification command timed out",
 			slog.String("command", command),
 			slog.Int64("duration_ms", duration.Milliseconds()),
