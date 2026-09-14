@@ -57,11 +57,13 @@ func TestAssignProcess_CleanupProcess_Idempotent(t *testing.T) {
 	}
 	pid := cmd.Process.Pid
 
-	if err := AssignProcess(pid, cmd.Process); err != nil {
+	job, _, err := assignToJobObject(pid, false)
+	if err != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
-		t.Fatalf("AssignProcess() = %v, want nil", err)
+		t.Fatalf("assignToJobObject() = %v, want nil", err)
 	}
+	registerJobAssignment(pid, cmd.Process, job)
 
 	// Kill the process so the test doesn't wait 5 seconds.
 	_ = cmd.Process.Kill()
@@ -93,11 +95,13 @@ func TestKillProcessGroup_KillsChildAndGrandchild(t *testing.T) {
 	}
 	pid := cmd.Process.Pid
 
-	if err := AssignProcess(pid, cmd.Process); err != nil {
+	job, _, err := assignToJobObject(pid, false)
+	if err != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
-		t.Fatalf("AssignProcess() = %v, want nil", err)
+		t.Fatalf("assignToJobObject() = %v, want nil", err)
 	}
+	registerJobAssignment(pid, cmd.Process, job)
 
 	// Allow the child process tree to spawn.
 	time.Sleep(300 * time.Millisecond)
@@ -135,11 +139,13 @@ func TestSignalGraceful_ConsoleProcess(t *testing.T) {
 	}
 	pid := cmd.Process.Pid
 
-	if err := AssignProcess(pid, cmd.Process); err != nil {
+	job, _, err := assignToJobObject(pid, false)
+	if err != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
-		t.Fatalf("AssignProcess() = %v", err)
+		t.Fatalf("assignToJobObject() = %v", err)
 	}
+	registerJobAssignment(pid, cmd.Process, job)
 	t.Cleanup(func() { CleanupProcess(pid) })
 
 	// Allow the process to initialize its console.
@@ -199,11 +205,13 @@ func TestWasSignaled_JobTermination_IsSignaled(t *testing.T) {
 	}
 	pid := cmd.Process.Pid
 
-	if err := AssignProcess(pid, cmd.Process); err != nil {
+	job, _, err := assignToJobObject(pid, false)
+	if err != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
-		t.Fatalf("AssignProcess() = %v", err)
+		t.Fatalf("assignToJobObject() = %v", err)
 	}
+	registerJobAssignment(pid, cmd.Process, job)
 
 	time.Sleep(200 * time.Millisecond)
 

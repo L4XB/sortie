@@ -99,7 +99,7 @@ func TestReaper_OutputSurvivesAfterDoneCloses(t *testing.T) {
 	cmd := fakeRuntimeCmd(t, agenttest.Output{Stdout: "hello from the child\n"})
 	SetProcessGroup(cmd)
 
-	pipes, err := StartWithOwnedPipes(cmd)
+	pipes, err := StartWithOwnedPipes(cmd, nil)
 	if err != nil {
 		t.Fatalf("StartWithOwnedPipes() error = %v", err)
 	}
@@ -133,7 +133,7 @@ func TestReaper_ClosingStdoutAtDoneLosesOutput(t *testing.T) {
 	cmd := fakeRuntimeCmd(t, agenttest.Output{Stdout: "hello from the child\n"})
 	SetProcessGroup(cmd)
 
-	pipes, err := StartWithOwnedPipes(cmd)
+	pipes, err := StartWithOwnedPipes(cmd, nil)
 	if err != nil {
 		t.Fatalf("StartWithOwnedPipes() error = %v", err)
 	}

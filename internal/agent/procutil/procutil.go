@@ -1,5 +1,8 @@
 // Package procutil provides subprocess lifecycle utilities shared by
-// agent adapters that manage coding agents as local subprocesses.
+// agent adapters that manage coding agents as local subprocesses, by
+// workspace hooks and the orchestrator's one-shot commands that
+// capture a subprocess's bounded output, and by every Windows launch
+// that starts a process suspended until its Job Object assignment.
 package procutil
 
 import (
@@ -30,6 +33,8 @@ const (
 	// DefaultDrainGrace is the time an adapter waits for a stderr drain
 	// to finish before it reaps the subprocess without it, and again
 	// before it gives up on the drain and reads the collector anyway.
+	// A [Capture] waits the same duration, after its reap, for its
+	// captured streams to reach end of file before it gives up on them.
 	DefaultDrainGrace = 5 * time.Second
 
 	// DefaultStopGrace is the time an adapter's graceful phase spends

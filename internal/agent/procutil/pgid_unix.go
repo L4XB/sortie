@@ -33,7 +33,25 @@ func SignalProcessGroup(pid int, sig syscall.Signal) error {
 // KillProcessGroup sends SIGKILL to the entire process group led by
 // pid. Returns nil if the process group no longer exists.
 func KillProcessGroup(pid int) error {
-	return SignalProcessGroup(pid, syscall.SIGKILL)
+	_, err := killProcessGroupReportingLeftover(pid)
+	return err
+}
+
+// killProcessGroupReportingLeftover sends SIGKILL to the process group
+// led by pid and reports whether the group still answered: a direct
+// child StartReaper has already reaped no longer belongs to the group,
+// so syscall.Kill succeeding means at least one other member was still
+// alive to receive the signal, read before SignalProcessGroup maps
+// ESRCH to nil.
+func killProcessGroupReportingLeftover(pid int) (leftover bool, err error) {
+	killErr := syscall.Kill(-pid, syscall.SIGKILL)
+	if killErr == nil {
+		return true, nil
+	}
+	if errors.Is(killErr, syscall.ESRCH) {
+		return false, nil
+	}
+	return false, killErr
 }
 
 // SignalGraceful sends SIGTERM to the entire process group led by pid.
@@ -41,9 +59,9 @@ func SignalGraceful(pid int) error {
 	return SignalProcessGroup(pid, syscall.SIGTERM)
 }
 
-// AssignProcess is a no-op on Unix. Process group membership is
+// assignProcess is a no-op on Unix. Process group membership is
 // established at fork time via Setpgid.
-func AssignProcess(_ int, _ *os.Process) error { return nil }
+func assignProcess(_ int, _ *os.Process) error { return nil }
 
 // CleanupProcess is a no-op on Unix. Process group resources are
 // managed by the kernel.
