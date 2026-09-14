@@ -3,6 +3,7 @@
 package procutil
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os/exec"
@@ -418,6 +419,13 @@ func scanSurvivors(rootPID uint32, jobPIDs []uint32) ([]jobSurvivor, error) {
 		})
 		entry.Size = uint32(unsafe.Sizeof(entry))
 		walkErr = windows.Process32Next(snapshot, &entry)
+	}
+	// Only ERROR_NO_MORE_FILES ends a completed walk. Any other error
+	// stops it partway, and reporting the descendants gathered so far as
+	// if they were all of them would let the teardown record call a tree
+	// settled while a live descendant sat past the truncation.
+	if !errors.Is(walkErr, windows.ERROR_NO_MORE_FILES) {
+		return nil, fmt.Errorf("Process32Next: %w", walkErr)
 	}
 
 	inJob := make(map[uint32]bool, len(jobPIDs))
