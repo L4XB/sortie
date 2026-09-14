@@ -5,6 +5,7 @@ package procutil
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
 	"os/exec"
@@ -231,5 +232,298 @@ func TestSetGroupCancel_CancelReachesDescendant(t *testing.T) {
 	}
 	if err := syscall.Kill(descendantPID, 0); err == nil {
 		t.Errorf("SetGroupCancel(): descendant %d still alive after cancellation, want gone", descendantPID)
+	}
+}
+
+// TestKillProcessGroupReportingLeftover_ReturnsPromptlyOnceGone pins that
+// the wait returns as soon as the group reports itself gone rather than
+// always paying groupDrainBound in full: an already-exited, already-reaped
+// group answers ESRCH on the first send, well inside a shortened bound.
+//
+// groupDrainBound is mutated, so this test does not run in parallel with
+// the package's other parallel tests.
+func TestKillProcessGroupReportingLeftover_ReturnsPromptlyOnceGone(t *testing.T) {
+	cmd := fakeRuntimeCmd(t, agenttest.Output{})
+	SetProcessGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("cmd.Start() = %v", err)
+	}
+	pid := cmd.Process.Pid
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("cmd.Wait() = %v, want nil", err)
+	}
+
+	origBound := groupDrainBound
+	t.Cleanup(func() { groupDrainBound = origBound })
+	groupDrainBound = 500 * time.Millisecond
+
+	start := time.Now()
+	leftover, err := killProcessGroupReportingLeftover(pid)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Errorf("killProcessGroupReportingLeftover(%d) error = %v, want nil (an empty group answers ESRCH)", pid, err)
+	}
+	if leftover {
+		t.Errorf("killProcessGroupReportingLeftover(%d) leftover = %t, want false", pid, leftover)
+	}
+	if elapsed >= groupDrainBound/2 {
+		t.Errorf("killProcessGroupReportingLeftover(%d) took %v, want well under the %v drain bound", pid, elapsed, groupDrainBound)
+	}
+}
+
+// TestKillProcessGroupReportingLeftover_ResendsUntilGone pins that the
+// wait resends the group signal rather than sending it once: a process
+// joining the group after the first signal is the reason the loop exists,
+// so a leftover member that only stops answering after several sends must
+// still be observed gone.
+//
+// groupKillFunc and groupDrainBound are mutated, so this test does not run
+// in parallel with the package's other parallel tests.
+func TestKillProcessGroupReportingLeftover_ResendsUntilGone(t *testing.T) {
+	origBound, origKill := groupDrainBound, groupKillFunc
+	t.Cleanup(func() { groupDrainBound, groupKillFunc = origBound, origKill })
+
+	groupDrainBound = time.Second
+	const wantCalls = 4
+	var calls int
+	groupKillFunc = func(int, syscall.Signal) error {
+		calls++
+		if calls < wantCalls {
+			return nil
+		}
+		return syscall.ESRCH
+	}
+
+	leftover, err := killProcessGroupReportingLeftover(4242)
+
+	if err != nil {
+		t.Errorf("killProcessGroupReportingLeftover() error = %v, want nil once the group reports gone", err)
+	}
+	if !leftover {
+		t.Error("leftover = false, want true (a member answered before the group reported gone)")
+	}
+	if calls != wantCalls {
+		t.Errorf("groupKillFunc call count = %d, want %d (the wait must resend a member gained after the first signal, not signal once)", calls, wantCalls)
+	}
+}
+
+// TestKillProcessGroupReportingLeftover_BoundElapsed pins that a group
+// that keeps answering past groupDrainBound is reported as a non-nil
+// error, and that the wait does not run away past the bound: it stops
+// within about one extra poll interval of it, not several multiples.
+//
+// groupKillFunc and groupDrainBound are mutated, so this test does not run
+// in parallel with the package's other parallel tests.
+func TestKillProcessGroupReportingLeftover_BoundElapsed(t *testing.T) {
+	origBound, origKill := groupDrainBound, groupKillFunc
+	t.Cleanup(func() { groupDrainBound, groupKillFunc = origBound, origKill })
+
+	groupDrainBound = 200 * time.Millisecond
+	var calls int
+	groupKillFunc = func(int, syscall.Signal) error {
+		calls++
+		return nil
+	}
+
+	start := time.Now()
+	leftover, err := killProcessGroupReportingLeftover(4242)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("killProcessGroupReportingLeftover() error = nil, want non-nil once the group keeps answering past the drain bound")
+	}
+	if !leftover {
+		t.Error("leftover = false, want true (a member answered at least once)")
+	}
+	if calls <= 1 {
+		t.Errorf("groupKillFunc call count = %d, want > 1 (the wait must resend, not signal once)", calls)
+	}
+	if overrun := elapsed - groupDrainBound; overrun > 10*groupDrainPollInterval {
+		t.Errorf("killProcessGroupReportingLeftover() took %v, %v over the %v drain bound, want at most about one poll interval (%v) over", elapsed, overrun, groupDrainBound, groupDrainPollInterval)
+	}
+}
+
+// TestStartReaper_DoneWaitsForGroupDrain pins the user-visible half of the
+// defect: StartReaper's Done must not close, and therefore a launch's
+// outcome must not be published, while killProcessGroupReportingLeftover
+// is still resending because a group member has not yet confirmed gone.
+// The direct child here exits almost immediately, so any premature close
+// of Done would come from not waiting on the group drain.
+//
+// groupKillFunc is mutated, so this test does not run in parallel with the
+// package's other parallel tests.
+func TestStartReaper_DoneWaitsForGroupDrain(t *testing.T) {
+	cmd := fakeRuntimeCmd(t, agenttest.Output{})
+	SetProcessGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("cmd.Start() = %v", err)
+	}
+
+	origKill := groupKillFunc
+	t.Cleanup(func() { groupKillFunc = origKill })
+	unlock := make(chan struct{})
+	var calls int
+	groupKillFunc = func(int, syscall.Signal) error {
+		calls++
+		if calls < 3 {
+			return nil
+		}
+		<-unlock
+		return syscall.ESRCH
+	}
+
+	r := StartReaper(cmd, nil)
+
+	select {
+	case <-r.Done():
+		t.Fatal("Done() closed before the process group drain was allowed to finish")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(unlock)
+
+	select {
+	case <-r.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("Done() did not close after the process group drain was allowed to finish")
+	}
+	if calls < 3 {
+		t.Errorf("groupKillFunc call count = %d, want >= 3 (the drain must resend before Done closes)", calls)
+	}
+}
+
+// blockingWarnHandler wraps a [captureLogSpy] and blocks inside Handle
+// for the one record whose message equals msg, signaling hit once it
+// has entered that block. A test uses hit to know the record has been
+// handed to the logger, then release to let the call return, so it can
+// observe that [Reaper.Done] is still open while StartReaper's log call
+// is in flight and only closes once that call has returned.
+type blockingWarnHandler struct {
+	inner   *captureLogSpy
+	msg     string
+	hit     chan struct{}
+	release chan struct{}
+}
+
+func (h *blockingWarnHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *blockingWarnHandler) Handle(ctx context.Context, r slog.Record) error {
+	err := h.inner.Handle(ctx, r)
+	if r.Message == h.msg {
+		close(h.hit)
+		<-h.release
+	}
+	return err
+}
+
+func (h *blockingWarnHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *blockingWarnHandler) WithGroup(string) slog.Handler      { return h }
+
+// TestStartReaper_CleanupFailureLogsOneRecordBeforeDoneCloses pins the
+// fix's core claim: a reap whose group termination cannot prove the
+// process tree gone logs exactly one CaptureCleanupWarning record,
+// carrying the command and error attributes, and that record is written
+// before Done closes rather than after.
+//
+// groupKillFunc and groupDrainBound are mutated, so this test does not
+// run in parallel with the package's other parallel tests.
+func TestStartReaper_CleanupFailureLogsOneRecordBeforeDoneCloses(t *testing.T) {
+	origBound, origKill := groupDrainBound, groupKillFunc
+	t.Cleanup(func() { groupDrainBound, groupKillFunc = origBound, origKill })
+	groupDrainBound = 100 * time.Millisecond
+	groupKillFunc = func(int, syscall.Signal) error { return nil }
+
+	cmd := fakeRuntimeCmd(t, agenttest.Output{})
+	SetProcessGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("cmd.Start() = %v", err)
+	}
+
+	spy := &captureLogSpy{}
+	handler := &blockingWarnHandler{inner: spy, msg: CaptureCleanupWarning, hit: make(chan struct{}), release: make(chan struct{})}
+	logger := slog.New(handler)
+
+	r := StartReaper(cmd, logger)
+
+	select {
+	case <-handler.hit:
+	case <-time.After(3 * time.Second):
+		t.Fatal("CaptureCleanupWarning was not logged within 3s")
+	}
+
+	select {
+	case <-r.Done():
+		t.Fatal("Done() closed before the blocked log call returned, want the record written first")
+	default:
+	}
+
+	close(handler.release)
+
+	select {
+	case <-r.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("Done() did not close after the log call was allowed to return")
+	}
+
+	var matches []captureLogRecord
+	for _, rec := range spy.snapshot() {
+		if rec.Msg == CaptureCleanupWarning {
+			matches = append(matches, rec)
+		}
+	}
+	if len(matches) != 1 {
+		t.Fatalf("CaptureCleanupWarning logged %d times, want exactly 1", len(matches))
+	}
+	rec := matches[0]
+	if got := len(rec.Attrs); got != 2 {
+		t.Errorf("record carries %d attributes, want exactly 2 (command, error); got %v", got, rec.Attrs)
+	}
+	if _, ok := rec.Attrs["command"]; !ok {
+		t.Error("record missing the command attribute")
+	}
+	if _, ok := rec.Attrs["error"]; !ok {
+		t.Error("record missing the error attribute")
+	}
+}
+
+// TestStartReaper_NilLoggerLogsThroughDefault pins StartReaper's nil
+// fallback: a reap started with a nil logger neither panics nor loses
+// the CaptureCleanupWarning record, which lands on slog.Default().
+//
+// groupKillFunc and groupDrainBound are mutated and slog.Default() is
+// replaced, so this test does not run in parallel with the package's
+// other parallel tests.
+func TestStartReaper_NilLoggerLogsThroughDefault(t *testing.T) {
+	origBound, origKill := groupDrainBound, groupKillFunc
+	t.Cleanup(func() { groupDrainBound, groupKillFunc = origBound, origKill })
+	groupDrainBound = 100 * time.Millisecond
+	groupKillFunc = func(int, syscall.Signal) error { return nil }
+
+	spy := &captureLogSpy{}
+	origDefault := slog.Default()
+	slog.SetDefault(slog.New(spy))
+	t.Cleanup(func() { slog.SetDefault(origDefault) })
+
+	cmd := fakeRuntimeCmd(t, agenttest.Output{})
+	SetProcessGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("cmd.Start() = %v", err)
+	}
+
+	r := StartReaper(cmd, nil)
+
+	select {
+	case <-r.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("Done() did not close within 3s")
+	}
+
+	record, ok := findCaptureLogRecord(spy, CaptureCleanupWarning)
+	if !ok {
+		t.Fatal("a nil logger lost the CaptureCleanupWarning record, want it logged through slog.Default()")
+	}
+	if got := len(record.Attrs); got != 2 {
+		t.Errorf("record carries %d attributes, want exactly 2 (command, error); got %v", got, record.Attrs)
 	}
 }

@@ -2,6 +2,7 @@ package procutil
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"sync"
@@ -26,6 +27,10 @@ const (
 	StageStdoutPipe StartStage = iota + 1
 	StageStderrPipe
 	StageProcessStart
+	// StageProcessResume reports a Windows process that started
+	// suspended and could not be resumed after its Job Object
+	// assignment.
+	StageProcessResume
 )
 
 // StartError reports the stage StartWithOwnedPipes failed at. Unwrap
@@ -47,13 +52,18 @@ func (e *StartError) Unwrap() error {
 }
 
 // StartWithOwnedPipes wires cmd's standard output and standard error to
-// pipes the caller owns, starts cmd, and closes the parent's copies of
-// the two write ends. cmd.Stdout and cmd.Stderr MUST be nil on entry.
-// It closes every descriptor it created before returning an error, and
-// every error it returns is a *StartError. A caller whose subprocess
-// state is guarded by a mutex MUST hold that mutex across this call,
-// because the call starts the process.
-func StartWithOwnedPipes(cmd *exec.Cmd) (*OwnedPipes, error) {
+// pipes the caller owns, starts cmd in its own process group (on
+// Windows suspended until its Job Object assignment, then resumed),
+// and closes the parent's copies of the two write ends. cmd.Stdout and
+// cmd.Stderr MUST be nil on entry. It closes every descriptor it
+// created before returning an error, and every error it returns is a
+// *StartError; on Windows a *StartError with StageProcessResume means
+// the process has already been terminated and reaped. logger receives
+// a failed Job Object assignment's or a failed resume's WARN record; a
+// nil logger resolves to slog.Default. A caller whose subprocess state
+// is guarded by a mutex MUST hold that mutex across this call, because
+// the call starts the process.
+func StartWithOwnedPipes(cmd *exec.Cmd, logger *slog.Logger) (*OwnedPipes, error) {
 	stdoutRead, stdoutWrite, err := os.Pipe()
 	if err != nil {
 		return nil, &StartError{Stage: StageStdoutPipe, Err: err}
@@ -68,11 +78,17 @@ func StartWithOwnedPipes(cmd *exec.Cmd) (*OwnedPipes, error) {
 	cmd.Stdout = stdoutWrite
 	cmd.Stderr = stderrWrite
 
-	if startErr := cmd.Start(); startErr != nil {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if _, _, startErr := startAndAssign(cmd, logger, false); startErr != nil {
 		closeFiles(stdoutRead, stdoutWrite, stderrRead, stderrWrite)
 		cmd.Stdout = nil
 		cmd.Stderr = nil
-		return nil, &StartError{Stage: StageProcessStart, Err: startErr}
+		if cmd.Process == nil {
+			return nil, &StartError{Stage: StageProcessStart, Err: startErr}
+		}
+		return nil, &StartError{Stage: StageProcessResume, Err: startErr}
 	}
 
 	// A write end passed to exec.Cmd as an *os.File is never closed by

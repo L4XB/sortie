@@ -253,7 +253,7 @@ func startSession(ctx context.Context, a *ClientProtocolAdapter, params domain.S
 		return domain.Session{}, &domain.AgentError{Kind: domain.ErrPortExit, Message: "failed to create stdin pipe", Err: err}
 	}
 
-	pipes, err := procutil.StartWithOwnedPipes(cmd)
+	pipes, err := procutil.StartWithOwnedPipes(cmd, state.logger)
 	if err != nil {
 		var startErr *procutil.StartError
 		if !errors.As(err, &startErr) {
@@ -261,7 +261,8 @@ func startSession(ctx context.Context, a *ClientProtocolAdapter, params domain.S
 		}
 		// Both pipe stages fail before cmd.Start, whose deferred cleanup
 		// is what closes the parent's stdin end on a failed launch, so
-		// this closes it instead. The process-start stage needs none.
+		// this closes it instead. The process-start and resume stages
+		// need none.
 		switch startErr.Stage {
 		case procutil.StageStdoutPipe:
 			stdinPipe.Close() //nolint:errcheck,gosec // best-effort; the pipe error is what the caller needs
@@ -269,13 +270,9 @@ func startSession(ctx context.Context, a *ClientProtocolAdapter, params domain.S
 		case procutil.StageStderrPipe:
 			stdinPipe.Close() //nolint:errcheck,gosec // best-effort; the pipe error is what the caller needs
 			return domain.Session{}, &domain.AgentError{Kind: domain.ErrPortExit, Message: "failed to create stderr pipe", Err: startErr.Err}
-		default: // procutil.StageProcessStart
+		default: // procutil.StageProcessStart, procutil.StageProcessResume
 			return domain.Session{}, &domain.AgentError{Kind: domain.ErrPortExit, Message: "failed to start subprocess", Err: startErr.Err}
 		}
-	}
-
-	if assignErr := procutil.AssignProcess(cmd.Process.Pid, cmd.Process); assignErr != nil {
-		state.logger.Warn("process group assignment failed", slog.Any("error", assignErr))
 	}
 
 	state.pid = cmd.Process.Pid
@@ -291,7 +288,7 @@ func startSession(ctx context.Context, a *ClientProtocolAdapter, params domain.S
 	// reaping cannot cut a reader still consuming buffered output short.
 	// Teardown's close_stdout and close_pipes steps are what end that
 	// reader.
-	reaper := procutil.StartReaper(cmd)
+	reaper := procutil.StartReaper(cmd, state.logger)
 	state.waitCh = reaper.Done()
 
 	// The release ends a handshake call or a turn that would otherwise

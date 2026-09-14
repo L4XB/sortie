@@ -123,10 +123,15 @@ func newKiroCLI(t *testing.T, dir string, params chatParams) string {
 	return agenttest.FakeRuntime(t, dir, "kiro-cli", chatScenario, params)
 }
 
+// fakeScenarios collects every non-default fake-runtime scenario this
+// package's tests register. Platform-specific test files add their own
+// entries via init.
+var fakeScenarios = map[string]agenttest.Scenario{
+	chatScenario: agenttest.Typed(runChat),
+}
+
 func TestMain(m *testing.M) {
-	agenttest.Main(m, map[string]agenttest.Scenario{
-		chatScenario: agenttest.Typed(runChat),
-	})
+	agenttest.Main(m, fakeScenarios)
 }
 
 // setValidAPIKey sets a usable KIRO_API_KEY for the test. It is incompatible

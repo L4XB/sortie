@@ -412,7 +412,8 @@ func (a *CodexAdapter) StartSession(ctx context.Context, params domain.StartSess
 		}
 	}
 
-	pipes, err := procutil.StartWithOwnedPipes(cmd)
+	logger := slog.Default().With(slog.String("component", "codex-adapter"))
+	pipes, err := procutil.StartWithOwnedPipes(cmd, logger)
 	if err != nil {
 		var startErr *procutil.StartError
 		if !errors.As(err, &startErr) {
@@ -424,7 +425,8 @@ func (a *CodexAdapter) StartSession(ctx context.Context, params domain.StartSess
 		}
 		// Both pipe stages fail before cmd.Start, whose deferred cleanup
 		// is what closes the parent's stdin end on a failed launch, so
-		// these close it instead. The process-start stage needs none.
+		// these close it instead. The process-start and resume stages
+		// need none.
 		switch startErr.Stage {
 		case procutil.StageStdoutPipe:
 			stdinPipe.Close() //nolint:errcheck,gosec // best-effort; the pipe error is what the caller needs
@@ -440,18 +442,13 @@ func (a *CodexAdapter) StartSession(ctx context.Context, params domain.StartSess
 				Message: "failed to create stderr pipe",
 				Err:     startErr.Err,
 			}
-		default: // procutil.StageProcessStart
+		default: // procutil.StageProcessStart, procutil.StageProcessResume
 			return domain.Session{}, &domain.AgentError{
 				Kind:    domain.ErrPortExit,
 				Message: "failed to start app-server subprocess",
 				Err:     startErr.Err,
 			}
 		}
-	}
-
-	logger := slog.Default().With(slog.String("component", "codex-adapter"))
-	if assignErr := procutil.AssignProcess(cmd.Process.Pid, cmd.Process); assignErr != nil {
-		logger.Warn("process group assignment failed", slog.Any("error", assignErr))
 	}
 
 	state.proc = cmd.Process
@@ -463,7 +460,7 @@ func (a *CodexAdapter) StartSession(ctx context.Context, params domain.StartSess
 	}
 	state.stderrCollector = procutil.NewStderrCollector(pipes.Stderr, logger)
 
-	reaper := procutil.StartReaper(cmd)
+	reaper := procutil.StartReaper(cmd, logger)
 	state.waitCh = reaper.Done()
 
 	// killOnError is a cleanup closure used if any handshake step fails.

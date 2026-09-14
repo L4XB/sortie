@@ -51,6 +51,11 @@ type HookResult struct {
 	// [MaxHookOutputBytes] bytes, prefixed with a truncation marker
 	// when earlier output was dropped.
 	Output string
+
+	// TerminatedLeftovers is true when the hook exited on its own and
+	// its termination reached a process of its tree other than the
+	// hook script itself.
+	TerminatedLeftovers bool
 }
 
 // truncateScript returns s unchanged if it fits within
@@ -65,7 +70,8 @@ func truncateScript(s string) string {
 
 // limitedBuffer retains the last max bytes written to it, dropping the
 // earliest bytes once the total exceeds max. It implements [io.Writer]
-// for use as cmd.Stdout and cmd.Stderr and is safe for concurrent use.
+// for use as a hook capture's combined-output sink and is safe for
+// concurrent use.
 type limitedBuffer struct {
 	mu        sync.Mutex
 	buf       bytes.Buffer
@@ -75,8 +81,7 @@ type limitedBuffer struct {
 
 // Write appends p and, once the retained content exceeds max, discards
 // the earliest bytes so only the most recent max bytes remain. It
-// always returns len(p), nil to prevent [os/exec.Cmd] short-write
-// errors, and is safe for concurrent use.
+// always returns len(p), nil, and is safe for concurrent use.
 func (lb *limitedBuffer) Write(p []byte) (int, error) {
 	lb.mu.Lock()
 	defer lb.mu.Unlock()

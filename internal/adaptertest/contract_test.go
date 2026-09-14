@@ -113,6 +113,9 @@ const (
 	ruleBLOCKER   contractRule = "BLOCKER"
 	ruleIDENTITY  contractRule = "IDENTITY"
 	ruleSTOPGRACE contractRule = "STOPGRACE"
+	ruleCAPTURE   contractRule = "CAPTURE"
+	ruleSINK      contractRule = "SINK"
+	ruleREAPER    contractRule = "REAPER"
 )
 
 // Family roots and the orchestrator path rule IMPORT matches an import
@@ -162,7 +165,7 @@ type contractSharedPackage struct {
 // orchestrator's production code.
 var contractSharedFamilyPackages = map[string]contractSharedPackage{
 	"github.com/sortie-ai/sortie/internal/scm/scmcore":                     {reason: "shared forge decision core; registers no kind and holds no adapter", coreImportable: true},
-	"github.com/sortie-ai/sortie/internal/agent/procutil":                  {reason: "shared subprocess group handling; registers no kind and holds no adapter", coreImportable: true},
+	"github.com/sortie-ai/sortie/internal/agent/procutil":                  {reason: "shared subprocess group handling, Windows process containment, and bounded output capture; registers no kind and holds no adapter", coreImportable: true},
 	"github.com/sortie-ai/sortie/internal/agent/agentcore":                 {reason: "shared agent session, event, and disposition core; registers no kind and holds no adapter", coreImportable: true},
 	"github.com/sortie-ai/sortie/internal/agent/mcpconfig":                 {reason: "shared MCP configuration parsing; registers no kind and holds no adapter", coreImportable: true},
 	"github.com/sortie-ai/sortie/internal/agent/sshutil":                   {reason: "shared SSH invocation helpers; registers no kind and holds no adapter", coreImportable: true},
@@ -192,8 +195,18 @@ var contractAllowlist = map[string]map[contractRule]string{
 		ruleHOOK: "no HTTP, no credential, no remote project, and no config to validate",
 	},
 	"procutil": {
-		ruleTEARDOWN:  "owns SetGroupCancel, the helper every other launcher calls",
+		ruleTEARDOWN:  "owns SetGroupCancel and SetGroupKill, the helpers every other launcher calls",
 		ruleSTOPGRACE: "owns DefaultStopGrace, the fallback every other family reaches through StopGrace",
+		ruleCAPTURE:   "owns StartCapture and RunCapture, the capture every other launcher calls",
+	},
+	"agenttest": {
+		ruleCAPTURE: "test-support package that cmd/sortie does not link",
+	},
+	"probe": {
+		ruleCAPTURE: "test-support package that cmd/sortie does not link",
+	},
+	"e2e": {
+		ruleCAPTURE: "test-support package that cmd/sortie does not link",
 	},
 }
 
@@ -472,7 +485,7 @@ var contractTeardownFields = map[string]bool{
 }
 
 // contractTeardownOwner is the helper rule TEARDOWN directs a launcher to.
-const contractTeardownOwner = "procutil.SetGroupCancel"
+const contractTeardownOwner = "procutil.SetGroupCancel or procutil.SetGroupKill"
 
 // checkContractTeardown reports a violation for every assignment to an
 // exec.Cmd teardown field in file. It reads file only when file imports
@@ -499,6 +512,703 @@ func checkContractTeardown(fset *token.FileSet, file *ast.File) []contractViolat
 		}
 		return true
 	})
+	return violations
+}
+
+// contractCaptureOwner is the helper rule CAPTURE directs a caller to.
+const contractCaptureOwner = "procutil.RunCapture or procutil.StartCapture"
+
+// contractCaptureDotImportReason is the text checkContractCaptureFile
+// gives for any dot-imported package, regardless of which one: a dot
+// import binds no name contractFileImportAliases or
+// resolveContractImportName can key a qualifier to, so a call, a
+// constant reference, or a sink type reached through it resolves
+// against nothing rather than against the dot-imported package. Rules
+// CAPTURE and SINK have no way to tell an innocuous dot import from one
+// hiding a process launch or an unbounded sink, so every one is
+// unresolvable and this text says so rather than trusting the house
+// style ban on dot imports to hold.
+const contractCaptureDotImportReason = "which this rule cannot resolve a bound identifier, capture sink, or command constructor through; import it by name"
+
+// contractBoundedSinkTypes names the sink types [procutil.CaptureParams]'s
+// own contract admits for Stdout and Stderr: [procutil.Capture.Wait]
+// copies into them and [sinkWriter.seal] takes the same lock a Write
+// holds, so a Write that blocks holds Wait open past every bound it
+// otherwise honours. Each entry here returns from Write immediately
+// rather than pushing bytes to a slow consumer - it discards, caps, or
+// simply grows in memory - which is what makes it safe. A sink type
+// absent from this map is presumed capable of blocking until rule SINK
+// is deliberately extended to admit it.
+var contractBoundedSinkTypes = map[string]string{
+	"bytes.Buffer":  "grows in memory and never blocks on Write",
+	"limitedBuffer": "drops the earliest bytes once its cap is exceeded",
+	"cappedWriter":  "discards bytes past its cap and always reports success",
+}
+
+// contractSinkTypeOwner is the map rule SINK directs a caller to extend
+// when a new bounded sink type needs admitting.
+const contractSinkTypeOwner = "contractBoundedSinkTypes"
+
+// contractCmdIndex records, for one package's non-test files, every
+// top-level function and method whose result list includes *exec.Cmd
+// or exec.Cmd: a function is keyed by "importPath.Name", a method by
+// its bare name alone, since a call site names a method with no
+// receiver-type qualifier. producerPaths holds the import path of
+// every indexed function, letting a caller recognize a file as able to
+// reach a command through a constructor it never names by declaration,
+// only by import.
+type contractCmdIndex struct {
+	funcs         map[string]bool
+	methods       map[string]bool
+	producerPaths map[string]bool
+}
+
+// contractCmdFields records, for one package's non-test files, every
+// struct field name declared with type *exec.Cmd or exec.Cmd.
+type contractCmdFields map[string]bool
+
+// contractTypeIsExecCmd reports whether expr, a field or result type
+// expression, names exec.Cmd or *exec.Cmd under file's own import name
+// for os/exec.
+func contractTypeIsExecCmd(execName string, expr ast.Expr) bool {
+	if execName == "" {
+		return false
+	}
+	if star, ok := expr.(*ast.StarExpr); ok {
+		expr = star.X
+	}
+	sel, ok := expr.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	ident, ok := sel.X.(*ast.Ident)
+	return ok && ident.Name == execName && sel.Sel.Name == "Cmd"
+}
+
+// contractTypeIsOSProcess reports whether expr names *os.Process under
+// file's own import name for os.
+func contractTypeIsOSProcess(osName string, expr ast.Expr) bool {
+	if osName == "" {
+		return false
+	}
+	star, ok := expr.(*ast.StarExpr)
+	if !ok {
+		return false
+	}
+	sel, ok := star.X.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	ident, ok := sel.X.(*ast.Ident)
+	return ok && ident.Name == osName && sel.Sel.Name == "Process"
+}
+
+// contractBuildCmdIndex adds every exec.Cmd-returning top-level
+// function and method declared in file to idx, and every exec.Cmd-typed
+// struct field to fields.
+func contractBuildCmdIndex(file *ast.File, importPath string, idx *contractCmdIndex, fields contractCmdFields) {
+	execName := resolveContractImportName(file, "os/exec")
+	if execName == "" {
+		return
+	}
+	for _, decl := range file.Decls {
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			if d.Type.Results == nil {
+				continue
+			}
+			returnsCmd := false
+			for _, res := range d.Type.Results.List {
+				if contractTypeIsExecCmd(execName, res.Type) {
+					returnsCmd = true
+					break
+				}
+			}
+			if !returnsCmd {
+				continue
+			}
+			if d.Recv != nil {
+				idx.methods[d.Name.Name] = true
+			} else {
+				idx.funcs[importPath+"."+d.Name.Name] = true
+				idx.producerPaths[importPath] = true
+			}
+		case *ast.GenDecl:
+			if d.Tok != token.TYPE {
+				continue
+			}
+			for _, spec := range d.Specs {
+				ts, ok := spec.(*ast.TypeSpec)
+				if !ok {
+					continue
+				}
+				st, ok := ts.Type.(*ast.StructType)
+				if !ok || st.Fields == nil {
+					continue
+				}
+				for _, f := range st.Fields.List {
+					if !contractTypeIsExecCmd(execName, f.Type) {
+						continue
+					}
+					for _, name := range f.Names {
+						fields[name.Name] = true
+					}
+				}
+			}
+		}
+	}
+}
+
+// contractFileImportAliases maps each import file binds to the local
+// identifier a selector qualifies it with: the explicit alias when one
+// is given, or the path's last segment otherwise. contractCmdBoundCall
+// uses it to resolve a package-qualified call, such as
+// workspace.GitCommand(...), to the import path contractBuildCmdIndex
+// keyed that function's idx.funcs entry under, so a call bound to a
+// constructor declared in another walked package is recognized exactly
+// as a same-package call is. Blank and dot imports are omitted: neither
+// binds a name a selector could qualify.
+func contractFileImportAliases(file *ast.File) map[string]string {
+	aliases := make(map[string]string, len(file.Imports))
+	for _, imp := range file.Imports {
+		path, err := strconv.Unquote(imp.Path.Value)
+		if err != nil {
+			continue
+		}
+		name := ""
+		switch {
+		case imp.Name == nil:
+			segments := strings.Split(path, "/")
+			name = segments[len(segments)-1]
+		case imp.Name.Name != "_" && imp.Name.Name != ".":
+			name = imp.Name.Name
+		}
+		if name != "" {
+			aliases[name] = path
+		}
+	}
+	return aliases
+}
+
+// contractCmdBoundCall reports whether expr is a call to exec.Command,
+// exec.CommandContext, a package-qualified call aliasPaths resolves to a
+// function contractBuildCmdIndex indexed under that package's import
+// path, or an unqualified call to a function or method it indexed under
+// the bare name.
+func contractCmdBoundCall(execName string, idx *contractCmdIndex, importPath string, aliasPaths map[string]string, expr ast.Expr) bool {
+	call, ok := expr.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	switch fn := call.Fun.(type) {
+	case *ast.SelectorExpr:
+		ident, isIdent := fn.X.(*ast.Ident)
+		if isIdent && execName != "" && ident.Name == execName &&
+			(fn.Sel.Name == "Command" || fn.Sel.Name == "CommandContext") {
+			return true
+		}
+		if isIdent {
+			if pkgPath, isPkg := aliasPaths[ident.Name]; isPkg && idx.funcs[pkgPath+"."+fn.Sel.Name] {
+				return true
+			}
+		}
+		return idx.methods[fn.Sel.Name]
+	case *ast.Ident:
+		return idx.funcs[importPath+"."+fn.Name]
+	}
+	return false
+}
+
+// contractProcessBoundExpr reports whether expr is a selector naming
+// field Process, or a call to os.StartProcess or os.FindProcess.
+func contractProcessBoundExpr(osName string, expr ast.Expr) bool {
+	switch e := expr.(type) {
+	case *ast.SelectorExpr:
+		return e.Sel.Name == "Process"
+	case *ast.CallExpr:
+		sel, ok := e.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return false
+		}
+		ident, ok := sel.X.(*ast.Ident)
+		return ok && osName != "" && ident.Name == osName && (sel.Sel.Name == "StartProcess" || sel.Sel.Name == "FindProcess")
+	}
+	return false
+}
+
+// contractCollectBoundNames walks fn once and returns the set of local
+// identifiers (parameters, var declarations, and assignment targets)
+// bound to an exec.Cmd and the set bound to an *os.Process, per the
+// rules contractCmdBoundCall and contractProcessBoundExpr apply to
+// their declaration or the value they were last assigned from.
+func contractCollectBoundNames(execName, osName string, idx *contractCmdIndex, importPath string, aliasPaths map[string]string, fn *ast.FuncDecl) (cmdNames, procNames map[string]bool) {
+	cmdNames = map[string]bool{}
+	procNames = map[string]bool{}
+
+	addFieldList := func(fl *ast.FieldList) {
+		if fl == nil {
+			return
+		}
+		for _, f := range fl.List {
+			switch {
+			case contractTypeIsExecCmd(execName, f.Type):
+				for _, n := range f.Names {
+					cmdNames[n.Name] = true
+				}
+			case contractTypeIsOSProcess(osName, f.Type):
+				for _, n := range f.Names {
+					procNames[n.Name] = true
+				}
+			}
+		}
+	}
+	if fn.Recv != nil {
+		addFieldList(fn.Recv)
+	}
+	addFieldList(fn.Type.Params)
+
+	if fn.Body == nil {
+		return cmdNames, procNames
+	}
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		switch s := n.(type) {
+		case *ast.DeclStmt:
+			gd, ok := s.Decl.(*ast.GenDecl)
+			if !ok || gd.Tok != token.VAR {
+				return true
+			}
+			for _, spec := range gd.Specs {
+				vs, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				if vs.Type != nil {
+					switch {
+					case contractTypeIsExecCmd(execName, vs.Type):
+						for _, n2 := range vs.Names {
+							cmdNames[n2.Name] = true
+						}
+					case contractTypeIsOSProcess(osName, vs.Type):
+						for _, n2 := range vs.Names {
+							procNames[n2.Name] = true
+						}
+					}
+				}
+				for i, val := range vs.Values {
+					if i >= len(vs.Names) {
+						continue
+					}
+					if contractCmdBoundCall(execName, idx, importPath, aliasPaths, val) {
+						cmdNames[vs.Names[i].Name] = true
+					}
+					if contractProcessBoundExpr(osName, val) {
+						procNames[vs.Names[i].Name] = true
+					}
+				}
+			}
+		case *ast.AssignStmt:
+			for i, rhs := range s.Rhs {
+				if i >= len(s.Lhs) {
+					continue
+				}
+				ident, ok := s.Lhs[i].(*ast.Ident)
+				if !ok {
+					continue
+				}
+				if contractCmdBoundCall(execName, idx, importPath, aliasPaths, rhs) {
+					cmdNames[ident.Name] = true
+				}
+				if contractProcessBoundExpr(osName, rhs) {
+					procNames[ident.Name] = true
+				}
+			}
+		}
+		return true
+	})
+	return cmdNames, procNames
+}
+
+// contractExprIsCmdBound reports whether expr, a Start/Run/Wait call's
+// receiver, is bound to an exec.Cmd: a direct exec.Command or
+// exec.CommandContext call, a call to an indexed function or method, a
+// local identifier contractCollectBoundNames marked, or a selector
+// whose field fields declares as an exec.Cmd.
+func contractExprIsCmdBound(execName string, idx *contractCmdIndex, importPath string, aliasPaths map[string]string, cmdNames map[string]bool, fields contractCmdFields, expr ast.Expr) bool {
+	switch e := expr.(type) {
+	case *ast.Ident:
+		return cmdNames[e.Name]
+	case *ast.CallExpr:
+		return contractCmdBoundCall(execName, idx, importPath, aliasPaths, e)
+	case *ast.SelectorExpr:
+		return fields[e.Sel.Name]
+	}
+	return false
+}
+
+// contractSinkTypeName returns the contractBoundedSinkTypes key a type
+// expression names: "bytes.Buffer" for a selector resolving to the
+// file's own import of "bytes", or the bare identifier for a
+// package-local type such as limitedBuffer or cappedWriter. It returns
+// "" for any type this rule does not recognize, so an unrecognized
+// type is treated as unbounded rather than silently accepted.
+func contractSinkTypeName(bytesName string, expr ast.Expr) string {
+	switch e := expr.(type) {
+	case *ast.Ident:
+		return e.Name
+	case *ast.SelectorExpr:
+		if ident, ok := e.X.(*ast.Ident); ok && bytesName != "" && ident.Name == bytesName && e.Sel.Name == "Buffer" {
+			return "bytes.Buffer"
+		}
+	}
+	return ""
+}
+
+// contractSinkTypeFromValue returns the contractBoundedSinkTypes key
+// for a value expression that constructs a sink directly, looking
+// through a leading address-of the way unwrapCompositeLit does, so
+// both "T{}" and "&T{}" resolve to T's name. It returns "" when expr is
+// not a composite literal.
+func contractSinkTypeFromValue(bytesName string, expr ast.Expr) string {
+	lit, ok := unwrapCompositeLit(expr)
+	if !ok {
+		return ""
+	}
+	return contractSinkTypeName(bytesName, lit.Type)
+}
+
+// contractCollectSinkVarTypes maps every local variable fn's body binds
+// to a recognized sink type - by "var x T" or "var x T = ..." and by
+// "x := T{...}" or "x := &T{...}" - to that type's
+// contractBoundedSinkTypes key, the same way contractCollectBoundNames
+// tracks exec.Cmd- and os.Process-bound names for rule CAPTURE.
+func contractCollectSinkVarTypes(bytesName string, fn *ast.FuncDecl) map[string]string {
+	sinkTypes := map[string]string{}
+	if fn.Body == nil {
+		return sinkTypes
+	}
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		switch s := n.(type) {
+		case *ast.DeclStmt:
+			gd, ok := s.Decl.(*ast.GenDecl)
+			if !ok || gd.Tok != token.VAR {
+				return true
+			}
+			for _, spec := range gd.Specs {
+				vs, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				if vs.Type != nil {
+					if typeName := contractSinkTypeName(bytesName, vs.Type); typeName != "" {
+						for _, name := range vs.Names {
+							sinkTypes[name.Name] = typeName
+						}
+					}
+				}
+				for i, val := range vs.Values {
+					if i >= len(vs.Names) {
+						continue
+					}
+					if typeName := contractSinkTypeFromValue(bytesName, val); typeName != "" {
+						sinkTypes[vs.Names[i].Name] = typeName
+					}
+				}
+			}
+		case *ast.AssignStmt:
+			for i, rhs := range s.Rhs {
+				if i >= len(s.Lhs) {
+					continue
+				}
+				ident, ok := s.Lhs[i].(*ast.Ident)
+				if !ok {
+					continue
+				}
+				if typeName := contractSinkTypeFromValue(bytesName, rhs); typeName != "" {
+					sinkTypes[ident.Name] = typeName
+				}
+			}
+		}
+		return true
+	})
+	return sinkTypes
+}
+
+// contractResolveSinkType reports the contractBoundedSinkTypes key expr
+// resolves to via sinkTypes, and whether expr is the literal nil, which
+// [procutil.CaptureParams] accepts unconditionally in place of a
+// writer. An expression this function cannot resolve - a call, a
+// selector into an unrecognized value such as os.Stdout, or an
+// identifier sinkTypes never bound - reports "", false: unresolved is
+// treated as unbounded rather than accepted.
+func contractResolveSinkType(bytesName string, sinkTypes map[string]string, expr ast.Expr) (typeName string, isNil bool) {
+	switch e := expr.(type) {
+	case *ast.Ident:
+		if e.Name == "nil" {
+			return "", true
+		}
+		return sinkTypes[e.Name], false
+	case *ast.UnaryExpr:
+		if e.Op != token.AND {
+			return "", false
+		}
+		switch x := e.X.(type) {
+		case *ast.Ident:
+			return sinkTypes[x.Name], false
+		case *ast.CompositeLit:
+			return contractSinkTypeName(bytesName, x.Type), false
+		}
+		return "", false
+	case *ast.CompositeLit:
+		return contractSinkTypeName(bytesName, e.Type), false
+	}
+	return "", false
+}
+
+// contractIsCaptureParamsLit reports whether lit's type is
+// procName.CaptureParams, procName being the local identifier the file
+// binds to [procutil]'s import path.
+func contractIsCaptureParamsLit(procName string, lit *ast.CompositeLit) bool {
+	if procName == "" {
+		return false
+	}
+	sel, ok := lit.Type.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	ident, ok := sel.X.(*ast.Ident)
+	return ok && ident.Name == procName && sel.Sel.Name == "CaptureParams"
+}
+
+// checkContractCaptureSinkFields reports a rule SINK violation for each
+// of lit's Stdout and Stderr fields that is set and does not resolve,
+// via sinkTypes, to nil or a type contractBoundedSinkTypes admits.
+func checkContractCaptureSinkFields(fset *token.FileSet, lit *ast.CompositeLit, bytesName string, sinkTypes map[string]string) []contractViolation {
+	var violations []contractViolation
+	for _, field := range [2]string{"Stdout", "Stderr"} {
+		value := compositeLitKeyValue(lit, field)
+		if value == nil {
+			continue
+		}
+		typeName, isNil := contractResolveSinkType(bytesName, sinkTypes, value)
+		if isNil {
+			continue
+		}
+		if _, ok := contractBoundedSinkTypes[typeName]; ok {
+			continue
+		}
+		violations = append(violations, contractViolation{
+			pos:  fset.Position(value.Pos()),
+			text: "CaptureParams." + field + " passes a writer not accepted as bounded; extend " + contractSinkTypeOwner + " to admit it deliberately",
+		})
+	}
+	return violations
+}
+
+// checkContractCaptureFile reports every rule CAPTURE and rule SINK
+// violation in file, using idx and fields already built across the
+// whole package file belongs to. Rule SINK is skipped when dirName is
+// exempt from it.
+//
+// Any dot import in file is itself a rule CAPTURE violation, regardless
+// of which package it names: a call, constant reference, or sink type
+// reached through a dot import binds no local identifier, so the rest
+// of this function - which resolves every one of those against file's
+// own named and aliased imports - cannot see through it. Reporting the
+// import outright, once, keeps a file that hides a command constructor
+// or a sink type behind a dot import from silently passing this rule
+// the way naming the four import paths this used to check did not.
+//
+// A file that imports none of os/exec, os, syscall, windows, or
+// procutil can still reach an exec.Cmd by calling a constructor
+// declared in another walked package - workspace.GitCommand called
+// from a file that imports only "workspace", never "os/exec" - so the
+// early return below also stays open when idx.producerPaths names one
+// of file's own imports. A file naming none of the five imports and no
+// producer's import path plainly cannot violate rule CAPTURE or rule
+// SINK, since it can neither construct nor receive a command, and is
+// skipped at the cost this rule was built to avoid paying.
+func checkContractCaptureFile(fset *token.FileSet, file *ast.File, importPath, dirName string, idx *contractCmdIndex, fields contractCmdFields) []contractViolation {
+	var violations []contractViolation
+
+	for _, imp := range file.Imports {
+		if imp.Name == nil || imp.Name.Name != "." {
+			continue
+		}
+		path, err := strconv.Unquote(imp.Path.Value)
+		if err != nil {
+			continue
+		}
+		violations = append(violations, contractViolation{
+			pos:  fset.Position(imp.Pos()),
+			text: "dot-imports " + path + ", " + contractCaptureDotImportReason,
+		})
+	}
+
+	execName := resolveContractImportName(file, "os/exec")
+	osName := resolveContractImportName(file, "os")
+	syscallName := resolveContractImportName(file, "syscall")
+	winName := resolveContractImportName(file, "golang.org/x/sys/windows")
+	procName := resolveContractImportName(file, contractProcutilImportPath)
+	aliasPaths := contractFileImportAliases(file)
+	importsCmdProducer := false
+	for _, path := range aliasPaths {
+		if idx.producerPaths[path] {
+			importsCmdProducer = true
+			break
+		}
+	}
+	if execName == "" && osName == "" && syscallName == "" && winName == "" && procName == "" && !importsCmdProducer {
+		return violations
+	}
+	bytesName := resolveContractImportName(file, "bytes")
+	checkSinks := procName != "" && !contractExempt(dirName, ruleSINK)
+	hasCmd := execName != "" || importsCmdProducer
+
+	if hasCmd {
+		ast.Inspect(file, func(n ast.Node) bool {
+			assign, ok := n.(*ast.AssignStmt)
+			if !ok {
+				return true
+			}
+			for _, lhs := range assign.Lhs {
+				sel, isSel := lhs.(*ast.SelectorExpr)
+				if !isSel || (sel.Sel.Name != "Stdout" && sel.Sel.Name != "Stderr") {
+					continue
+				}
+				violations = append(violations, contractViolation{
+					pos:  fset.Position(sel.Pos()),
+					text: "assigns exec.Cmd." + sel.Sel.Name + " directly; call " + contractCaptureOwner,
+				})
+			}
+			return true
+		})
+	}
+
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Body == nil {
+			continue
+		}
+		cmdNames, procNames := contractCollectBoundNames(execName, osName, idx, importPath, aliasPaths, fn)
+		var sinkTypes map[string]string
+		if checkSinks {
+			sinkTypes = contractCollectSinkVarTypes(bytesName, fn)
+		}
+
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			if checkSinks {
+				if lit, ok := n.(*ast.CompositeLit); ok && contractIsCaptureParamsLit(procName, lit) {
+					violations = append(violations, checkContractCaptureSinkFields(fset, lit, bytesName, sinkTypes)...)
+					return true
+				}
+			}
+
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+
+			if hasCmd {
+				switch sel.Sel.Name {
+				case "Output", "CombinedOutput", "StdoutPipe", "StderrPipe":
+					violations = append(violations, contractViolation{
+						pos:  fset.Position(call.Pos()),
+						text: "waits on an exec.Cmd directly; call " + contractCaptureOwner,
+					})
+					return true
+				case "Start", "Run":
+					if contractExprIsCmdBound(execName, idx, importPath, aliasPaths, cmdNames, fields, sel.X) {
+						violations = append(violations, contractViolation{
+							pos:  fset.Position(call.Pos()),
+							text: "waits on an exec.Cmd directly; call " + contractCaptureOwner,
+						})
+					}
+					return true
+				}
+			}
+
+			if sel.Sel.Name == "Wait" {
+				if hasCmd && contractExprIsCmdBound(execName, idx, importPath, aliasPaths, cmdNames, fields, sel.X) {
+					violations = append(violations, contractViolation{
+						pos:  fset.Position(call.Pos()),
+						text: "waits on an exec.Cmd directly; call " + contractCaptureOwner,
+					})
+					return true
+				}
+				bound := false
+				if ident, isIdent := sel.X.(*ast.Ident); isIdent {
+					bound = procNames[ident.Name]
+				} else if procSel, isSel := sel.X.(*ast.SelectorExpr); isSel {
+					bound = procSel.Sel.Name == "Process"
+				}
+				if bound {
+					violations = append(violations, contractViolation{
+						pos:  fset.Position(call.Pos()),
+						text: "waits on an os.Process directly; call " + contractCaptureOwner,
+					})
+					return true
+				}
+			}
+
+			ident, isIdent := sel.X.(*ast.Ident)
+			if !isIdent {
+				return true
+			}
+			raw := (osName != "" && ident.Name == osName && sel.Sel.Name == "StartProcess") ||
+				(syscallName != "" && ident.Name == syscallName && (sel.Sel.Name == "StartProcess" || sel.Sel.Name == "ForkExec")) ||
+				(winName != "" && ident.Name == winName && (sel.Sel.Name == "CreateProcess" || sel.Sel.Name == "CreateProcessAsUser"))
+			if raw {
+				violations = append(violations, contractViolation{
+					pos:  fset.Position(call.Pos()),
+					text: "starts a process outside os/exec; call " + contractCaptureOwner,
+				})
+			}
+			return true
+		})
+	}
+
+	return violations
+}
+
+// contractBuildModuleCmdIndex builds one function, method, and
+// struct-field index from every non-test file across every package in
+// walked, so a caller in one package that binds a *exec.Cmd from a
+// constructor declared in another - workspace.GitCommand called from
+// internal/orchestrator, for instance - is indexed the same as a
+// same-package call site. The cost stays linear in the file count
+// contractWalkRoot already parsed: this is one more pass over files
+// already held in memory, not a second walk of the tree.
+func contractBuildModuleCmdIndex(walked []contractWalkedPackage) (*contractCmdIndex, contractCmdFields) {
+	idx := &contractCmdIndex{funcs: map[string]bool{}, methods: map[string]bool{}, producerPaths: map[string]bool{}}
+	fields := contractCmdFields{}
+	for _, w := range walked {
+		for _, file := range w.pkg.files {
+			contractBuildCmdIndex(file, w.pkg.importPath, idx, fields)
+		}
+	}
+	return idx, fields
+}
+
+// checkContractCapture applies rule CAPTURE and rule SINK to every
+// non-test file in pkg, using idx and fields the caller built ahead of
+// time with contractBuildModuleCmdIndex. A caller checking one package
+// in isolation - a fixture test's single-file package, for instance -
+// may build idx and fields from that same package alone; a caller
+// checking a real tree builds them from every package the walk found,
+// so a cross-package call site resolves against the same index a
+// same-package one does. Rule SINK honors its own contractAllowlist
+// entry rather than reusing rule CAPTURE's; a caller that skips this
+// function entirely for a rule-CAPTURE-exempt package skips rule SINK
+// for it too, since nothing here runs for that package at all.
+func checkContractCapture(fset *token.FileSet, pkg contractPackage, idx *contractCmdIndex, fields contractCmdFields) []contractViolation {
+	var violations []contractViolation
+	for _, file := range pkg.files {
+		violations = append(violations, checkContractCaptureFile(fset, file, pkg.importPath, pkg.dirName, idx, fields)...)
+	}
 	return violations
 }
 
@@ -557,6 +1267,88 @@ func checkContractStopGrace(fset *token.FileSet, file *ast.File) []contractViola
 			pos:  fset.Position(sel.Pos()),
 			text: "references procutil.DefaultStopGrace directly; call " + contractStopGraceOwner,
 		})
+		return true
+	})
+	return violations
+}
+
+// contractReaperLoggerHint is what checkContractReaperLogger's message
+// tells a caller to pass instead of the two forbidden shapes.
+const contractReaperLoggerHint = "a logger the call site already holds, in a local variable or a struct field"
+
+// contractCallsSlogDefault reports whether expr is a call to
+// slogIdent.Default, or a call chained onto one (e.g.
+// slog.Default().With(...)), by recursing into the receiver of each
+// chained call.
+func contractCallsSlogDefault(expr ast.Expr, slogIdent string) bool {
+	call, ok := expr.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	if ident, ok := sel.X.(*ast.Ident); ok && ident.Name == slogIdent && sel.Sel.Name == "Default" {
+		return true
+	}
+	return contractCallsSlogDefault(sel.X, slogIdent)
+}
+
+// checkContractReaperLogger reports a violation for every
+// procutil.StartReaper call in file whose second argument is the nil
+// literal or a call to slog.Default() (with or without a chained
+// With), rather than a logger the call site already holds. StartReaper
+// logs the one CaptureCleanupWarning record for a reap whose group
+// termination cannot prove the process tree gone, and either forbidden
+// shape routes that record away from the logger the caller was built
+// with: nil falls back to StartReaper's own package-level default, and
+// a fresh slog.Default() call reaches the same default directly,
+// bypassing whatever component-scoped or session-scoped logger the
+// call site actually owns.
+func checkContractReaperLogger(fset *token.FileSet, file *ast.File) []contractViolation {
+	procutilIdent := resolveContractImportName(file, contractProcutilImportPath)
+	if procutilIdent == "" {
+		return nil
+	}
+	// See checkContractStopGrace for why a dot import is reported at the
+	// import itself rather than chased through bare identifiers.
+	if procutilIdent == "." {
+		return []contractViolation{{
+			pos:  fset.Position(importPos(file, contractProcutilImportPath)),
+			text: "dot-imports procutil, which hides a StartReaper call from this rule; import it by name",
+		}}
+	}
+	slogIdent := resolveContractImportName(file, "log/slog")
+
+	var violations []contractViolation
+	ast.Inspect(file, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		ident, isIdent := sel.X.(*ast.Ident)
+		if !isIdent || ident.Name != procutilIdent || sel.Sel.Name != "StartReaper" || len(call.Args) != 2 {
+			return true
+		}
+		arg := call.Args[1]
+		if nilIdent, isNilIdent := arg.(*ast.Ident); isNilIdent && nilIdent.Name == "nil" {
+			violations = append(violations, contractViolation{
+				pos:  fset.Position(call.Pos()),
+				text: "calls procutil.StartReaper with a nil logger; pass " + contractReaperLoggerHint,
+			})
+			return true
+		}
+		if slogIdent != "" && contractCallsSlogDefault(arg, slogIdent) {
+			violations = append(violations, contractViolation{
+				pos:  fset.Position(call.Pos()),
+				text: "calls procutil.StartReaper with slog.Default() rather than " + contractReaperLoggerHint,
+			})
+		}
 		return true
 	})
 	return violations
@@ -756,9 +1548,6 @@ func checkCoreContractPackage(fset *token.FileSet, pkg contractPackage) []contra
 	var violations []contractViolation
 	for _, file := range pkg.files {
 		violations = append(violations, checkContractCoreImports(fset, file, false)...)
-		if !contractExempt(pkg.dirName, ruleTEARDOWN) {
-			violations = append(violations, checkContractTeardown(fset, file)...)
-		}
 	}
 	for _, file := range pkg.testFiles {
 		violations = append(violations, checkContractCoreImports(fset, file, true)...)
@@ -1612,12 +2401,6 @@ func checkAdapterContractPackage(fset *token.FileSet, pkg contractPackage) []con
 		}
 	}
 
-	if !contractExempt(pkg.dirName, ruleTEARDOWN) {
-		for _, file := range pkg.files {
-			violations = append(violations, checkContractTeardown(fset, file)...)
-		}
-	}
-
 	registers, usedMeta, hasHook, hasBlockerSource, blockerSourceIsPerIssue, factsPos := contractRegistrationFacts(fset, pkg.files)
 
 	if !contractExempt(pkg.dirName, ruleMETRICS) {
@@ -1822,6 +2605,75 @@ func TestCheckOrchestratorContract(t *testing.T) {
 	}
 }
 
+// contractCaptureTeardownRoots names the two roots rules CAPTURE and
+// TEARDOWN walk, the same module-wide scope contractWideIdentityRoots
+// names for rule IDENTITY: every launch site has to reach
+// procutil.RunCapture, procutil.StartCapture, procutil.SetGroupCancel,
+// or procutil.SetGroupKill, whichever family or layer it lives in.
+var contractCaptureTeardownRoots = []struct {
+	dir        string
+	importPath string
+}{
+	{filepath.Join("..", "..", "cmd"), "github.com/sortie-ai/sortie/cmd"},
+	{filepath.Join("..", "..", "internal"), "github.com/sortie-ai/sortie/internal"},
+}
+
+// contractWalkCaptureAndTeardown walks both contractCaptureTeardownRoots
+// through contractWalkRoot, grouping files by directory, and merges the
+// two roots' packages into one dir-ordered slice. The caller builds rule
+// CAPTURE's index from the merged slice via contractBuildModuleCmdIndex,
+// so a constructor call spanning two of the walked packages resolves the
+// same way a same-package call does.
+func contractWalkCaptureAndTeardown(t *testing.T, fset *token.FileSet) []contractWalkedPackage {
+	t.Helper()
+	var walked []contractWalkedPackage
+	for _, root := range contractCaptureTeardownRoots {
+		rootWalked, _ := contractWalkRoot(t, fset, root.dir, root.importPath)
+		walked = append(walked, rootWalked...)
+	}
+	sort.Slice(walked, func(i, j int) bool { return walked[i].dir < walked[j].dir })
+	return walked
+}
+
+// TestContractCaptureAndTeardown walks every non-test Go file under
+// cmd/ and internal/, excluding testdata, and fails when a file starts
+// a process, waits on one, or wires an exec.Cmd's output or
+// cancellation directly, outside procutil and the named test-support
+// packages (rule CAPTURE); passes a CaptureParams.Stdout or
+// CaptureParams.Stderr that does not resolve to nil or a type
+// contractBoundedSinkTypes admits (rule SINK); assigns an exec.Cmd
+// teardown field by hand (rule TEARDOWN); or calls
+// procutil.StartReaper with a nil logger or a fresh slog.Default()
+// call rather than a logger the call site already holds (rule
+// REAPER).
+func TestContractCaptureAndTeardown(t *testing.T) {
+	fset := token.NewFileSet()
+	walked := contractWalkCaptureAndTeardown(t, fset)
+	idx, fields := contractBuildModuleCmdIndex(walked)
+
+	for _, w := range walked {
+		if !contractExempt(w.pkg.dirName, ruleCAPTURE) {
+			for _, v := range checkContractCapture(fset, w.pkg, idx, fields) {
+				t.Errorf("%s: %s", v.pos, v.text)
+			}
+		}
+		if !contractExempt(w.pkg.dirName, ruleTEARDOWN) {
+			for _, file := range w.pkg.files {
+				for _, v := range checkContractTeardown(fset, file) {
+					t.Errorf("%s: %s", v.pos, v.text)
+				}
+			}
+		}
+		if !contractExempt(w.pkg.dirName, ruleREAPER) {
+			for _, file := range w.pkg.files {
+				for _, v := range checkContractReaperLogger(fset, file) {
+					t.Errorf("%s: %s", v.pos, v.text)
+				}
+			}
+		}
+	}
+}
+
 // TestCheckAdapterContract_DetectsViolations pins the checker's own logic
 // against inline source fixtures, independent of the current state of
 // any adapter package, so a regression in a rule is caught even when
@@ -1844,57 +2696,6 @@ func TestCheckAdapterContract_DetectsViolations(t *testing.T) {
 		// right count.
 		wantSubstr string
 	}{
-		{
-			name:       "a hand-wired exec.Cmd cancellation is rejected",
-			dirName:    "fixture",
-			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
-			src: `package fixture
-
-import "os/exec"
-
-func launch(cmd *exec.Cmd) {
-	cmd.Cancel = func() error { return nil }
-}
-`,
-			wantCount:  1,
-			wantSubstr: "call procutil.SetGroupCancel",
-		},
-		{
-			name:       "a hand-wired exec.Cmd wait delay is rejected",
-			dirName:    "fixture",
-			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
-			src: `package fixture
-
-import (
-	"os/exec"
-	"time"
-)
-
-func launch(cmd *exec.Cmd) {
-	cmd.WaitDelay = 5 * time.Second
-}
-`,
-			wantCount:  1,
-			wantSubstr: "call procutil.SetGroupCancel",
-		},
-		{
-			name:       "a same-named field in a package that never touches os/exec is accepted",
-			dirName:    "fixture",
-			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
-			src: `package fixture
-
-type request struct {
-	Cancel    func() error
-	WaitDelay int
-}
-
-func configure(r *request) {
-	r.Cancel = func() error { return nil }
-	r.WaitDelay = 5
-}
-`,
-			wantCount: 0,
-		},
 		{
 			name:       "a non-test file referencing procutil.DefaultStopGrace directly is rejected",
 			dirName:    "fixture",
@@ -2460,6 +3261,1102 @@ const kind = "claude-code"
 	}
 }
 
+// TestCheckContractCapture_DetectsViolations pins rule CAPTURE's, rule
+// SINK's, and rule TEARDOWN's own logic against inline source
+// fixtures, independent of the current state of any package under
+// cmd/ or internal/, so a regression is caught even when every real
+// launch site happens to comply. Each fixture is parsed as the single
+// non-test file of a one-file package named by dirName; every case
+// runs through both checkContractCapture and checkContractTeardown.
+// Rule CAPTURE's own Stdout/Stderr check targets a direct assignment
+// to exec.Cmd.Stdout or exec.Cmd.Stderr; rule SINK's targets a field of
+// that name inside a procutil.CaptureParams composite literal instead,
+// so the two never match the same syntax, and TEARDOWN's Cancel and
+// WaitDelay checks overlap with neither.
+func TestCheckContractCapture_DetectsViolations(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		dirName    string
+		importPath string
+		src        string
+		wantCount  int
+		wantSubstr string
+	}{
+		{
+			name:       "a chained CombinedOutput call is rejected",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import (
+	"context"
+	"os/exec"
+)
+
+func run(ctx context.Context) ([]byte, error) {
+	return exec.CommandContext(ctx, "git", "status").CombinedOutput()
+}
+`,
+			wantCount:  1,
+			wantSubstr: "call procutil.RunCapture or procutil.StartCapture",
+		},
+		{
+			name:       "a declared-then-called Run is rejected",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import "os/exec"
+
+func run() error {
+	cmd := exec.Command("git", "status")
+	return cmd.Run()
+}
+`,
+			wantCount:  1,
+			wantSubstr: "waits on an exec.Cmd directly",
+		},
+		{
+			name:       "a var-declared cmd's Output call is rejected",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import "os/exec"
+
+func run() ([]byte, error) {
+	var cmd *exec.Cmd
+	cmd = exec.Command("git", "status")
+	return cmd.Output()
+}
+`,
+			wantCount:  1,
+			wantSubstr: "waits on an exec.Cmd directly",
+		},
+		{
+			name:       "a cmd parameter's Wait call is rejected",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import "os/exec"
+
+func run(cmd *exec.Cmd) error {
+	return cmd.Wait()
+}
+`,
+			wantCount:  1,
+			wantSubstr: "waits on an exec.Cmd directly",
+		},
+		{
+			name:       "a struct field cmd's Start call is rejected",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import "os/exec"
+
+type runner struct {
+	cmd *exec.Cmd
+}
+
+func (s *runner) run() error {
+	return s.cmd.Start()
+}
+`,
+			wantCount:  1,
+			wantSubstr: "waits on an exec.Cmd directly",
+		},
+		{
+			name:       "an indexed function's returned cmd is rejected, assigned and chained",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import "os/exec"
+
+func newGitCmd(dir string) *exec.Cmd {
+	cmd := exec.Command("git", "status")
+	cmd.Dir = dir
+	return cmd
+}
+
+func runAssigned(dir string) error {
+	cmd := newGitCmd(dir)
+	return cmd.Run()
+}
+
+func runChained(dir string) error {
+	return newGitCmd(dir).Start()
+}
+`,
+			wantCount: 2,
+		},
+		{
+			name:       "an os.Process field's Wait call is rejected",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import "os/exec"
+
+func run(c *exec.Cmd) error {
+	return c.Process.Wait()
+}
+`,
+			wantCount:  1,
+			wantSubstr: "waits on an os.Process directly",
+		},
+		{
+			name:       "os.StartProcess and a later Wait on its result are both rejected",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import "os"
+
+func run() error {
+	p, _ := os.StartProcess("/bin/true", nil, &os.ProcAttr{})
+	return p.Wait()
+}
+`,
+			wantCount: 2,
+		},
+		{
+			name:       "syscall.ForkExec is rejected",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import "syscall"
+
+func run() (int, error) {
+	return syscall.ForkExec("/bin/true", nil, nil)
+}
+`,
+			wantCount:  1,
+			wantSubstr: "starts a process outside os/exec",
+		},
+		{
+			name:       "a direct Stdout assignment is rejected",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import (
+	"io"
+	"os/exec"
+)
+
+func run(cmd *exec.Cmd) {
+	cmd.Stdout = io.Discard
+}
+`,
+			wantCount:  1,
+			wantSubstr: "assigns exec.Cmd.Stdout directly",
+		},
+		{
+			name:       "a dot-import of os/exec is rejected once, on the import",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import . "os/exec"
+
+func run() (*Cmd, error) {
+	return Command("git", "status"), nil
+}
+`,
+			wantCount:  1,
+			wantSubstr: "dot-imports os/exec",
+		},
+		{
+			name:       "a dot-import of os is rejected once, on the import",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import . "os"
+
+func run() string {
+	return Getenv("PATH")
+}
+`,
+			wantCount:  1,
+			wantSubstr: "dot-imports os",
+		},
+		{
+			// A dot-imported procutil turns "CaptureParams{...}" into a
+			// bare composite literal contractIsCaptureParamsLit cannot
+			// recognize (it looks for a "procutil." selector), so
+			// without the general dot-import ban this Stdout field,
+			// resolving to os.Stdout rather than a bounded sink, would
+			// evade rule SINK entirely instead of being reported.
+			name:       "a dot-import of procutil hiding an unbounded sink is rejected once, on the import",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import (
+	"os"
+	"os/exec"
+
+	. "github.com/sortie-ai/sortie/internal/agent/procutil"
+)
+
+func run(cmd *exec.Cmd) error {
+	_, err := StartCapture(cmd, CaptureParams{Stdout: os.Stdout})
+	return err
+}
+`,
+			wantCount:  1,
+			wantSubstr: "dot-imports github.com/sortie-ai/sortie/internal/agent/procutil",
+		},
+		{
+			name:       "a sync.WaitGroup Wait in a file importing os/exec is accepted",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import (
+	"os/exec"
+	"sync"
+)
+
+func run(wg *sync.WaitGroup) {
+	_ = exec.Command
+	wg.Wait()
+}
+`,
+			wantCount: 0,
+		},
+		{
+			name:       "Wait on a *procutil.Capture is accepted",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import "github.com/sortie-ai/sortie/internal/agent/procutil"
+
+func run(c *procutil.Capture) {
+	c.Wait()
+}
+`,
+			wantCount: 0,
+		},
+		{
+			name:       "Output on an unrelated type in a file that never imports os/exec is accepted",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+type buffer struct{}
+
+func (b *buffer) Output() []byte { return nil }
+
+func run(x *buffer) []byte {
+	return x.Output()
+}
+`,
+			wantCount: 0,
+		},
+		{
+			name:       "StdinPipe is accepted",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import "os/exec"
+
+func run(cmd *exec.Cmd) error {
+	_, err := cmd.StdinPipe()
+	return err
+}
+`,
+			wantCount: 0,
+		},
+		{
+			name:       "Signal on an *os.Process from os.FindProcess is accepted",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import (
+	"os"
+	"syscall"
+)
+
+func run(pid int) error {
+	p, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+	return p.Signal(syscall.Signal(0))
+}
+`,
+			wantCount: 0,
+		},
+		{
+			name:       "a hand-wired exec.Cmd cancellation is rejected",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import "os/exec"
+
+func launch(cmd *exec.Cmd) {
+	cmd.Cancel = func() error { return nil }
+}
+`,
+			wantCount:  1,
+			wantSubstr: "call procutil.SetGroupCancel or procutil.SetGroupKill",
+		},
+		{
+			name:       "a hand-wired exec.Cmd wait delay is rejected",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import (
+	"os/exec"
+	"time"
+)
+
+func launch(cmd *exec.Cmd) {
+	cmd.WaitDelay = 5 * time.Second
+}
+`,
+			wantCount:  1,
+			wantSubstr: "call procutil.SetGroupCancel or procutil.SetGroupKill",
+		},
+		{
+			name:       "a same-named field in a package that never touches os/exec is accepted",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+type request struct {
+	Cancel    func() error
+	WaitDelay int
+}
+
+func configure(r *request) {
+	r.Cancel = func() error { return nil }
+	r.WaitDelay = 5
+}
+`,
+			wantCount: 0,
+		},
+		{
+			name:       "a hand-wired exec.Cmd cancellation under internal/workspace is rejected",
+			dirName:    "workspace",
+			importPath: "github.com/sortie-ai/sortie/internal/workspace",
+			src: `package workspace
+
+import "os/exec"
+
+func launch(cmd *exec.Cmd) {
+	cmd.Cancel = func() error { return nil }
+}
+`,
+			wantCount:  1,
+			wantSubstr: "call procutil.SetGroupCancel or procutil.SetGroupKill",
+		},
+		{
+			// The negative control: an os.Pipe write end is exactly the
+			// sink [CaptureParams] warns against, since a reader that
+			// stops draining it blocks Write and holds seal, and so
+			// Wait, open indefinitely. Reproduces StartCapture's real
+			// call shape rather than a synthetic type.
+			name:       "an os.Pipe write end passed as a capture sink is rejected",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import (
+	"os"
+	"os/exec"
+
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
+)
+
+func run(cmd *exec.Cmd) error {
+	_, w, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	_, startErr := procutil.StartCapture(cmd, procutil.CaptureParams{Stdout: w})
+	return startErr
+}
+`,
+			wantCount:  1,
+			wantSubstr: "CaptureParams.Stdout passes a writer not accepted as bounded",
+		},
+		{
+			name:       "os.Stdout passed directly as a capture sink is rejected",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import (
+	"os"
+	"os/exec"
+
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
+)
+
+func run(cmd *exec.Cmd) error {
+	_, err := procutil.RunCapture(cmd, procutil.DefaultStopGrace, procutil.CaptureParams{Stdout: os.Stdout, Stderr: os.Stderr})
+	return err
+}
+`,
+			wantCount: 2,
+		},
+		{
+			// The positive control, reproducing the shape every real
+			// call site outside procutil uses: a local bytes.Buffer,
+			// addressed and shared by both streams.
+			name:       "a bytes.Buffer capture sink is accepted",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import (
+	"bytes"
+	"os/exec"
+
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
+)
+
+func run(cmd *exec.Cmd) error {
+	var combined bytes.Buffer
+	_, startErr := procutil.StartCapture(cmd, procutil.CaptureParams{Stdout: &combined, Stderr: &combined})
+	return startErr
+}
+`,
+			wantCount: 0,
+		},
+		{
+			// Reproduces workspace.RunHook's real shape: a package-local
+			// bounded writer built with "&T{...}" and shared by both
+			// streams, admitted through contractBoundedSinkTypes by name
+			// rather than by structural inspection of its Write method.
+			name:       "a locally-declared bounded writer capture sink is accepted",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import (
+	"os/exec"
+
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
+)
+
+type limitedBuffer struct{ max int }
+
+func (lb *limitedBuffer) Write(p []byte) (int, error) { return len(p), nil }
+
+func run(cmd *exec.Cmd) error {
+	buf := &limitedBuffer{max: 1024}
+	_, startErr := procutil.StartCapture(cmd, procutil.CaptureParams{Stdout: buf, Stderr: buf})
+	return startErr
+}
+`,
+			wantCount: 0,
+		},
+		{
+			name:       "an explicit nil capture sink is accepted",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import (
+	"os/exec"
+
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
+)
+
+func run(cmd *exec.Cmd) error {
+	_, startErr := procutil.StartCapture(cmd, procutil.CaptureParams{Stdout: nil})
+	return startErr
+}
+`,
+			wantCount: 0,
+		},
+		{
+			name:       "a CaptureParams literal naming neither Stdout nor Stderr is accepted",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import (
+	"os/exec"
+
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
+)
+
+func run(cmd *exec.Cmd) error {
+	_, startErr := procutil.RunCapture(cmd, procutil.DefaultStopGrace, procutil.CaptureParams{})
+	return startErr
+}
+`,
+			wantCount: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fset := token.NewFileSet()
+			file, err := parser.ParseFile(fset, "fixture.go", tt.src, parser.SkipObjectResolution)
+			if err != nil {
+				t.Fatalf("parser.ParseFile: %v", err)
+			}
+
+			pkg := contractPackage{dirName: tt.dirName, importPath: tt.importPath, files: []*ast.File{file}}
+			idx, fields := contractBuildModuleCmdIndex([]contractWalkedPackage{{pkg: pkg}})
+			got := checkContractCapture(fset, pkg, idx, fields)
+			got = append(got, checkContractTeardown(fset, file)...)
+
+			if len(got) != tt.wantCount {
+				t.Errorf("checkContractCapture()+checkContractTeardown() returned %d violations, want %d: %+v", len(got), tt.wantCount, got)
+			}
+			if tt.wantSubstr != "" && !slices.ContainsFunc(got, func(v contractViolation) bool {
+				return strings.Contains(v.text, tt.wantSubstr)
+			}) {
+				t.Errorf("violations = %+v, want one containing %q", got, tt.wantSubstr)
+			}
+		})
+	}
+}
+
+// TestCheckContractReaperLogger_DetectsViolations pins rule REAPER's
+// own logic against inline source fixtures, independent of the current
+// state of any package under cmd/ or internal/, so a regression is
+// caught even when every real launch site happens to comply. The
+// clean fixtures are the negative control: a call that already passes
+// a logger the call site holds, whether in a local variable or a
+// struct field, or through a chained slog.Default().With(...) already
+// bound to a local before the call, must report no violation, so the
+// rule is proven not to fire on the shape every real call site uses.
+func TestCheckContractReaperLogger_DetectsViolations(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		src        string
+		wantCount  int
+		wantSubstr string
+	}{
+		{
+			name: "a nil logger is rejected",
+			src: `package fixture
+
+import (
+	"os/exec"
+
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
+)
+
+func run(cmd *exec.Cmd) {
+	procutil.StartReaper(cmd, nil)
+}
+`,
+			wantCount:  1,
+			wantSubstr: "nil logger",
+		},
+		{
+			name: "a bare slog.Default() call is rejected",
+			src: `package fixture
+
+import (
+	"log/slog"
+	"os/exec"
+
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
+)
+
+func run(cmd *exec.Cmd) {
+	procutil.StartReaper(cmd, slog.Default())
+}
+`,
+			wantCount:  1,
+			wantSubstr: "slog.Default()",
+		},
+		{
+			name: "a chained slog.Default().With(...) call is rejected",
+			src: `package fixture
+
+import (
+	"log/slog"
+	"os/exec"
+
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
+)
+
+func run(cmd *exec.Cmd) {
+	procutil.StartReaper(cmd, slog.Default().With(slog.String("component", "fixture-adapter")))
+}
+`,
+			wantCount:  1,
+			wantSubstr: "slog.Default()",
+		},
+		{
+			name: "a renamed procutil import does not evade the nil check",
+			src: `package fixture
+
+import (
+	"os/exec"
+
+	proc "github.com/sortie-ai/sortie/internal/agent/procutil"
+)
+
+func run(cmd *exec.Cmd) {
+	proc.StartReaper(cmd, nil)
+}
+`,
+			wantCount:  1,
+			wantSubstr: "nil logger",
+		},
+		{
+			name: "a dot-imported procutil is rejected outright",
+			src: `package fixture
+
+import (
+	"os/exec"
+
+	. "github.com/sortie-ai/sortie/internal/agent/procutil"
+)
+
+func run(cmd *exec.Cmd) {
+	StartReaper(cmd, nil)
+}
+`,
+			wantCount:  1,
+			wantSubstr: "dot-imports procutil",
+		},
+		{
+			name: "a local variable logger is accepted",
+			src: `package fixture
+
+import (
+	"log/slog"
+	"os/exec"
+
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
+)
+
+func run(cmd *exec.Cmd, logger *slog.Logger) {
+	procutil.StartReaper(cmd, logger)
+}
+`,
+			wantCount: 0,
+		},
+		{
+			name: "a struct field logger is accepted",
+			src: `package fixture
+
+import (
+	"os/exec"
+
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
+)
+
+type session struct {
+	logger any
+}
+
+func (s *session) run(cmd *exec.Cmd) {
+	procutil.StartReaper(cmd, s.logger)
+}
+`,
+			wantCount: 0,
+		},
+		{
+			name: "slog.Default() bound to a local before the call is accepted",
+			src: `package fixture
+
+import (
+	"log/slog"
+	"os/exec"
+
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
+)
+
+func run(cmd *exec.Cmd) {
+	logger := slog.Default().With(slog.String("component", "fixture-adapter"))
+	procutil.StartReaper(cmd, logger)
+}
+`,
+			wantCount: 0,
+		},
+		{
+			name: "a file that never imports procutil is untouched",
+			src: `package fixture
+
+func run() int { return 1 }
+`,
+			wantCount: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fset := token.NewFileSet()
+			file, err := parser.ParseFile(fset, "fixture.go", tt.src, parser.SkipObjectResolution)
+			if err != nil {
+				t.Fatalf("parser.ParseFile: %v", err)
+			}
+
+			got := checkContractReaperLogger(fset, file)
+
+			if len(got) != tt.wantCount {
+				t.Errorf("checkContractReaperLogger() returned %d violations, want %d: %+v", len(got), tt.wantCount, got)
+			}
+			if tt.wantSubstr != "" && !slices.ContainsFunc(got, func(v contractViolation) bool {
+				return strings.Contains(v.text, tt.wantSubstr)
+			}) {
+				t.Errorf("violations = %+v, want one containing %q", got, tt.wantSubstr)
+			}
+		})
+	}
+}
+
+// TestCheckContractCapture_DetectsCrossPackageConstructorViolations pins
+// that rule CAPTURE binds a call to a constructor declared in another
+// walked package, not only one declared in the caller's own package.
+// The producer fixture reproduces workspace.GitCommand's real shape - a
+// context- and dir-taking function returning *exec.Cmd, built on
+// exec.CommandContext - and the consumer fixture reproduces
+// internal/orchestrator's real call shape, assigning its result to a
+// local and hand-wiring Wait directly instead of going through
+// procutil.RunCapture or procutil.StartCapture. idx and fields are
+// built module-wide via contractBuildModuleCmdIndex across both fixture
+// packages, the way TestContractCaptureAndTeardown builds them across
+// the real walk; an idx built from the consumer package alone - the
+// defect this test guards against - indexes no function under
+// GitCommand's own import path and misses the call.
+func TestCheckContractCapture_DetectsCrossPackageConstructorViolations(t *testing.T) {
+	t.Parallel()
+
+	const producerSrc = `package workspace
+
+import (
+	"context"
+	"os/exec"
+)
+
+func GitCommand(ctx context.Context, dir string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = dir
+	return cmd
+}
+`
+
+	const consumerSrc = `package orchestrator
+
+import (
+	"context"
+	"os/exec"
+
+	"github.com/sortie-ai/sortie/internal/workspace"
+)
+
+func runVerification(ctx context.Context, command string) *exec.Cmd {
+	return exec.CommandContext(ctx, "sh", "-c", command)
+}
+
+func runGitDiff(ctx context.Context, workspacePath string, args ...string) error {
+	cmd := workspace.GitCommand(ctx, workspacePath, args...)
+	return cmd.Wait()
+}
+`
+
+	fset := token.NewFileSet()
+	producerFile, err := parser.ParseFile(fset, "workspace.go", producerSrc, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parser.ParseFile(producer): %v", err)
+	}
+	consumerFile, err := parser.ParseFile(fset, "orchestrator.go", consumerSrc, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parser.ParseFile(consumer): %v", err)
+	}
+
+	producerPkg := contractPackage{
+		dirName:    "workspace",
+		importPath: "github.com/sortie-ai/sortie/internal/workspace",
+		files:      []*ast.File{producerFile},
+	}
+	consumerPkg := contractPackage{
+		dirName:    "orchestrator",
+		importPath: contractOrchestratorPath,
+		files:      []*ast.File{consumerFile},
+	}
+
+	walked := []contractWalkedPackage{{pkg: producerPkg}, {pkg: consumerPkg}}
+	idx, fields := contractBuildModuleCmdIndex(walked)
+
+	got := checkContractCapture(fset, consumerPkg, idx, fields)
+	if len(got) != 1 {
+		t.Fatalf("checkContractCapture() on a caller of a cross-package constructor returned %d violations, want 1: %+v", len(got), got)
+	}
+	const wantSubstr = "waits on an exec.Cmd directly"
+	if !strings.Contains(got[0].text, wantSubstr) {
+		t.Errorf("violations = %+v, want one containing %q", got, wantSubstr)
+	}
+
+	producerGot := checkContractCapture(fset, producerPkg, idx, fields)
+	if len(producerGot) != 0 {
+		t.Errorf("checkContractCapture() on the constructor's own package returned %d violations, want 0: %+v", len(producerGot), producerGot)
+	}
+}
+
+// TestCheckContractCapture_DetectsDotImportedConstructorViolations is the
+// negative control for the hole an audit of
+// TestCheckContractCapture_DetectsCrossPackageConstructorViolations
+// found: contractFileImportAliases omits a dot import, since a dot
+// import binds no name a selector could qualify, so a call reached
+// through one - GitCommand written bare instead of workspace.GitCommand
+// - resolved against nothing and the hand-wired Wait beneath it passed
+// uncaught. The consumer here is the same shape as that test's, a dot
+// import substituted for the named one; before the general dot-import
+// ban in checkContractCaptureFile this returned zero violations, which
+// an overlay probe against a pre-fix copy confirmed.
+func TestCheckContractCapture_DetectsDotImportedConstructorViolations(t *testing.T) {
+	t.Parallel()
+
+	const producerSrc = `package workspace
+
+import (
+	"context"
+	"os/exec"
+)
+
+func GitCommand(ctx context.Context, dir string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = dir
+	return cmd
+}
+`
+
+	const consumerSrc = `package orchestrator
+
+import (
+	"context"
+
+	. "github.com/sortie-ai/sortie/internal/workspace"
+)
+
+func runGitDiff(ctx context.Context, workspacePath string, args ...string) error {
+	cmd := GitCommand(ctx, workspacePath, args...)
+	return cmd.Wait()
+}
+`
+
+	fset := token.NewFileSet()
+	producerFile, err := parser.ParseFile(fset, "workspace.go", producerSrc, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parser.ParseFile(producer): %v", err)
+	}
+	consumerFile, err := parser.ParseFile(fset, "orchestrator.go", consumerSrc, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parser.ParseFile(consumer): %v", err)
+	}
+
+	producerPkg := contractPackage{
+		dirName:    "workspace",
+		importPath: "github.com/sortie-ai/sortie/internal/workspace",
+		files:      []*ast.File{producerFile},
+	}
+	consumerPkg := contractPackage{
+		dirName:    "orchestrator",
+		importPath: contractOrchestratorPath,
+		files:      []*ast.File{consumerFile},
+	}
+
+	walked := []contractWalkedPackage{{pkg: producerPkg}, {pkg: consumerPkg}}
+	idx, fields := contractBuildModuleCmdIndex(walked)
+
+	got := checkContractCapture(fset, consumerPkg, idx, fields)
+	if len(got) != 1 {
+		t.Fatalf("checkContractCapture() on a dot-importing caller of a cross-package constructor returned %d violations, want 1: %+v", len(got), got)
+	}
+	const wantSubstr = "dot-imports github.com/sortie-ai/sortie/internal/workspace"
+	if !strings.Contains(got[0].text, wantSubstr) {
+		t.Errorf("violations = %+v, want one containing %q", got, wantSubstr)
+	}
+}
+
+// TestCheckContractCapture_ResolvesRenamedImportConstructorCalls pins
+// that a renamed import - unlike a dot import - does not share the hole
+// TestCheckContractCapture_DetectsDotImportedConstructorViolations
+// closes: contractFileImportAliases keys aliasPaths from each import's
+// own local identifier, alias or not, so ws.GitCommand resolves exactly
+// as the unaliased workspace.GitCommand does and the hand-wired Wait
+// stays caught. The consumer keeps runVerification and its direct
+// os/exec import from TestCheckContractCapture_DetectsCrossPackageConstructorViolations's
+// fixture: every real caller of a workspace constructor, such as
+// internal/orchestrator/self_review.go, imports os/exec directly in
+// the same file, and dropping that import here would exercise this
+// function's early-return guard instead of the alias resolution this
+// test targets.
+func TestCheckContractCapture_ResolvesRenamedImportConstructorCalls(t *testing.T) {
+	t.Parallel()
+
+	const producerSrc = `package workspace
+
+import (
+	"context"
+	"os/exec"
+)
+
+func GitCommand(ctx context.Context, dir string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = dir
+	return cmd
+}
+`
+
+	const consumerSrc = `package orchestrator
+
+import (
+	"context"
+	"os/exec"
+
+	ws "github.com/sortie-ai/sortie/internal/workspace"
+)
+
+func runVerification(ctx context.Context, command string) *exec.Cmd {
+	return exec.CommandContext(ctx, "sh", "-c", command)
+}
+
+func runGitDiff(ctx context.Context, workspacePath string, args ...string) error {
+	cmd := ws.GitCommand(ctx, workspacePath, args...)
+	return cmd.Wait()
+}
+`
+
+	fset := token.NewFileSet()
+	producerFile, err := parser.ParseFile(fset, "workspace.go", producerSrc, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parser.ParseFile(producer): %v", err)
+	}
+	consumerFile, err := parser.ParseFile(fset, "orchestrator.go", consumerSrc, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parser.ParseFile(consumer): %v", err)
+	}
+
+	producerPkg := contractPackage{
+		dirName:    "workspace",
+		importPath: "github.com/sortie-ai/sortie/internal/workspace",
+		files:      []*ast.File{producerFile},
+	}
+	consumerPkg := contractPackage{
+		dirName:    "orchestrator",
+		importPath: contractOrchestratorPath,
+		files:      []*ast.File{consumerFile},
+	}
+
+	walked := []contractWalkedPackage{{pkg: producerPkg}, {pkg: consumerPkg}}
+	idx, fields := contractBuildModuleCmdIndex(walked)
+
+	got := checkContractCapture(fset, consumerPkg, idx, fields)
+	if len(got) != 1 {
+		t.Fatalf("checkContractCapture() on a renamed-import caller of a cross-package constructor returned %d violations, want 1: %+v", len(got), got)
+	}
+	const wantSubstr = "waits on an exec.Cmd directly"
+	if !strings.Contains(got[0].text, wantSubstr) {
+		t.Errorf("violations = %+v, want one containing %q", got, wantSubstr)
+	}
+}
+
+// TestCheckContractCapture_DetectsProducerOnlyImportViolations is the
+// negative control for the hole checkContractCaptureFile's early return
+// left open: a file that reaches a command through a cross-package
+// constructor never has to import os/exec, os, syscall, windows, or
+// procutil itself, so naming none of those five was wrongly treated as
+// proof the file could not violate rule CAPTURE. The consumer here
+// drops every import the sibling constructor tests keep around it -
+// os/exec included - leaving only the producer's own import, and waits
+// on the result directly the same way those tests' consumers do.
+// Before the producer-path check joined the early return's condition,
+// an overlay run against a pre-fix copy of this file confirmed this
+// case reported zero violations.
+func TestCheckContractCapture_DetectsProducerOnlyImportViolations(t *testing.T) {
+	t.Parallel()
+
+	const producerSrc = `package workspace
+
+import (
+	"context"
+	"os/exec"
+)
+
+func GitCommand(ctx context.Context, dir string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = dir
+	return cmd
+}
+`
+
+	const consumerSrc = `package orchestrator
+
+import (
+	"context"
+
+	"github.com/sortie-ai/sortie/internal/workspace"
+)
+
+func runGitDiff(ctx context.Context, workspacePath string, args ...string) error {
+	cmd := workspace.GitCommand(ctx, workspacePath, args...)
+	return cmd.Wait()
+}
+`
+
+	fset := token.NewFileSet()
+	producerFile, err := parser.ParseFile(fset, "workspace.go", producerSrc, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parser.ParseFile(producer): %v", err)
+	}
+	consumerFile, err := parser.ParseFile(fset, "orchestrator.go", consumerSrc, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parser.ParseFile(consumer): %v", err)
+	}
+
+	producerPkg := contractPackage{
+		dirName:    "workspace",
+		importPath: "github.com/sortie-ai/sortie/internal/workspace",
+		files:      []*ast.File{producerFile},
+	}
+	consumerPkg := contractPackage{
+		dirName:    "orchestrator",
+		importPath: contractOrchestratorPath,
+		files:      []*ast.File{consumerFile},
+	}
+
+	walked := []contractWalkedPackage{{pkg: producerPkg}, {pkg: consumerPkg}}
+	idx, fields := contractBuildModuleCmdIndex(walked)
+
+	got := checkContractCapture(fset, consumerPkg, idx, fields)
+	if len(got) != 1 {
+		t.Fatalf("checkContractCapture() on a producer-only-import caller of a cross-package constructor returned %d violations, want 1: %+v", len(got), got)
+	}
+	const wantSubstr = "waits on an exec.Cmd directly"
+	if !strings.Contains(got[0].text, wantSubstr) {
+		t.Errorf("violations = %+v, want one containing %q", got, wantSubstr)
+	}
+
+	producerGot := checkContractCapture(fset, producerPkg, idx, fields)
+	if len(producerGot) != 0 {
+		t.Errorf("checkContractCapture() on the constructor's own package returned %d violations, want 0: %+v", len(producerGot), producerGot)
+	}
+}
+
 // TestContractAllowlist_BlockerRuleHasNoExemptions pins that no package
 // carries a contractAllowlist entry for ruleBLOCKER, so every
 // tracker-registering package, including file, is subject to it.
@@ -2531,6 +4428,46 @@ func contractCheckStopGraceAllowlist(r contractIdentityReporter, found map[strin
 		}
 		if !found[dirName] {
 			r.Errorf("contractAllowlist[%q] exempts %s, but the walk under %s did not find a directory named %q", dirName, ruleSTOPGRACE, contractAgentFamilyPath, dirName)
+		}
+	}
+}
+
+// contractCaptureTeardownEvaluationRoots names the three roots the
+// CAPTURE, SINK, and TEARDOWN staleness guards each require at least
+// one evaluated, non-exempt file under.
+var contractCaptureTeardownEvaluationRoots = []string{
+	"github.com/sortie-ai/sortie/internal/agent",
+	"github.com/sortie-ai/sortie/internal/orchestrator",
+	"github.com/sortie-ai/sortie/internal/workspace",
+}
+
+// contractCheckWideRuleEvaluated reports, for each of
+// contractCaptureTeardownEvaluationRoots, when rule was evaluated for
+// no non-exempt package carrying a non-test file under it.
+func contractCheckWideRuleEvaluated(r contractIdentityReporter, rule contractRule, walked []contractWalkedPackage) {
+	for _, root := range contractCaptureTeardownEvaluationRoots {
+		evaluated := false
+		for _, w := range walked {
+			if contractPathIsUnder(w.pkg.importPath, root) && len(w.pkg.files) > 0 && !contractExempt(w.pkg.dirName, rule) {
+				evaluated = true
+				break
+			}
+		}
+		if !evaluated {
+			r.Errorf("rule %s was evaluated for no file under %s, want at least one", rule, root)
+		}
+	}
+}
+
+// contractCheckWideRuleAllowlist reports each contractAllowlist entry
+// that exempts rule for a directory the walk did not find.
+func contractCheckWideRuleAllowlist(r contractIdentityReporter, rule contractRule, found map[string]bool) {
+	for dirName, reasons := range contractAllowlist {
+		if _, exempt := reasons[rule]; !exempt {
+			continue
+		}
+		if !found[dirName] {
+			r.Errorf("contractAllowlist[%q] exempts %s, but the walk did not find a directory named %q", dirName, rule, dirName)
 		}
 	}
 }
@@ -2669,6 +4606,74 @@ func TestContractStopGraceRule_StalenessGuardCatchesRealBreaks(t *testing.T) {
 			t.Fatalf("staleness guard recorded no failure for an allowlist entry naming a directory absent from the walk, want at least one")
 		}
 	})
+}
+
+// TestContractCaptureAndTeardownRule_AppliesAndStaysCurrent guards
+// rules CAPTURE, SINK, TEARDOWN, and REAPER against going stale: each
+// fails when it was evaluated for no non-exempt file under
+// internal/agent, internal/orchestrator, or internal/workspace, or
+// when a contractAllowlist entry naming it names a directory the walk
+// did not find.
+func TestContractCaptureAndTeardownRule_AppliesAndStaysCurrent(t *testing.T) {
+	fset := token.NewFileSet()
+	walked := contractWalkCaptureAndTeardown(t, fset)
+
+	found := map[string]bool{}
+	for _, w := range walked {
+		found[w.pkg.dirName] = true
+	}
+
+	contractCheckWideRuleEvaluated(t, ruleCAPTURE, walked)
+	contractCheckWideRuleAllowlist(t, ruleCAPTURE, found)
+	contractCheckWideRuleEvaluated(t, ruleSINK, walked)
+	contractCheckWideRuleAllowlist(t, ruleSINK, found)
+	contractCheckWideRuleEvaluated(t, ruleTEARDOWN, walked)
+	contractCheckWideRuleAllowlist(t, ruleTEARDOWN, found)
+	contractCheckWideRuleEvaluated(t, ruleREAPER, walked)
+	contractCheckWideRuleAllowlist(t, ruleREAPER, found)
+}
+
+// TestContractCaptureAndTeardownRule_StalenessGuardCatchesRealBreaks
+// proves the checks TestContractCaptureAndTeardownRule_AppliesAndStaysCurrent
+// performs are themselves capable of failing, not merely capable of
+// passing against the current tree: fed a walk that evaluated the rule
+// for no file under any of the three required roots, or an allowlist
+// naming a directory that walk did not find, each check must record a
+// failure. The second subtest temporarily replaces the package-level
+// contractAllowlist, which a concurrently-running fixture test also
+// reads, so neither subtest runs in parallel.
+func TestContractCaptureAndTeardownRule_StalenessGuardCatchesRealBreaks(t *testing.T) {
+	for _, rule := range []contractRule{ruleCAPTURE, ruleSINK, ruleTEARDOWN, ruleREAPER} {
+		t.Run(string(rule)+": zero files evaluated under a required root", func(t *testing.T) {
+			walked := []contractWalkedPackage{
+				{pkg: contractPackage{dirName: "fixture", importPath: "github.com/sortie-ai/sortie/internal/tracker/fixture"}},
+			}
+
+			reporter := &contractStalenessFakeReporter{}
+			contractCheckWideRuleEvaluated(reporter, rule, walked)
+
+			if len(reporter.errors) == 0 {
+				t.Fatalf("staleness guard recorded no failure for a walk carrying no file under any required root, want at least one")
+			}
+		})
+
+		t.Run(string(rule)+": an allowlist entry names a directory the walk did not find", func(t *testing.T) {
+			original := contractAllowlist
+			contractAllowlist = map[string]map[contractRule]string{
+				"ghost-adapter": {rule: "does not exist on disk"},
+			}
+			t.Cleanup(func() { contractAllowlist = original })
+
+			found := map[string]bool{"procutil": true}
+
+			reporter := &contractStalenessFakeReporter{}
+			contractCheckWideRuleAllowlist(reporter, rule, found)
+
+			if len(reporter.errors) == 0 {
+				t.Fatalf("staleness guard recorded no failure for an allowlist entry naming a directory absent from the walk, want at least one")
+			}
+		})
+	}
 }
 
 // TestResolveContractImportName pins that the qualifier is read from the
