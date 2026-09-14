@@ -123,7 +123,7 @@ func startAndAssign(cmd *exec.Cmd, logger *slog.Logger, keepJobHandle bool) (job
 
 		_ = cmd.Process.Kill()
 		reapStart := time.Now()
-		r := StartReaper(cmd)
+		r := StartReaper(cmd, logger)
 		<-r.Done()
 		waitMS := time.Since(reapStart).Milliseconds()
 

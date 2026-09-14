@@ -288,7 +288,7 @@ func startSession(ctx context.Context, a *ClientProtocolAdapter, params domain.S
 	// reaping cannot cut a reader still consuming buffered output short.
 	// Teardown's close_stdout and close_pipes steps are what end that
 	// reader.
-	reaper := procutil.StartReaper(cmd)
+	reaper := procutil.StartReaper(cmd, state.logger)
 	state.waitCh = reaper.Done()
 
 	// The release ends a handshake call or a turn that would otherwise

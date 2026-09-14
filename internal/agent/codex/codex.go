@@ -460,7 +460,7 @@ func (a *CodexAdapter) StartSession(ctx context.Context, params domain.StartSess
 	}
 	state.stderrCollector = procutil.NewStderrCollector(pipes.Stderr, logger)
 
-	reaper := procutil.StartReaper(cmd)
+	reaper := procutil.StartReaper(cmd, logger)
 	state.waitCh = reaper.Done()
 
 	// killOnError is a cleanup closure used if any handshake step fails.

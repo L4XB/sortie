@@ -285,7 +285,7 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 
 	runtime.stderrCollector = procutil.NewStderrCollector(pipes.Stderr, logger)
 	runtime.reader = procutil.NewStdoutReader(pipes.Stdout, logger)
-	startWait(runtime, cmd)
+	startWait(runtime, cmd, logger)
 
 	emit := func(event domain.AgentEvent) {
 		if state.target.RemoteCommand == "" {
@@ -712,9 +712,9 @@ func (s *sessionState) applySessionEvent(eventSessionID string) (bool, bool) {
 // startWait reaps the turn's subprocess independently of its stdout
 // reader and, once the reap and group kill have run, bounds the wait
 // for the turn's stderr drain before reading it.
-func startWait(runtime *turnRuntime, cmd *exec.Cmd) {
+func startWait(runtime *turnRuntime, cmd *exec.Cmd, logger *slog.Logger) {
 	go func() {
-		reaper := procutil.StartReaper(cmd)
+		reaper := procutil.StartReaper(cmd, logger)
 		<-reaper.Done()
 
 		// The turn's exit is published below, behind a stderr bound that

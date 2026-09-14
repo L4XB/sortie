@@ -58,9 +58,9 @@ const CaptureAbandonedWarning = "subprocess output was not fully collected befor
 // reap terminated.
 const LeftoversTerminatedMessage = "leftover processes terminated after the command exited"
 
-// CaptureCleanupWarning is the message of the one record Wait logs when
-// the reap's process-group termination itself failed, leaving the
-// launch's process tree unproven.
+// CaptureCleanupWarning is the message of the one record [StartReaper]
+// logs when the reap's process-group termination itself failed, leaving
+// the launch's process tree unproven.
 const CaptureCleanupWarning = "subprocess group termination failed after the launch returned"
 
 // closeWithoutWaiting is [CloseWithoutWaiting], read through a package
@@ -249,7 +249,7 @@ func StartCapture(cmd *exec.Cmd, params CaptureParams) (*Capture, error) {
 		cmd:           cmd,
 		logger:        logger,
 		streams:       streams,
-		reaper:        StartReaper(cmd),
+		reaper:        StartReaper(cmd, logger),
 		drainGrace:    drainGrace,
 		jobHandle:     jobHandle,
 		startedAt:     startedAt,
@@ -271,15 +271,6 @@ func (c *Capture) Wait() CaptureResult {
 		waitErr := c.reaper.Err()
 		leftover := c.reaper.Leftover()
 		waitMS := time.Since(c.reapStartedAt).Milliseconds()
-
-		// A termination that failed leaves the process tree unproven, so
-		// the record is the only thing standing between a surviving
-		// descendant and a launch that looks cleanly torn down.
-		if cleanupErr := c.reaper.CleanupErr(); cleanupErr != nil {
-			c.logger.Warn(CaptureCleanupWarning,
-				slog.String("command", filepath.Base(c.cmd.Path)),
-				slog.Any("error", cleanupErr))
-		}
 
 		drainCaptureJob(c.jobHandle, c.cmd, c.startedAt, waitMS, c.logger)
 

@@ -1,7 +1,9 @@
 package procutil
 
 import (
+	"log/slog"
 	"os/exec"
+	"path/filepath"
 	"time"
 )
 
@@ -27,12 +29,31 @@ type Reaper struct {
 // process group, releases the platform's process-group resources, and
 // only then closes the channel Done returns. cmd MUST already be
 // started.
-func StartReaper(cmd *exec.Cmd) *Reaper {
+//
+// A termination that could not prove the process tree torn down is
+// logged as the one [CaptureCleanupWarning] record for this reap; every
+// caller sees that record regardless of which one of them later reads
+// [Reaper.CleanupErr]. If logger is nil, StartReaper uses
+// [slog.Default].
+func StartReaper(cmd *exec.Cmd, logger *slog.Logger) *Reaper {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	r := &Reaper{done: make(chan struct{})}
 	go func() {
 		r.err = cmd.Wait()
 		r.leftover, r.cleanupErr = killProcessGroupReportingLeftover(cmd.Process.Pid)
 		CleanupProcess(cmd.Process.Pid)
+
+		// A termination that failed leaves the process tree unproven, so
+		// this record is the only thing standing between a surviving
+		// descendant and a launch that looks cleanly torn down.
+		if r.cleanupErr != nil {
+			logger.Warn(CaptureCleanupWarning,
+				slog.String("command", filepath.Base(cmd.Path)),
+				slog.Any("error", r.cleanupErr))
+		}
+
 		close(r.done)
 	}()
 	return r

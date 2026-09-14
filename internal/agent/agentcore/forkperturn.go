@@ -320,7 +320,7 @@ func (s *ForkPerTurnSession) RunTurn(
 
 	stderrCollector := procutil.NewStderrCollector(pipes.Stderr, s.logger)
 	reader := procutil.NewStdoutReader(pipes.Stdout, s.logger)
-	reaper := procutil.StartReaper(cmd)
+	reaper := procutil.StartReaper(cmd, s.logger)
 
 	var lastParsed any
 	parseLine := func(line []byte) {
