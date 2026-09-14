@@ -988,7 +988,7 @@ func TestOrchestrator_QueuedMessagesApplyAheadOfExit(t *testing.T) {
 		}
 	})
 
-	t.Run("drainRunningWorkers applies a queued agent event before the exit", func(t *testing.T) {
+	t.Run("drainRunningWorkers applies a queued agent event and a queued self-review message before the exit", func(t *testing.T) {
 		t.Parallel()
 
 		for trial := range trials {
@@ -1000,7 +1000,22 @@ func TestOrchestrator_QueuedMessagesApplyAheadOfExit(t *testing.T) {
 			tracker := &candidateTrackerAdapter{mockTrackerAdapter: &mockTrackerAdapter{}}
 			o := budgetOrchestrator(state, budgetTickConfig(0), store, tracker)
 
+			// The hooks run on the drain goroutine, which has returned before
+			// the test reads selfReviewQueueLen.
+			selfReviewQueueLen := -1
+			afterRunHistory := false
+			store.onAppendRunHistory = func(persistence.RunHistory) {
+				afterRunHistory = true
+			}
+			store.onUpsertSessionMetadata = func(persistence.SessionMetadata) {
+				if afterRunHistory {
+					afterRunHistory = false
+					selfReviewQueueLen = len(o.selfReviewCh)
+				}
+			}
+
 			o.agentEventCh <- queuedOrderingCrossingEvent(issueID, "m")
+			o.selfReviewCh <- selfReviewProgressMsg{IssueID: issueID, Message: "self_review_iteration", Iteration: 1, MaxIterations: 2}
 			o.workerExitCh <- WorkerResult{IssueID: issueID, Identifier: issueID + "-ident", ExitKind: WorkerExitNormal}
 
 			done := make(chan struct{})
@@ -1029,6 +1044,9 @@ func TestOrchestrator_QueuedMessagesApplyAheadOfExit(t *testing.T) {
 			}
 			if exitWrite.TotalTokens != 30 {
 				t.Fatalf("trial %d: SessionMetadata.TotalTokens = %d, want 30", trial, exitWrite.TotalTokens)
+			}
+			if selfReviewQueueLen != 0 {
+				t.Fatalf("trial %d: len(selfReviewCh) = %d at the time the row was upserted, want 0 (applied ahead of the exit)", trial, selfReviewQueueLen)
 			}
 		}
 	})
@@ -6084,6 +6102,53 @@ func TestMaybeWriteIncrementalMetadata(t *testing.T) {
 			t.Errorf("UpsertSessionMetadata calls = %d, want 2 (failed write not throttled)", len(writes))
 		}
 	})
+}
+
+// TestDrainRunningWorkers_SelfReviewProgressUpdatesRunningEntry delivers a
+// self-review progress message on the drain-loop selfReviewCh site while
+// the worker is still running and asserts the runtime snapshot reports
+// that progress before the worker exits.
+func TestDrainRunningWorkers_SelfReviewProgressUpdatesRunningEntry(t *testing.T) {
+	t.Parallel()
+
+	state := NewState(60000, 1, 0, nil, AgentTotals{})
+	state.Running["id-1"] = queuedOrderingIssueEntry("id-1")
+	store := &stubStore{}
+	tracker := &candidateTrackerAdapter{mockTrackerAdapter: &mockTrackerAdapter{}}
+	o := budgetOrchestrator(state, budgetTickConfig(0), store, tracker)
+	// The drain must still serve snapshot requests when the poll below
+	// gives up, so its own deadline sits well beyond the poll's.
+	o.drainTimeout = time.Minute
+
+	done := make(chan struct{})
+	go func() {
+		o.drainRunningWorkers()
+		close(done)
+	}()
+
+	o.selfReviewCh <- selfReviewProgressMsg{IssueID: "id-1", Message: "self_review_iteration", Iteration: 2, MaxIterations: 3}
+
+	deadline := time.After(10 * time.Second)
+	for {
+		reply := make(chan RuntimeSnapshotResult, 1)
+		o.snapshotCh <- snapshotRequest{ReplyCh: reply}
+		snap := <-reply
+		if len(snap.Running) == 1 && snap.Running[0].SelfReviewActive && snap.Running[0].SelfReviewIteration == 2 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("RuntimeSnapshot().Running = %+v after 10s of drain, want one entry with SelfReviewActive true and SelfReviewIteration 2", snap.Running)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	o.workerExitCh <- WorkerResult{IssueID: "id-1", Identifier: "id-1-ident"}
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("drainRunningWorkers did not return within 10 seconds")
+	}
 }
 
 // TestDrainRunningWorkers_TokenUsageEventTriggersIncrementalWrite delivers a

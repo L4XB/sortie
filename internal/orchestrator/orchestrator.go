@@ -1486,6 +1486,7 @@ func (o *Orchestrator) drainRunningWorkers() {
 			applyQueued(o.agentEventCh, func(msg agentEventMsg) {
 				o.applyAgentEvent(drainCtx, msg, false)
 			})
+			applyQueued(o.selfReviewCh, o.applySelfReviewProgress)
 			cfg := o.workflowManager.Config()
 			HandleWorkerExit(o.state, workerExit, HandleWorkerExitParams{
 				Store:                             o.store,
@@ -1518,6 +1519,9 @@ func (o *Orchestrator) drainRunningWorkers() {
 
 		case msg := <-o.agentEventCh:
 			o.applyAgentEvent(drainCtx, msg, false)
+
+		case msg := <-o.selfReviewCh:
+			o.applySelfReviewProgress(msg)
 
 		case req := <-o.snapshotCh:
 			snap := RuntimeSnapshot(o.state, time.Now())
