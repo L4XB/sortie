@@ -496,6 +496,9 @@ func probeRootProcess(rootPID uint32, jobPIDs []uint32, startedAt time.Time) (in
 		return inList, false, fmt.Errorf("GetProcessTimes: %w", timesErr)
 	}
 
+	// Filetime.Nanoseconds already rebases off the Windows 1601 epoch and
+	// returns Unix-epoch nanoseconds, so time.Unix(0, ...) is its exact
+	// inverse rather than a raw 100-nanosecond tick count.
 	if time.Unix(0, creationTime.Nanoseconds()).After(startedAt) {
 		// Created after the direct child was started, so the PID was
 		// recycled; this is not the direct child.
