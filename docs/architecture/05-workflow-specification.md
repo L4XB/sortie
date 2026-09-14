@@ -287,7 +287,7 @@ Fields:
   - Each iteration consists of a review turn and (if the verdict is `iterate`) a fix turn. `max_iterations: N` means up to `2N − 1` additional agent turns.
 - `verification_commands` (list of strings)
   - Shell commands executed during each review iteration. Required when `enabled` is true.
-  - Each command runs in its own subprocess with the workspace as `cwd` and a per-command timeout. Its process group, its Job Object on Windows, is terminated when it exits or times out, and its exit status decides whether it passed.
+  - Each command runs in its own subprocess with the workspace as `cwd` and a per-command timeout. Its process group, its Job Object on Windows, is terminated when it exits, times out, or is cancelled, and its exit status decides whether it passed.
 - `verification_timeout_ms` (integer)
   - Per-command timeout in milliseconds. Default: `120000` (2 minutes).
 - `max_diff_bytes` (integer)

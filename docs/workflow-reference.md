@@ -631,7 +631,7 @@ The self-review section configures an optional post-coding verification and iter
 
 **Turn Accounting:** `max_iterations: N` means up to `2N − 1` additional agent turns (N review turns + N−1 fix turns). For the default `max_iterations: 3`, this is up to 5 additional turns beyond the coding turn loop. Plan token budgets accordingly.
 
-**Process lifetime:** Each verification command's process group (its Job Object on Windows) is terminated when it exits or times out, and its exit status alone decides whether it passed. When a command exits on its own and its termination reached a process it left running, Sortie logs one INFO record, `leftover processes terminated after the command exited`, carrying `command`.
+**Process lifetime:** Each verification command's process group (its Job Object on Windows) is terminated when it exits, times out, or is cancelled, and its exit status alone decides whether it passed. When a command exits on its own and its termination reached a process it left running, Sortie logs one INFO record, `leftover processes terminated after the command exited`, carrying `command`.
 
 **Validation rules:**
 
@@ -701,7 +701,7 @@ reactions:
       timeout_ms: 120000
 ```
 
-**Execution environment.** The command runs with the per-issue workspace directory as its working directory, through the same machinery as `hooks.before_run`: the same restricted environment, the termination of its whole process group when it exits or times out, and the same 8 KiB captured output tail. It receives the four variables every hook receives (`SORTIE_ISSUE_ID`, `SORTIE_ISSUE_IDENTIFIER`, `SORTIE_WORKSPACE`, `SORTIE_ATTEMPT`), `SORTIE_SSH_HOST` when a host preference is set, and three of its own:
+**Execution environment.** The command runs with the per-issue workspace directory as its working directory, through the same machinery as `hooks.before_run`: the same restricted environment, the termination of its whole process group when it exits, times out, or is cancelled, and the same 8 KiB captured output tail. It receives the four variables every hook receives (`SORTIE_ISSUE_ID`, `SORTIE_ISSUE_IDENTIFIER`, `SORTIE_WORKSPACE`, `SORTIE_ATTEMPT`), `SORTIE_SSH_HOST` when a host preference is set, and three of its own:
 
 | Variable                | Value                                                                                                    |
 | ----------------------- | -------------------------------------------------------------------------------------------------------- |
