@@ -85,7 +85,7 @@ If the implementation exposes a synchronous runtime snapshot (for dashboards or 
   - `seconds_running` (aggregate runtime seconds as of snapshot time, including active sessions)
   - `unmeasured_sessions` (cumulative count of ended sessions whose usage was never recorded; persisted alongside the counters above and restored on startup, so it names what they excluded across every restart, not just the current process)
   - `running_unreported` (count of the current running set whose kind reports usage but no figure has arrived yet)
-  - `running_non_reporting` (count of the current running set whose kind reports no usage at all, so it never will)
+  - `running_non_reporting` (count of the current running set whose resolved `usage_arrival` is `none`; any figure such a session's runtime sends is discarded, so it never adds to the counters above)
 - `rate_limits` (latest coding-agent rate limit payload, if available)
 - `budget_exhausted_count` (number of issues currently blocked by a re-dispatch budget; always present)
 - `budget_exhausted` (list of blocked-issue records, sorted by identifier; always present, empty when the set is empty). Each record carries the issue's ID and identifier, the reason (`token_budget` or `session_budget`; `token_budget` takes precedence over `session_budget` when one issue reaches both gates), the used and budgeted session and token counts, and the time the hold began. The set is rebuilt per tick from those two gates (Section 8.4) and also updated by the retry lane when it discovers a hold between ticks.

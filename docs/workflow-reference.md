@@ -1559,7 +1559,10 @@ Returns the system-wide runtime state including running sessions, retry queue, a
     "output_tokens": 2400,
     "total_tokens": 7400,
     "cache_read_tokens": 1500,
-    "seconds_running": 1834.2
+    "seconds_running": 1834.2,
+    "unmeasured_sessions": 2,
+    "running_unreported": 1,
+    "running_non_reporting": 0
   },
   "rate_limits": {}
 }
@@ -1591,8 +1594,13 @@ Returns the system-wide runtime state including running sessions, retry queue, a
 | `total_tokens`      | integer | Total tokens consumed.                                                                                  |
 | `cache_read_tokens` | integer | Total cache-read tokens across all sessions. Follows the same cumulative-delta accounting as other token counters. |
 | `seconds_running`   | number  | Aggregate wall-clock runtime — completed-session time plus elapsed time from currently running sessions. |
+| `unmeasured_sessions` | integer | Ended sessions whose token usage was never recorded, which the token totals above leave out. Survives a restart. |
+| `running_unreported` | integer | Running sessions whose `usage_arrival` reports usage but that have not reported a figure yet. |
+| `running_non_reporting` | integer | Running sessions whose `usage_arrival` is `none`. |
 
-A session whose `usage_arrival` is `none` contributes nothing to these totals, even when its runtime reports a figure.
+A session whose `usage_arrival` is `none` contributes nothing to the token totals, even when its runtime reports a figure.
+
+`cost_unpriced_running` is a top-level field, present, zero included, whenever `token_rates` configures a rate for any agent kind, and omitted otherwise. It counts the running, measured sessions that `active_estimated_cost_usd` leaves out because their agent kind has no rate. `active_estimated_cost_usd` sums the estimated USD cost of the running, measured sessions that have one, and is omitted when none of them prices.
 
 #### `GET /api/v1/{identifier}` — Per-Issue Detail
 
