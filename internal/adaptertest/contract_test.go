@@ -114,6 +114,7 @@ const (
 	ruleIDENTITY  contractRule = "IDENTITY"
 	ruleSTOPGRACE contractRule = "STOPGRACE"
 	ruleCAPTURE   contractRule = "CAPTURE"
+	ruleSINK      contractRule = "SINK"
 )
 
 // Family roots and the orchestrator path rule IMPORT matches an import
@@ -525,6 +526,25 @@ var contractCaptureDotImportPaths = map[string]bool{
 	"golang.org/x/sys/windows": true,
 }
 
+// contractBoundedSinkTypes names the sink types [procutil.CaptureParams]'s
+// own contract admits for Stdout and Stderr: [procutil.Capture.Wait]
+// copies into them and [sinkWriter.seal] takes the same lock a Write
+// holds, so a Write that blocks holds Wait open past every bound it
+// otherwise honours. Each entry here returns from Write immediately
+// rather than pushing bytes to a slow consumer - it discards, caps, or
+// simply grows in memory - which is what makes it safe. A sink type
+// absent from this map is presumed capable of blocking until rule SINK
+// is deliberately extended to admit it.
+var contractBoundedSinkTypes = map[string]string{
+	"bytes.Buffer":  "grows in memory and never blocks on Write",
+	"limitedBuffer": "drops the earliest bytes once its cap is exceeded",
+	"cappedWriter":  "discards bytes past its cap and always reports success",
+}
+
+// contractSinkTypeOwner is the map rule SINK directs a caller to extend
+// when a new bounded sink type needs admitting.
+const contractSinkTypeOwner = "contractBoundedSinkTypes"
+
 // contractCmdIndex records, for one package's non-test files, every
 // top-level function and method whose result list includes *exec.Cmd
 // or exec.Cmd: a function is keyed by "importPath.Name", a method by
@@ -816,10 +836,170 @@ func contractExprIsCmdBound(execName string, idx *contractCmdIndex, importPath s
 	return false
 }
 
-// checkContractCaptureFile reports every rule CAPTURE violation in
-// file, using idx and fields already built across the whole package
-// file belongs to.
-func checkContractCaptureFile(fset *token.FileSet, file *ast.File, importPath string, idx *contractCmdIndex, fields contractCmdFields) []contractViolation {
+// contractSinkTypeName returns the contractBoundedSinkTypes key a type
+// expression names: "bytes.Buffer" for a selector resolving to the
+// file's own import of "bytes", or the bare identifier for a
+// package-local type such as limitedBuffer or cappedWriter. It returns
+// "" for any type this rule does not recognize, so an unrecognized
+// type is treated as unbounded rather than silently accepted.
+func contractSinkTypeName(bytesName string, expr ast.Expr) string {
+	switch e := expr.(type) {
+	case *ast.Ident:
+		return e.Name
+	case *ast.SelectorExpr:
+		if ident, ok := e.X.(*ast.Ident); ok && bytesName != "" && ident.Name == bytesName && e.Sel.Name == "Buffer" {
+			return "bytes.Buffer"
+		}
+	}
+	return ""
+}
+
+// contractSinkTypeFromValue returns the contractBoundedSinkTypes key
+// for a value expression that constructs a sink directly, looking
+// through a leading address-of the way unwrapCompositeLit does, so
+// both "T{}" and "&T{}" resolve to T's name. It returns "" when expr is
+// not a composite literal.
+func contractSinkTypeFromValue(bytesName string, expr ast.Expr) string {
+	lit, ok := unwrapCompositeLit(expr)
+	if !ok {
+		return ""
+	}
+	return contractSinkTypeName(bytesName, lit.Type)
+}
+
+// contractCollectSinkVarTypes maps every local variable fn's body binds
+// to a recognized sink type - by "var x T" or "var x T = ..." and by
+// "x := T{...}" or "x := &T{...}" - to that type's
+// contractBoundedSinkTypes key, the same way contractCollectBoundNames
+// tracks exec.Cmd- and os.Process-bound names for rule CAPTURE.
+func contractCollectSinkVarTypes(bytesName string, fn *ast.FuncDecl) map[string]string {
+	sinkTypes := map[string]string{}
+	if fn.Body == nil {
+		return sinkTypes
+	}
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		switch s := n.(type) {
+		case *ast.DeclStmt:
+			gd, ok := s.Decl.(*ast.GenDecl)
+			if !ok || gd.Tok != token.VAR {
+				return true
+			}
+			for _, spec := range gd.Specs {
+				vs, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				if vs.Type != nil {
+					if typeName := contractSinkTypeName(bytesName, vs.Type); typeName != "" {
+						for _, name := range vs.Names {
+							sinkTypes[name.Name] = typeName
+						}
+					}
+				}
+				for i, val := range vs.Values {
+					if i >= len(vs.Names) {
+						continue
+					}
+					if typeName := contractSinkTypeFromValue(bytesName, val); typeName != "" {
+						sinkTypes[vs.Names[i].Name] = typeName
+					}
+				}
+			}
+		case *ast.AssignStmt:
+			for i, rhs := range s.Rhs {
+				if i >= len(s.Lhs) {
+					continue
+				}
+				ident, ok := s.Lhs[i].(*ast.Ident)
+				if !ok {
+					continue
+				}
+				if typeName := contractSinkTypeFromValue(bytesName, rhs); typeName != "" {
+					sinkTypes[ident.Name] = typeName
+				}
+			}
+		}
+		return true
+	})
+	return sinkTypes
+}
+
+// contractResolveSinkType reports the contractBoundedSinkTypes key expr
+// resolves to via sinkTypes, and whether expr is the literal nil, which
+// [procutil.CaptureParams] accepts unconditionally in place of a
+// writer. An expression this function cannot resolve - a call, a
+// selector into an unrecognized value such as os.Stdout, or an
+// identifier sinkTypes never bound - reports "", false: unresolved is
+// treated as unbounded rather than accepted.
+func contractResolveSinkType(bytesName string, sinkTypes map[string]string, expr ast.Expr) (typeName string, isNil bool) {
+	switch e := expr.(type) {
+	case *ast.Ident:
+		if e.Name == "nil" {
+			return "", true
+		}
+		return sinkTypes[e.Name], false
+	case *ast.UnaryExpr:
+		if e.Op != token.AND {
+			return "", false
+		}
+		switch x := e.X.(type) {
+		case *ast.Ident:
+			return sinkTypes[x.Name], false
+		case *ast.CompositeLit:
+			return contractSinkTypeName(bytesName, x.Type), false
+		}
+		return "", false
+	case *ast.CompositeLit:
+		return contractSinkTypeName(bytesName, e.Type), false
+	}
+	return "", false
+}
+
+// contractIsCaptureParamsLit reports whether lit's type is
+// procName.CaptureParams, procName being the local identifier the file
+// binds to [procutil]'s import path.
+func contractIsCaptureParamsLit(procName string, lit *ast.CompositeLit) bool {
+	if procName == "" {
+		return false
+	}
+	sel, ok := lit.Type.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	ident, ok := sel.X.(*ast.Ident)
+	return ok && ident.Name == procName && sel.Sel.Name == "CaptureParams"
+}
+
+// checkContractCaptureSinkFields reports a rule SINK violation for each
+// of lit's Stdout and Stderr fields that is set and does not resolve,
+// via sinkTypes, to nil or a type contractBoundedSinkTypes admits.
+func checkContractCaptureSinkFields(fset *token.FileSet, lit *ast.CompositeLit, bytesName string, sinkTypes map[string]string) []contractViolation {
+	var violations []contractViolation
+	for _, field := range [2]string{"Stdout", "Stderr"} {
+		value := compositeLitKeyValue(lit, field)
+		if value == nil {
+			continue
+		}
+		typeName, isNil := contractResolveSinkType(bytesName, sinkTypes, value)
+		if isNil {
+			continue
+		}
+		if _, ok := contractBoundedSinkTypes[typeName]; ok {
+			continue
+		}
+		violations = append(violations, contractViolation{
+			pos:  fset.Position(value.Pos()),
+			text: "CaptureParams." + field + " passes a writer not accepted as bounded; extend " + contractSinkTypeOwner + " to admit it deliberately",
+		})
+	}
+	return violations
+}
+
+// checkContractCaptureFile reports every rule CAPTURE and rule SINK
+// violation in file, using idx and fields already built across the
+// whole package file belongs to. Rule SINK is skipped when dirName is
+// exempt from it.
+func checkContractCaptureFile(fset *token.FileSet, file *ast.File, importPath, dirName string, idx *contractCmdIndex, fields contractCmdFields) []contractViolation {
 	var violations []contractViolation
 
 	for _, imp := range file.Imports {
@@ -840,10 +1020,13 @@ func checkContractCaptureFile(fset *token.FileSet, file *ast.File, importPath st
 	osName := resolveContractImportName(file, "os")
 	syscallName := resolveContractImportName(file, "syscall")
 	winName := resolveContractImportName(file, "golang.org/x/sys/windows")
-	if execName == "" && osName == "" && syscallName == "" && winName == "" {
+	procName := resolveContractImportName(file, contractProcutilImportPath)
+	if execName == "" && osName == "" && syscallName == "" && winName == "" && procName == "" {
 		return violations
 	}
 	aliasPaths := contractFileImportAliases(file)
+	bytesName := resolveContractImportName(file, "bytes")
+	checkSinks := procName != "" && !contractExempt(dirName, ruleSINK)
 
 	if execName != "" {
 		ast.Inspect(file, func(n ast.Node) bool {
@@ -871,8 +1054,19 @@ func checkContractCaptureFile(fset *token.FileSet, file *ast.File, importPath st
 			continue
 		}
 		cmdNames, procNames := contractCollectBoundNames(execName, osName, idx, importPath, aliasPaths, fn)
+		var sinkTypes map[string]string
+		if checkSinks {
+			sinkTypes = contractCollectSinkVarTypes(bytesName, fn)
+		}
 
 		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			if checkSinks {
+				if lit, ok := n.(*ast.CompositeLit); ok && contractIsCaptureParamsLit(procName, lit) {
+					violations = append(violations, checkContractCaptureSinkFields(fset, lit, bytesName, sinkTypes)...)
+					return true
+				}
+			}
+
 			call, ok := n.(*ast.CallExpr)
 			if !ok {
 				return true
@@ -963,18 +1157,21 @@ func contractBuildModuleCmdIndex(walked []contractWalkedPackage) (*contractCmdIn
 	return idx, fields
 }
 
-// checkContractCapture applies rule CAPTURE to every non-test file in
-// pkg, using idx and fields the caller built ahead of time with
-// contractBuildModuleCmdIndex. A caller checking one package in
-// isolation - a fixture test's single-file package, for instance - may
-// build idx and fields from that same package alone; a caller checking
-// a real tree builds them from every package the walk found, so a
-// cross-package call site resolves against the same index a
-// same-package one does.
+// checkContractCapture applies rule CAPTURE and rule SINK to every
+// non-test file in pkg, using idx and fields the caller built ahead of
+// time with contractBuildModuleCmdIndex. A caller checking one package
+// in isolation - a fixture test's single-file package, for instance -
+// may build idx and fields from that same package alone; a caller
+// checking a real tree builds them from every package the walk found,
+// so a cross-package call site resolves against the same index a
+// same-package one does. Rule SINK honors its own contractAllowlist
+// entry rather than reusing rule CAPTURE's; a caller that skips this
+// function entirely for a rule-CAPTURE-exempt package skips rule SINK
+// for it too, since nothing here runs for that package at all.
 func checkContractCapture(fset *token.FileSet, pkg contractPackage, idx *contractCmdIndex, fields contractCmdFields) []contractViolation {
 	var violations []contractViolation
 	for _, file := range pkg.files {
-		violations = append(violations, checkContractCaptureFile(fset, file, pkg.importPath, idx, fields)...)
+		violations = append(violations, checkContractCaptureFile(fset, file, pkg.importPath, pkg.dirName, idx, fields)...)
 	}
 	return violations
 }
@@ -2324,8 +2521,10 @@ func contractWalkCaptureAndTeardown(t *testing.T, fset *token.FileSet) []contrac
 // cmd/ and internal/, excluding testdata, and fails when a file starts
 // a process, waits on one, or wires an exec.Cmd's output or
 // cancellation directly, outside procutil and the named test-support
-// packages (rule CAPTURE), or assigns an exec.Cmd teardown field by
-// hand (rule TEARDOWN).
+// packages (rule CAPTURE); passes a CaptureParams.Stdout or
+// CaptureParams.Stderr that does not resolve to nil or a type
+// contractBoundedSinkTypes admits (rule SINK); or assigns an exec.Cmd
+// teardown field by hand (rule TEARDOWN).
 func TestContractCaptureAndTeardown(t *testing.T) {
 	fset := token.NewFileSet()
 	walked := contractWalkCaptureAndTeardown(t, fset)
@@ -2934,15 +3133,18 @@ const kind = "claude-code"
 	}
 }
 
-// TestCheckContractCapture_DetectsViolations pins rule CAPTURE's and
-// rule TEARDOWN's own logic against inline source fixtures,
-// independent of the current state of any package under cmd/ or
-// internal/, so a regression is caught even when every real launch
-// site happens to comply. Each fixture is parsed as the single
+// TestCheckContractCapture_DetectsViolations pins rule CAPTURE's, rule
+// SINK's, and rule TEARDOWN's own logic against inline source
+// fixtures, independent of the current state of any package under
+// cmd/ or internal/, so a regression is caught even when every real
+// launch site happens to comply. Each fixture is parsed as the single
 // non-test file of a one-file package named by dirName; every case
-// runs through both checkContractCapture and checkContractTeardown,
-// whose field checks (Stdout/Stderr and Cancel/WaitDelay) never
-// overlap.
+// runs through both checkContractCapture and checkContractTeardown.
+// Rule CAPTURE's own Stdout/Stderr check targets a direct assignment
+// to exec.Cmd.Stdout or exec.Cmd.Stderr; rule SINK's targets a field of
+// that name inside a procutil.CaptureParams composite literal instead,
+// so the two never match the same syntax, and TEARDOWN's Cancel and
+// WaitDelay checks overlap with neither.
 func TestCheckContractCapture_DetectsViolations(t *testing.T) {
 	t.Parallel()
 
@@ -3307,6 +3509,146 @@ func launch(cmd *exec.Cmd) {
 			wantCount:  1,
 			wantSubstr: "call procutil.SetGroupCancel or procutil.SetGroupKill",
 		},
+		{
+			// The negative control: an os.Pipe write end is exactly the
+			// sink [CaptureParams] warns against, since a reader that
+			// stops draining it blocks Write and holds seal, and so
+			// Wait, open indefinitely. Reproduces StartCapture's real
+			// call shape rather than a synthetic type.
+			name:       "an os.Pipe write end passed as a capture sink is rejected",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import (
+	"os"
+	"os/exec"
+
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
+)
+
+func run(cmd *exec.Cmd) error {
+	_, w, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	_, startErr := procutil.StartCapture(cmd, procutil.CaptureParams{Stdout: w})
+	return startErr
+}
+`,
+			wantCount:  1,
+			wantSubstr: "CaptureParams.Stdout passes a writer not accepted as bounded",
+		},
+		{
+			name:       "os.Stdout passed directly as a capture sink is rejected",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import (
+	"os"
+	"os/exec"
+
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
+)
+
+func run(cmd *exec.Cmd) error {
+	_, err := procutil.RunCapture(cmd, procutil.DefaultStopGrace, procutil.CaptureParams{Stdout: os.Stdout, Stderr: os.Stderr})
+	return err
+}
+`,
+			wantCount: 2,
+		},
+		{
+			// The positive control, reproducing the shape every real
+			// call site outside procutil uses: a local bytes.Buffer,
+			// addressed and shared by both streams.
+			name:       "a bytes.Buffer capture sink is accepted",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import (
+	"bytes"
+	"os/exec"
+
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
+)
+
+func run(cmd *exec.Cmd) error {
+	var combined bytes.Buffer
+	_, startErr := procutil.StartCapture(cmd, procutil.CaptureParams{Stdout: &combined, Stderr: &combined})
+	return startErr
+}
+`,
+			wantCount: 0,
+		},
+		{
+			// Reproduces workspace.RunHook's real shape: a package-local
+			// bounded writer built with "&T{...}" and shared by both
+			// streams, admitted through contractBoundedSinkTypes by name
+			// rather than by structural inspection of its Write method.
+			name:       "a locally-declared bounded writer capture sink is accepted",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import (
+	"os/exec"
+
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
+)
+
+type limitedBuffer struct{ max int }
+
+func (lb *limitedBuffer) Write(p []byte) (int, error) { return len(p), nil }
+
+func run(cmd *exec.Cmd) error {
+	buf := &limitedBuffer{max: 1024}
+	_, startErr := procutil.StartCapture(cmd, procutil.CaptureParams{Stdout: buf, Stderr: buf})
+	return startErr
+}
+`,
+			wantCount: 0,
+		},
+		{
+			name:       "an explicit nil capture sink is accepted",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import (
+	"os/exec"
+
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
+)
+
+func run(cmd *exec.Cmd) error {
+	_, startErr := procutil.StartCapture(cmd, procutil.CaptureParams{Stdout: nil})
+	return startErr
+}
+`,
+			wantCount: 0,
+		},
+		{
+			name:       "a CaptureParams literal naming neither Stdout nor Stderr is accepted",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import (
+	"os/exec"
+
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
+)
+
+func run(cmd *exec.Cmd) error {
+	_, startErr := procutil.RunCapture(cmd, procutil.DefaultStopGrace, procutil.CaptureParams{})
+	return startErr
+}
+`,
+			wantCount: 0,
+		},
 	}
 
 	for _, tt := range tests {
@@ -3501,8 +3843,8 @@ func contractCheckStopGraceAllowlist(r contractIdentityReporter, found map[strin
 }
 
 // contractCaptureTeardownEvaluationRoots names the three roots the
-// CAPTURE and TEARDOWN staleness guards each require at least one
-// evaluated, non-exempt file under.
+// CAPTURE, SINK, and TEARDOWN staleness guards each require at least
+// one evaluated, non-exempt file under.
 var contractCaptureTeardownEvaluationRoots = []string{
 	"github.com/sortie-ai/sortie/internal/agent",
 	"github.com/sortie-ai/sortie/internal/orchestrator",
@@ -3677,8 +4019,8 @@ func TestContractStopGraceRule_StalenessGuardCatchesRealBreaks(t *testing.T) {
 }
 
 // TestContractCaptureAndTeardownRule_AppliesAndStaysCurrent guards
-// rules CAPTURE and TEARDOWN against going stale: each fails when it
-// was evaluated for no non-exempt file under internal/agent,
+// rules CAPTURE, SINK, and TEARDOWN against going stale: each fails
+// when it was evaluated for no non-exempt file under internal/agent,
 // internal/orchestrator, or internal/workspace, or when a
 // contractAllowlist entry naming it names a directory the walk did not
 // find.
@@ -3693,6 +4035,8 @@ func TestContractCaptureAndTeardownRule_AppliesAndStaysCurrent(t *testing.T) {
 
 	contractCheckWideRuleEvaluated(t, ruleCAPTURE, walked)
 	contractCheckWideRuleAllowlist(t, ruleCAPTURE, found)
+	contractCheckWideRuleEvaluated(t, ruleSINK, walked)
+	contractCheckWideRuleAllowlist(t, ruleSINK, found)
 	contractCheckWideRuleEvaluated(t, ruleTEARDOWN, walked)
 	contractCheckWideRuleAllowlist(t, ruleTEARDOWN, found)
 }
@@ -3707,7 +4051,7 @@ func TestContractCaptureAndTeardownRule_AppliesAndStaysCurrent(t *testing.T) {
 // contractAllowlist, which a concurrently-running fixture test also
 // reads, so neither subtest runs in parallel.
 func TestContractCaptureAndTeardownRule_StalenessGuardCatchesRealBreaks(t *testing.T) {
-	for _, rule := range []contractRule{ruleCAPTURE, ruleTEARDOWN} {
+	for _, rule := range []contractRule{ruleCAPTURE, ruleSINK, ruleTEARDOWN} {
 		t.Run(string(rule)+": zero files evaluated under a required root", func(t *testing.T) {
 			walked := []contractWalkedPackage{
 				{pkg: contractPackage{dirName: "fixture", importPath: "github.com/sortie-ai/sortie/internal/tracker/fixture"}},
