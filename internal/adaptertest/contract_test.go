@@ -113,6 +113,7 @@ const (
 	ruleBLOCKER   contractRule = "BLOCKER"
 	ruleIDENTITY  contractRule = "IDENTITY"
 	ruleSTOPGRACE contractRule = "STOPGRACE"
+	ruleCAPTURE   contractRule = "CAPTURE"
 )
 
 // Family roots and the orchestrator path rule IMPORT matches an import
@@ -162,7 +163,7 @@ type contractSharedPackage struct {
 // orchestrator's production code.
 var contractSharedFamilyPackages = map[string]contractSharedPackage{
 	"github.com/sortie-ai/sortie/internal/scm/scmcore":                     {reason: "shared forge decision core; registers no kind and holds no adapter", coreImportable: true},
-	"github.com/sortie-ai/sortie/internal/agent/procutil":                  {reason: "shared subprocess group handling; registers no kind and holds no adapter", coreImportable: true},
+	"github.com/sortie-ai/sortie/internal/agent/procutil":                  {reason: "shared subprocess group handling, Windows process containment, and bounded output capture; registers no kind and holds no adapter", coreImportable: true},
 	"github.com/sortie-ai/sortie/internal/agent/agentcore":                 {reason: "shared agent session, event, and disposition core; registers no kind and holds no adapter", coreImportable: true},
 	"github.com/sortie-ai/sortie/internal/agent/mcpconfig":                 {reason: "shared MCP configuration parsing; registers no kind and holds no adapter", coreImportable: true},
 	"github.com/sortie-ai/sortie/internal/agent/sshutil":                   {reason: "shared SSH invocation helpers; registers no kind and holds no adapter", coreImportable: true},
@@ -192,8 +193,18 @@ var contractAllowlist = map[string]map[contractRule]string{
 		ruleHOOK: "no HTTP, no credential, no remote project, and no config to validate",
 	},
 	"procutil": {
-		ruleTEARDOWN:  "owns SetGroupCancel, the helper every other launcher calls",
+		ruleTEARDOWN:  "owns SetGroupCancel and SetGroupKill, the helpers every other launcher calls",
 		ruleSTOPGRACE: "owns DefaultStopGrace, the fallback every other family reaches through StopGrace",
+		ruleCAPTURE:   "owns StartCapture and RunCapture, the capture every other launcher calls",
+	},
+	"agenttest": {
+		ruleCAPTURE: "test-support package that cmd/sortie does not link",
+	},
+	"probe": {
+		ruleCAPTURE: "test-support package that cmd/sortie does not link",
+	},
+	"e2e": {
+		ruleCAPTURE: "test-support package that cmd/sortie does not link",
 	},
 }
 
@@ -472,7 +483,7 @@ var contractTeardownFields = map[string]bool{
 }
 
 // contractTeardownOwner is the helper rule TEARDOWN directs a launcher to.
-const contractTeardownOwner = "procutil.SetGroupCancel"
+const contractTeardownOwner = "procutil.SetGroupCancel or procutil.SetGroupKill"
 
 // checkContractTeardown reports a violation for every assignment to an
 // exec.Cmd teardown field in file. It reads file only when file imports
@@ -499,6 +510,416 @@ func checkContractTeardown(fset *token.FileSet, file *ast.File) []contractViolat
 		}
 		return true
 	})
+	return violations
+}
+
+// contractCaptureOwner is the helper rule CAPTURE directs a caller to.
+const contractCaptureOwner = "procutil.RunCapture or procutil.StartCapture"
+
+// contractCaptureDotImportPaths names the four import paths a dot
+// import of which hides every call rule CAPTURE looks for.
+var contractCaptureDotImportPaths = map[string]bool{
+	"os/exec":                  true,
+	"os":                       true,
+	"syscall":                  true,
+	"golang.org/x/sys/windows": true,
+}
+
+// contractCmdIndex records, for one package's non-test files, every
+// top-level function and method whose result list includes *exec.Cmd
+// or exec.Cmd: a function is keyed by "importPath.Name", a method by
+// its bare name alone, since a call site names a method with no
+// receiver-type qualifier.
+type contractCmdIndex struct {
+	funcs   map[string]bool
+	methods map[string]bool
+}
+
+// contractCmdFields records, for one package's non-test files, every
+// struct field name declared with type *exec.Cmd or exec.Cmd.
+type contractCmdFields map[string]bool
+
+// contractTypeIsExecCmd reports whether expr, a field or result type
+// expression, names exec.Cmd or *exec.Cmd under file's own import name
+// for os/exec.
+func contractTypeIsExecCmd(execName string, expr ast.Expr) bool {
+	if execName == "" {
+		return false
+	}
+	if star, ok := expr.(*ast.StarExpr); ok {
+		expr = star.X
+	}
+	sel, ok := expr.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	ident, ok := sel.X.(*ast.Ident)
+	return ok && ident.Name == execName && sel.Sel.Name == "Cmd"
+}
+
+// contractTypeIsOSProcess reports whether expr names *os.Process under
+// file's own import name for os.
+func contractTypeIsOSProcess(osName string, expr ast.Expr) bool {
+	if osName == "" {
+		return false
+	}
+	star, ok := expr.(*ast.StarExpr)
+	if !ok {
+		return false
+	}
+	sel, ok := star.X.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	ident, ok := sel.X.(*ast.Ident)
+	return ok && ident.Name == osName && sel.Sel.Name == "Process"
+}
+
+// contractBuildCmdIndex adds every exec.Cmd-returning top-level
+// function and method declared in file to idx, and every exec.Cmd-typed
+// struct field to fields.
+func contractBuildCmdIndex(file *ast.File, importPath string, idx *contractCmdIndex, fields contractCmdFields) {
+	execName := resolveContractImportName(file, "os/exec")
+	if execName == "" {
+		return
+	}
+	for _, decl := range file.Decls {
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			if d.Type.Results == nil {
+				continue
+			}
+			returnsCmd := false
+			for _, res := range d.Type.Results.List {
+				if contractTypeIsExecCmd(execName, res.Type) {
+					returnsCmd = true
+					break
+				}
+			}
+			if !returnsCmd {
+				continue
+			}
+			if d.Recv != nil {
+				idx.methods[d.Name.Name] = true
+			} else {
+				idx.funcs[importPath+"."+d.Name.Name] = true
+			}
+		case *ast.GenDecl:
+			if d.Tok != token.TYPE {
+				continue
+			}
+			for _, spec := range d.Specs {
+				ts, ok := spec.(*ast.TypeSpec)
+				if !ok {
+					continue
+				}
+				st, ok := ts.Type.(*ast.StructType)
+				if !ok || st.Fields == nil {
+					continue
+				}
+				for _, f := range st.Fields.List {
+					if !contractTypeIsExecCmd(execName, f.Type) {
+						continue
+					}
+					for _, name := range f.Names {
+						fields[name.Name] = true
+					}
+				}
+			}
+		}
+	}
+}
+
+// contractCmdBoundCall reports whether expr is a call to exec.Command,
+// exec.CommandContext, or a function or method contractBuildCmdIndex
+// indexed as returning an exec.Cmd.
+func contractCmdBoundCall(execName string, idx *contractCmdIndex, importPath string, expr ast.Expr) bool {
+	call, ok := expr.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	switch fn := call.Fun.(type) {
+	case *ast.SelectorExpr:
+		if ident, ok := fn.X.(*ast.Ident); ok && execName != "" && ident.Name == execName &&
+			(fn.Sel.Name == "Command" || fn.Sel.Name == "CommandContext") {
+			return true
+		}
+		return idx.methods[fn.Sel.Name]
+	case *ast.Ident:
+		return idx.funcs[importPath+"."+fn.Name]
+	}
+	return false
+}
+
+// contractProcessBoundExpr reports whether expr is a selector naming
+// field Process, or a call to os.StartProcess or os.FindProcess.
+func contractProcessBoundExpr(osName string, expr ast.Expr) bool {
+	switch e := expr.(type) {
+	case *ast.SelectorExpr:
+		return e.Sel.Name == "Process"
+	case *ast.CallExpr:
+		sel, ok := e.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return false
+		}
+		ident, ok := sel.X.(*ast.Ident)
+		return ok && osName != "" && ident.Name == osName && (sel.Sel.Name == "StartProcess" || sel.Sel.Name == "FindProcess")
+	}
+	return false
+}
+
+// contractCollectBoundNames walks fn once and returns the set of local
+// identifiers (parameters, var declarations, and assignment targets)
+// bound to an exec.Cmd and the set bound to an *os.Process, per the
+// rules contractCmdBoundCall and contractProcessBoundExpr apply to
+// their declaration or the value they were last assigned from.
+func contractCollectBoundNames(execName, osName string, idx *contractCmdIndex, importPath string, fn *ast.FuncDecl) (cmdNames, procNames map[string]bool) {
+	cmdNames = map[string]bool{}
+	procNames = map[string]bool{}
+
+	addFieldList := func(fl *ast.FieldList) {
+		if fl == nil {
+			return
+		}
+		for _, f := range fl.List {
+			switch {
+			case contractTypeIsExecCmd(execName, f.Type):
+				for _, n := range f.Names {
+					cmdNames[n.Name] = true
+				}
+			case contractTypeIsOSProcess(osName, f.Type):
+				for _, n := range f.Names {
+					procNames[n.Name] = true
+				}
+			}
+		}
+	}
+	if fn.Recv != nil {
+		addFieldList(fn.Recv)
+	}
+	addFieldList(fn.Type.Params)
+
+	if fn.Body == nil {
+		return cmdNames, procNames
+	}
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		switch s := n.(type) {
+		case *ast.DeclStmt:
+			gd, ok := s.Decl.(*ast.GenDecl)
+			if !ok || gd.Tok != token.VAR {
+				return true
+			}
+			for _, spec := range gd.Specs {
+				vs, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				if vs.Type != nil {
+					switch {
+					case contractTypeIsExecCmd(execName, vs.Type):
+						for _, n2 := range vs.Names {
+							cmdNames[n2.Name] = true
+						}
+					case contractTypeIsOSProcess(osName, vs.Type):
+						for _, n2 := range vs.Names {
+							procNames[n2.Name] = true
+						}
+					}
+				}
+				for i, val := range vs.Values {
+					if i >= len(vs.Names) {
+						continue
+					}
+					if contractCmdBoundCall(execName, idx, importPath, val) {
+						cmdNames[vs.Names[i].Name] = true
+					}
+					if contractProcessBoundExpr(osName, val) {
+						procNames[vs.Names[i].Name] = true
+					}
+				}
+			}
+		case *ast.AssignStmt:
+			for i, rhs := range s.Rhs {
+				if i >= len(s.Lhs) {
+					continue
+				}
+				ident, ok := s.Lhs[i].(*ast.Ident)
+				if !ok {
+					continue
+				}
+				if contractCmdBoundCall(execName, idx, importPath, rhs) {
+					cmdNames[ident.Name] = true
+				}
+				if contractProcessBoundExpr(osName, rhs) {
+					procNames[ident.Name] = true
+				}
+			}
+		}
+		return true
+	})
+	return cmdNames, procNames
+}
+
+// contractExprIsCmdBound reports whether expr, a Start/Run/Wait call's
+// receiver, is bound to an exec.Cmd: a direct exec.Command or
+// exec.CommandContext call, a call to an indexed function or method, a
+// local identifier contractCollectBoundNames marked, or a selector
+// whose field fields declares as an exec.Cmd.
+func contractExprIsCmdBound(execName string, idx *contractCmdIndex, importPath string, cmdNames map[string]bool, fields contractCmdFields, expr ast.Expr) bool {
+	switch e := expr.(type) {
+	case *ast.Ident:
+		return cmdNames[e.Name]
+	case *ast.CallExpr:
+		return contractCmdBoundCall(execName, idx, importPath, e)
+	case *ast.SelectorExpr:
+		return fields[e.Sel.Name]
+	}
+	return false
+}
+
+// checkContractCaptureFile reports every rule CAPTURE violation in
+// file, using idx and fields already built across the whole package
+// file belongs to.
+func checkContractCaptureFile(fset *token.FileSet, file *ast.File, importPath string, idx *contractCmdIndex, fields contractCmdFields) []contractViolation {
+	var violations []contractViolation
+
+	for _, imp := range file.Imports {
+		if imp.Name == nil || imp.Name.Name != "." {
+			continue
+		}
+		path, err := strconv.Unquote(imp.Path.Value)
+		if err != nil || !contractCaptureDotImportPaths[path] {
+			continue
+		}
+		violations = append(violations, contractViolation{
+			pos:  fset.Position(imp.Pos()),
+			text: "dot-imports " + path + ", which hides process launches from this rule; import it by name",
+		})
+	}
+
+	execName := resolveContractImportName(file, "os/exec")
+	osName := resolveContractImportName(file, "os")
+	syscallName := resolveContractImportName(file, "syscall")
+	winName := resolveContractImportName(file, "golang.org/x/sys/windows")
+	if execName == "" && osName == "" && syscallName == "" && winName == "" {
+		return violations
+	}
+
+	if execName != "" {
+		ast.Inspect(file, func(n ast.Node) bool {
+			assign, ok := n.(*ast.AssignStmt)
+			if !ok {
+				return true
+			}
+			for _, lhs := range assign.Lhs {
+				sel, isSel := lhs.(*ast.SelectorExpr)
+				if !isSel || (sel.Sel.Name != "Stdout" && sel.Sel.Name != "Stderr") {
+					continue
+				}
+				violations = append(violations, contractViolation{
+					pos:  fset.Position(sel.Pos()),
+					text: "assigns exec.Cmd." + sel.Sel.Name + " directly; call " + contractCaptureOwner,
+				})
+			}
+			return true
+		})
+	}
+
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Body == nil {
+			continue
+		}
+		cmdNames, procNames := contractCollectBoundNames(execName, osName, idx, importPath, fn)
+
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+
+			if execName != "" {
+				switch sel.Sel.Name {
+				case "Output", "CombinedOutput", "StdoutPipe", "StderrPipe":
+					violations = append(violations, contractViolation{
+						pos:  fset.Position(call.Pos()),
+						text: "waits on an exec.Cmd directly; call " + contractCaptureOwner,
+					})
+					return true
+				case "Start", "Run":
+					if contractExprIsCmdBound(execName, idx, importPath, cmdNames, fields, sel.X) {
+						violations = append(violations, contractViolation{
+							pos:  fset.Position(call.Pos()),
+							text: "waits on an exec.Cmd directly; call " + contractCaptureOwner,
+						})
+					}
+					return true
+				}
+			}
+
+			if sel.Sel.Name == "Wait" {
+				if execName != "" && contractExprIsCmdBound(execName, idx, importPath, cmdNames, fields, sel.X) {
+					violations = append(violations, contractViolation{
+						pos:  fset.Position(call.Pos()),
+						text: "waits on an exec.Cmd directly; call " + contractCaptureOwner,
+					})
+					return true
+				}
+				bound := false
+				if ident, isIdent := sel.X.(*ast.Ident); isIdent {
+					bound = procNames[ident.Name]
+				} else if procSel, isSel := sel.X.(*ast.SelectorExpr); isSel {
+					bound = procSel.Sel.Name == "Process"
+				}
+				if bound {
+					violations = append(violations, contractViolation{
+						pos:  fset.Position(call.Pos()),
+						text: "waits on an os.Process directly; call " + contractCaptureOwner,
+					})
+					return true
+				}
+			}
+
+			ident, isIdent := sel.X.(*ast.Ident)
+			if !isIdent {
+				return true
+			}
+			raw := (osName != "" && ident.Name == osName && sel.Sel.Name == "StartProcess") ||
+				(syscallName != "" && ident.Name == syscallName && (sel.Sel.Name == "StartProcess" || sel.Sel.Name == "ForkExec")) ||
+				(winName != "" && ident.Name == winName && (sel.Sel.Name == "CreateProcess" || sel.Sel.Name == "CreateProcessAsUser"))
+			if raw {
+				violations = append(violations, contractViolation{
+					pos:  fset.Position(call.Pos()),
+					text: "starts a process outside os/exec; call " + contractCaptureOwner,
+				})
+			}
+			return true
+		})
+	}
+
+	return violations
+}
+
+// checkContractCapture applies rule CAPTURE to every non-test file in
+// pkg, building the function, method, and struct-field index from
+// pkg.files alone: a package's own exec.Cmd-returning helper and its
+// call site are always parsed together, whether pkg is one directory
+// from a tree walk or one fixture package built from a single file.
+func checkContractCapture(fset *token.FileSet, pkg contractPackage) []contractViolation {
+	idx := &contractCmdIndex{funcs: map[string]bool{}, methods: map[string]bool{}}
+	fields := contractCmdFields{}
+	for _, file := range pkg.files {
+		contractBuildCmdIndex(file, pkg.importPath, idx, fields)
+	}
+
+	var violations []contractViolation
+	for _, file := range pkg.files {
+		violations = append(violations, checkContractCaptureFile(fset, file, pkg.importPath, idx, fields)...)
+	}
 	return violations
 }
 
@@ -756,9 +1177,6 @@ func checkCoreContractPackage(fset *token.FileSet, pkg contractPackage) []contra
 	var violations []contractViolation
 	for _, file := range pkg.files {
 		violations = append(violations, checkContractCoreImports(fset, file, false)...)
-		if !contractExempt(pkg.dirName, ruleTEARDOWN) {
-			violations = append(violations, checkContractTeardown(fset, file)...)
-		}
 	}
 	for _, file := range pkg.testFiles {
 		violations = append(violations, checkContractCoreImports(fset, file, true)...)
@@ -1612,12 +2030,6 @@ func checkAdapterContractPackage(fset *token.FileSet, pkg contractPackage) []con
 		}
 	}
 
-	if !contractExempt(pkg.dirName, ruleTEARDOWN) {
-		for _, file := range pkg.files {
-			violations = append(violations, checkContractTeardown(fset, file)...)
-		}
-	}
-
 	registers, usedMeta, hasHook, hasBlockerSource, blockerSourceIsPerIssue, factsPos := contractRegistrationFacts(fset, pkg.files)
 
 	if !contractExempt(pkg.dirName, ruleMETRICS) {
@@ -1822,6 +2234,61 @@ func TestCheckOrchestratorContract(t *testing.T) {
 	}
 }
 
+// contractCaptureTeardownRoots names the two roots rules CAPTURE and
+// TEARDOWN walk, the same module-wide scope contractWideIdentityRoots
+// names for rule IDENTITY: every launch site has to reach
+// procutil.RunCapture, procutil.StartCapture, procutil.SetGroupCancel,
+// or procutil.SetGroupKill, whichever family or layer it lives in.
+var contractCaptureTeardownRoots = []struct {
+	dir        string
+	importPath string
+}{
+	{filepath.Join("..", "..", "cmd"), "github.com/sortie-ai/sortie/cmd"},
+	{filepath.Join("..", "..", "internal"), "github.com/sortie-ai/sortie/internal"},
+}
+
+// contractWalkCaptureAndTeardown walks both contractCaptureTeardownRoots
+// through contractWalkRoot, grouping files by directory so rule
+// CAPTURE's function, method, and struct-field index is built from one
+// package's own files, and merges the two roots' packages into one
+// dir-ordered slice.
+func contractWalkCaptureAndTeardown(t *testing.T, fset *token.FileSet) []contractWalkedPackage {
+	t.Helper()
+	var walked []contractWalkedPackage
+	for _, root := range contractCaptureTeardownRoots {
+		rootWalked, _ := contractWalkRoot(t, fset, root.dir, root.importPath)
+		walked = append(walked, rootWalked...)
+	}
+	sort.Slice(walked, func(i, j int) bool { return walked[i].dir < walked[j].dir })
+	return walked
+}
+
+// TestContractCaptureAndTeardown walks every non-test Go file under
+// cmd/ and internal/, excluding testdata, and fails when a file starts
+// a process, waits on one, or wires an exec.Cmd's output or
+// cancellation directly, outside procutil and the named test-support
+// packages (rule CAPTURE), or assigns an exec.Cmd teardown field by
+// hand (rule TEARDOWN).
+func TestContractCaptureAndTeardown(t *testing.T) {
+	fset := token.NewFileSet()
+	walked := contractWalkCaptureAndTeardown(t, fset)
+
+	for _, w := range walked {
+		if !contractExempt(w.pkg.dirName, ruleCAPTURE) {
+			for _, v := range checkContractCapture(fset, w.pkg) {
+				t.Errorf("%s: %s", v.pos, v.text)
+			}
+		}
+		if !contractExempt(w.pkg.dirName, ruleTEARDOWN) {
+			for _, file := range w.pkg.files {
+				for _, v := range checkContractTeardown(fset, file) {
+					t.Errorf("%s: %s", v.pos, v.text)
+				}
+			}
+		}
+	}
+}
+
 // TestCheckAdapterContract_DetectsViolations pins the checker's own logic
 // against inline source fixtures, independent of the current state of
 // any adapter package, so a regression in a rule is caught even when
@@ -1844,57 +2311,6 @@ func TestCheckAdapterContract_DetectsViolations(t *testing.T) {
 		// right count.
 		wantSubstr string
 	}{
-		{
-			name:       "a hand-wired exec.Cmd cancellation is rejected",
-			dirName:    "fixture",
-			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
-			src: `package fixture
-
-import "os/exec"
-
-func launch(cmd *exec.Cmd) {
-	cmd.Cancel = func() error { return nil }
-}
-`,
-			wantCount:  1,
-			wantSubstr: "call procutil.SetGroupCancel",
-		},
-		{
-			name:       "a hand-wired exec.Cmd wait delay is rejected",
-			dirName:    "fixture",
-			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
-			src: `package fixture
-
-import (
-	"os/exec"
-	"time"
-)
-
-func launch(cmd *exec.Cmd) {
-	cmd.WaitDelay = 5 * time.Second
-}
-`,
-			wantCount:  1,
-			wantSubstr: "call procutil.SetGroupCancel",
-		},
-		{
-			name:       "a same-named field in a package that never touches os/exec is accepted",
-			dirName:    "fixture",
-			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
-			src: `package fixture
-
-type request struct {
-	Cancel    func() error
-	WaitDelay int
-}
-
-func configure(r *request) {
-	r.Cancel = func() error { return nil }
-	r.WaitDelay = 5
-}
-`,
-			wantCount: 0,
-		},
 		{
 			name:       "a non-test file referencing procutil.DefaultStopGrace directly is rejected",
 			dirName:    "fixture",
@@ -2460,6 +2876,407 @@ const kind = "claude-code"
 	}
 }
 
+// TestCheckContractCapture_DetectsViolations pins rule CAPTURE's and
+// rule TEARDOWN's own logic against inline source fixtures,
+// independent of the current state of any package under cmd/ or
+// internal/, so a regression is caught even when every real launch
+// site happens to comply. Each fixture is parsed as the single
+// non-test file of a one-file package named by dirName; every case
+// runs through both checkContractCapture and checkContractTeardown,
+// whose field checks (Stdout/Stderr and Cancel/WaitDelay) never
+// overlap.
+func TestCheckContractCapture_DetectsViolations(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		dirName    string
+		importPath string
+		src        string
+		wantCount  int
+		wantSubstr string
+	}{
+		{
+			name:       "a chained CombinedOutput call is rejected",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import (
+	"context"
+	"os/exec"
+)
+
+func run(ctx context.Context) ([]byte, error) {
+	return exec.CommandContext(ctx, "git", "status").CombinedOutput()
+}
+`,
+			wantCount:  1,
+			wantSubstr: "call procutil.RunCapture or procutil.StartCapture",
+		},
+		{
+			name:       "a declared-then-called Run is rejected",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import "os/exec"
+
+func run() error {
+	cmd := exec.Command("git", "status")
+	return cmd.Run()
+}
+`,
+			wantCount:  1,
+			wantSubstr: "waits on an exec.Cmd directly",
+		},
+		{
+			name:       "a var-declared cmd's Output call is rejected",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import "os/exec"
+
+func run() ([]byte, error) {
+	var cmd *exec.Cmd
+	cmd = exec.Command("git", "status")
+	return cmd.Output()
+}
+`,
+			wantCount:  1,
+			wantSubstr: "waits on an exec.Cmd directly",
+		},
+		{
+			name:       "a cmd parameter's Wait call is rejected",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import "os/exec"
+
+func run(cmd *exec.Cmd) error {
+	return cmd.Wait()
+}
+`,
+			wantCount:  1,
+			wantSubstr: "waits on an exec.Cmd directly",
+		},
+		{
+			name:       "a struct field cmd's Start call is rejected",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import "os/exec"
+
+type runner struct {
+	cmd *exec.Cmd
+}
+
+func (s *runner) run() error {
+	return s.cmd.Start()
+}
+`,
+			wantCount:  1,
+			wantSubstr: "waits on an exec.Cmd directly",
+		},
+		{
+			name:       "an indexed function's returned cmd is rejected, assigned and chained",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import "os/exec"
+
+func newGitCmd(dir string) *exec.Cmd {
+	cmd := exec.Command("git", "status")
+	cmd.Dir = dir
+	return cmd
+}
+
+func runAssigned(dir string) error {
+	cmd := newGitCmd(dir)
+	return cmd.Run()
+}
+
+func runChained(dir string) error {
+	return newGitCmd(dir).Start()
+}
+`,
+			wantCount: 2,
+		},
+		{
+			name:       "an os.Process field's Wait call is rejected",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import "os/exec"
+
+func run(c *exec.Cmd) error {
+	return c.Process.Wait()
+}
+`,
+			wantCount:  1,
+			wantSubstr: "waits on an os.Process directly",
+		},
+		{
+			name:       "os.StartProcess and a later Wait on its result are both rejected",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import "os"
+
+func run() error {
+	p, _ := os.StartProcess("/bin/true", nil, &os.ProcAttr{})
+	return p.Wait()
+}
+`,
+			wantCount: 2,
+		},
+		{
+			name:       "syscall.ForkExec is rejected",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import "syscall"
+
+func run() (int, error) {
+	return syscall.ForkExec("/bin/true", nil, nil)
+}
+`,
+			wantCount:  1,
+			wantSubstr: "starts a process outside os/exec",
+		},
+		{
+			name:       "a direct Stdout assignment is rejected",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import (
+	"io"
+	"os/exec"
+)
+
+func run(cmd *exec.Cmd) {
+	cmd.Stdout = io.Discard
+}
+`,
+			wantCount:  1,
+			wantSubstr: "assigns exec.Cmd.Stdout directly",
+		},
+		{
+			name:       "a dot-import of os/exec is rejected once, on the import",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import . "os/exec"
+
+func run() (*Cmd, error) {
+	return Command("git", "status"), nil
+}
+`,
+			wantCount:  1,
+			wantSubstr: "dot-imports os/exec",
+		},
+		{
+			name:       "a dot-import of os is rejected once, on the import",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import . "os"
+
+func run() string {
+	return Getenv("PATH")
+}
+`,
+			wantCount:  1,
+			wantSubstr: "dot-imports os",
+		},
+		{
+			name:       "a sync.WaitGroup Wait in a file importing os/exec is accepted",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import (
+	"os/exec"
+	"sync"
+)
+
+func run(wg *sync.WaitGroup) {
+	_ = exec.Command
+	wg.Wait()
+}
+`,
+			wantCount: 0,
+		},
+		{
+			name:       "Wait on a *procutil.Capture is accepted",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import "github.com/sortie-ai/sortie/internal/agent/procutil"
+
+func run(c *procutil.Capture) {
+	c.Wait()
+}
+`,
+			wantCount: 0,
+		},
+		{
+			name:       "Output on an unrelated type in a file that never imports os/exec is accepted",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+type buffer struct{}
+
+func (b *buffer) Output() []byte { return nil }
+
+func run(x *buffer) []byte {
+	return x.Output()
+}
+`,
+			wantCount: 0,
+		},
+		{
+			name:       "StdinPipe is accepted",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import "os/exec"
+
+func run(cmd *exec.Cmd) error {
+	_, err := cmd.StdinPipe()
+	return err
+}
+`,
+			wantCount: 0,
+		},
+		{
+			name:       "Signal on an *os.Process from os.FindProcess is accepted",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import (
+	"os"
+	"syscall"
+)
+
+func run(pid int) error {
+	p, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+	return p.Signal(syscall.Signal(0))
+}
+`,
+			wantCount: 0,
+		},
+		{
+			name:       "a hand-wired exec.Cmd cancellation is rejected",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import "os/exec"
+
+func launch(cmd *exec.Cmd) {
+	cmd.Cancel = func() error { return nil }
+}
+`,
+			wantCount:  1,
+			wantSubstr: "call procutil.SetGroupCancel or procutil.SetGroupKill",
+		},
+		{
+			name:       "a hand-wired exec.Cmd wait delay is rejected",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import (
+	"os/exec"
+	"time"
+)
+
+func launch(cmd *exec.Cmd) {
+	cmd.WaitDelay = 5 * time.Second
+}
+`,
+			wantCount:  1,
+			wantSubstr: "call procutil.SetGroupCancel or procutil.SetGroupKill",
+		},
+		{
+			name:       "a same-named field in a package that never touches os/exec is accepted",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+type request struct {
+	Cancel    func() error
+	WaitDelay int
+}
+
+func configure(r *request) {
+	r.Cancel = func() error { return nil }
+	r.WaitDelay = 5
+}
+`,
+			wantCount: 0,
+		},
+		{
+			name:       "a hand-wired exec.Cmd cancellation under internal/workspace is rejected",
+			dirName:    "workspace",
+			importPath: "github.com/sortie-ai/sortie/internal/workspace",
+			src: `package workspace
+
+import "os/exec"
+
+func launch(cmd *exec.Cmd) {
+	cmd.Cancel = func() error { return nil }
+}
+`,
+			wantCount:  1,
+			wantSubstr: "call procutil.SetGroupCancel or procutil.SetGroupKill",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fset := token.NewFileSet()
+			file, err := parser.ParseFile(fset, "fixture.go", tt.src, parser.SkipObjectResolution)
+			if err != nil {
+				t.Fatalf("parser.ParseFile: %v", err)
+			}
+
+			pkg := contractPackage{dirName: tt.dirName, importPath: tt.importPath, files: []*ast.File{file}}
+			got := checkContractCapture(fset, pkg)
+			got = append(got, checkContractTeardown(fset, file)...)
+
+			if len(got) != tt.wantCount {
+				t.Errorf("checkContractCapture()+checkContractTeardown() returned %d violations, want %d: %+v", len(got), tt.wantCount, got)
+			}
+			if tt.wantSubstr != "" && !slices.ContainsFunc(got, func(v contractViolation) bool {
+				return strings.Contains(v.text, tt.wantSubstr)
+			}) {
+				t.Errorf("violations = %+v, want one containing %q", got, tt.wantSubstr)
+			}
+		})
+	}
+}
+
 // TestContractAllowlist_BlockerRuleHasNoExemptions pins that no package
 // carries a contractAllowlist entry for ruleBLOCKER, so every
 // tracker-registering package, including file, is subject to it.
@@ -2531,6 +3348,46 @@ func contractCheckStopGraceAllowlist(r contractIdentityReporter, found map[strin
 		}
 		if !found[dirName] {
 			r.Errorf("contractAllowlist[%q] exempts %s, but the walk under %s did not find a directory named %q", dirName, ruleSTOPGRACE, contractAgentFamilyPath, dirName)
+		}
+	}
+}
+
+// contractCaptureTeardownEvaluationRoots names the three roots the
+// CAPTURE and TEARDOWN staleness guards each require at least one
+// evaluated, non-exempt file under.
+var contractCaptureTeardownEvaluationRoots = []string{
+	"github.com/sortie-ai/sortie/internal/agent",
+	"github.com/sortie-ai/sortie/internal/orchestrator",
+	"github.com/sortie-ai/sortie/internal/workspace",
+}
+
+// contractCheckWideRuleEvaluated reports, for each of
+// contractCaptureTeardownEvaluationRoots, when rule was evaluated for
+// no non-exempt package carrying a non-test file under it.
+func contractCheckWideRuleEvaluated(r contractIdentityReporter, rule contractRule, walked []contractWalkedPackage) {
+	for _, root := range contractCaptureTeardownEvaluationRoots {
+		evaluated := false
+		for _, w := range walked {
+			if contractPathIsUnder(w.pkg.importPath, root) && len(w.pkg.files) > 0 && !contractExempt(w.pkg.dirName, rule) {
+				evaluated = true
+				break
+			}
+		}
+		if !evaluated {
+			r.Errorf("rule %s was evaluated for no file under %s, want at least one", rule, root)
+		}
+	}
+}
+
+// contractCheckWideRuleAllowlist reports each contractAllowlist entry
+// that exempts rule for a directory the walk did not find.
+func contractCheckWideRuleAllowlist(r contractIdentityReporter, rule contractRule, found map[string]bool) {
+	for dirName, reasons := range contractAllowlist {
+		if _, exempt := reasons[rule]; !exempt {
+			continue
+		}
+		if !found[dirName] {
+			r.Errorf("contractAllowlist[%q] exempts %s, but the walk did not find a directory named %q", dirName, rule, dirName)
 		}
 	}
 }
@@ -2669,6 +3526,70 @@ func TestContractStopGraceRule_StalenessGuardCatchesRealBreaks(t *testing.T) {
 			t.Fatalf("staleness guard recorded no failure for an allowlist entry naming a directory absent from the walk, want at least one")
 		}
 	})
+}
+
+// TestContractCaptureAndTeardownRule_AppliesAndStaysCurrent guards
+// rules CAPTURE and TEARDOWN against going stale: each fails when it
+// was evaluated for no non-exempt file under internal/agent,
+// internal/orchestrator, or internal/workspace, or when a
+// contractAllowlist entry naming it names a directory the walk did not
+// find.
+func TestContractCaptureAndTeardownRule_AppliesAndStaysCurrent(t *testing.T) {
+	fset := token.NewFileSet()
+	walked := contractWalkCaptureAndTeardown(t, fset)
+
+	found := map[string]bool{}
+	for _, w := range walked {
+		found[w.pkg.dirName] = true
+	}
+
+	contractCheckWideRuleEvaluated(t, ruleCAPTURE, walked)
+	contractCheckWideRuleAllowlist(t, ruleCAPTURE, found)
+	contractCheckWideRuleEvaluated(t, ruleTEARDOWN, walked)
+	contractCheckWideRuleAllowlist(t, ruleTEARDOWN, found)
+}
+
+// TestContractCaptureAndTeardownRule_StalenessGuardCatchesRealBreaks
+// proves the checks TestContractCaptureAndTeardownRule_AppliesAndStaysCurrent
+// performs are themselves capable of failing, not merely capable of
+// passing against the current tree: fed a walk that evaluated the rule
+// for no file under any of the three required roots, or an allowlist
+// naming a directory that walk did not find, each check must record a
+// failure. The second subtest temporarily replaces the package-level
+// contractAllowlist, which a concurrently-running fixture test also
+// reads, so neither subtest runs in parallel.
+func TestContractCaptureAndTeardownRule_StalenessGuardCatchesRealBreaks(t *testing.T) {
+	for _, rule := range []contractRule{ruleCAPTURE, ruleTEARDOWN} {
+		t.Run(string(rule)+": zero files evaluated under a required root", func(t *testing.T) {
+			walked := []contractWalkedPackage{
+				{pkg: contractPackage{dirName: "fixture", importPath: "github.com/sortie-ai/sortie/internal/tracker/fixture"}},
+			}
+
+			reporter := &contractStalenessFakeReporter{}
+			contractCheckWideRuleEvaluated(reporter, rule, walked)
+
+			if len(reporter.errors) == 0 {
+				t.Fatalf("staleness guard recorded no failure for a walk carrying no file under any required root, want at least one")
+			}
+		})
+
+		t.Run(string(rule)+": an allowlist entry names a directory the walk did not find", func(t *testing.T) {
+			original := contractAllowlist
+			contractAllowlist = map[string]map[contractRule]string{
+				"ghost-adapter": {rule: "does not exist on disk"},
+			}
+			t.Cleanup(func() { contractAllowlist = original })
+
+			found := map[string]bool{"procutil": true}
+
+			reporter := &contractStalenessFakeReporter{}
+			contractCheckWideRuleAllowlist(reporter, rule, found)
+
+			if len(reporter.errors) == 0 {
+				t.Fatalf("staleness guard recorded no failure for an allowlist entry naming a directory absent from the walk, want at least one")
+			}
+		})
+	}
 }
 
 // TestResolveContractImportName pins that the qualifier is read from the
