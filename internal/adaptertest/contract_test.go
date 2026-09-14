@@ -517,14 +517,17 @@ func checkContractTeardown(fset *token.FileSet, file *ast.File) []contractViolat
 // contractCaptureOwner is the helper rule CAPTURE directs a caller to.
 const contractCaptureOwner = "procutil.RunCapture or procutil.StartCapture"
 
-// contractCaptureDotImportPaths names the four import paths a dot
-// import of which hides every call rule CAPTURE looks for.
-var contractCaptureDotImportPaths = map[string]bool{
-	"os/exec":                  true,
-	"os":                       true,
-	"syscall":                  true,
-	"golang.org/x/sys/windows": true,
-}
+// contractCaptureDotImportReason is the text checkContractCaptureFile
+// gives for any dot-imported package, regardless of which one: a dot
+// import binds no name contractFileImportAliases or
+// resolveContractImportName can key a qualifier to, so a call, a
+// constant reference, or a sink type reached through it resolves
+// against nothing rather than against the dot-imported package. Rules
+// CAPTURE and SINK have no way to tell an innocuous dot import from one
+// hiding a process launch or an unbounded sink, so every one is
+// unresolvable and this text says so rather than trusting the house
+// style ban on dot imports to hold.
+const contractCaptureDotImportReason = "which this rule cannot resolve a bound identifier, capture sink, or command constructor through; import it by name"
 
 // contractBoundedSinkTypes names the sink types [procutil.CaptureParams]'s
 // own contract admits for Stdout and Stderr: [procutil.Capture.Wait]
@@ -999,6 +1002,15 @@ func checkContractCaptureSinkFields(fset *token.FileSet, lit *ast.CompositeLit, 
 // violation in file, using idx and fields already built across the
 // whole package file belongs to. Rule SINK is skipped when dirName is
 // exempt from it.
+//
+// Any dot import in file is itself a rule CAPTURE violation, regardless
+// of which package it names: a call, constant reference, or sink type
+// reached through a dot import binds no local identifier, so the rest
+// of this function - which resolves every one of those against file's
+// own named and aliased imports - cannot see through it. Reporting the
+// import outright, once, keeps a file that hides a command constructor
+// or a sink type behind a dot import from silently passing this rule
+// the way naming the four import paths this used to check did not.
 func checkContractCaptureFile(fset *token.FileSet, file *ast.File, importPath, dirName string, idx *contractCmdIndex, fields contractCmdFields) []contractViolation {
 	var violations []contractViolation
 
@@ -1007,12 +1019,12 @@ func checkContractCaptureFile(fset *token.FileSet, file *ast.File, importPath, d
 			continue
 		}
 		path, err := strconv.Unquote(imp.Path.Value)
-		if err != nil || !contractCaptureDotImportPaths[path] {
+		if err != nil {
 			continue
 		}
 		violations = append(violations, contractViolation{
 			pos:  fset.Position(imp.Pos()),
-			text: "dot-imports " + path + ", which hides process launches from this rule; import it by name",
+			text: "dot-imports " + path + ", " + contractCaptureDotImportReason,
 		})
 	}
 
@@ -3360,6 +3372,33 @@ func run() string {
 			wantSubstr: "dot-imports os",
 		},
 		{
+			// A dot-imported procutil turns "CaptureParams{...}" into a
+			// bare composite literal contractIsCaptureParamsLit cannot
+			// recognize (it looks for a "procutil." selector), so
+			// without the general dot-import ban this Stdout field,
+			// resolving to os.Stdout rather than a bounded sink, would
+			// evade rule SINK entirely instead of being reported.
+			name:       "a dot-import of procutil hiding an unbounded sink is rejected once, on the import",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import (
+	"os"
+	"os/exec"
+
+	. "github.com/sortie-ai/sortie/internal/agent/procutil"
+)
+
+func run(cmd *exec.Cmd) error {
+	_, err := StartCapture(cmd, CaptureParams{Stdout: os.Stdout})
+	return err
+}
+`,
+			wantCount:  1,
+			wantSubstr: "dot-imports github.com/sortie-ai/sortie/internal/agent/procutil",
+		},
+		{
 			name:       "a sync.WaitGroup Wait in a file importing os/exec is accepted",
 			dirName:    "fixture",
 			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
@@ -3764,6 +3803,165 @@ func runGitDiff(ctx context.Context, workspacePath string, args ...string) error
 	producerGot := checkContractCapture(fset, producerPkg, idx, fields)
 	if len(producerGot) != 0 {
 		t.Errorf("checkContractCapture() on the constructor's own package returned %d violations, want 0: %+v", len(producerGot), producerGot)
+	}
+}
+
+// TestCheckContractCapture_DetectsDotImportedConstructorViolations is the
+// negative control for the hole an audit of
+// TestCheckContractCapture_DetectsCrossPackageConstructorViolations
+// found: contractFileImportAliases omits a dot import, since a dot
+// import binds no name a selector could qualify, so a call reached
+// through one - GitCommand written bare instead of workspace.GitCommand
+// - resolved against nothing and the hand-wired Wait beneath it passed
+// uncaught. The consumer here is the same shape as that test's, a dot
+// import substituted for the named one; before the general dot-import
+// ban in checkContractCaptureFile this returned zero violations, which
+// an overlay probe against a pre-fix copy confirmed.
+func TestCheckContractCapture_DetectsDotImportedConstructorViolations(t *testing.T) {
+	t.Parallel()
+
+	const producerSrc = `package workspace
+
+import (
+	"context"
+	"os/exec"
+)
+
+func GitCommand(ctx context.Context, dir string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = dir
+	return cmd
+}
+`
+
+	const consumerSrc = `package orchestrator
+
+import (
+	"context"
+
+	. "github.com/sortie-ai/sortie/internal/workspace"
+)
+
+func runGitDiff(ctx context.Context, workspacePath string, args ...string) error {
+	cmd := GitCommand(ctx, workspacePath, args...)
+	return cmd.Wait()
+}
+`
+
+	fset := token.NewFileSet()
+	producerFile, err := parser.ParseFile(fset, "workspace.go", producerSrc, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parser.ParseFile(producer): %v", err)
+	}
+	consumerFile, err := parser.ParseFile(fset, "orchestrator.go", consumerSrc, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parser.ParseFile(consumer): %v", err)
+	}
+
+	producerPkg := contractPackage{
+		dirName:    "workspace",
+		importPath: "github.com/sortie-ai/sortie/internal/workspace",
+		files:      []*ast.File{producerFile},
+	}
+	consumerPkg := contractPackage{
+		dirName:    "orchestrator",
+		importPath: contractOrchestratorPath,
+		files:      []*ast.File{consumerFile},
+	}
+
+	walked := []contractWalkedPackage{{pkg: producerPkg}, {pkg: consumerPkg}}
+	idx, fields := contractBuildModuleCmdIndex(walked)
+
+	got := checkContractCapture(fset, consumerPkg, idx, fields)
+	if len(got) != 1 {
+		t.Fatalf("checkContractCapture() on a dot-importing caller of a cross-package constructor returned %d violations, want 1: %+v", len(got), got)
+	}
+	const wantSubstr = "dot-imports github.com/sortie-ai/sortie/internal/workspace"
+	if !strings.Contains(got[0].text, wantSubstr) {
+		t.Errorf("violations = %+v, want one containing %q", got, wantSubstr)
+	}
+}
+
+// TestCheckContractCapture_ResolvesRenamedImportConstructorCalls pins
+// that a renamed import - unlike a dot import - does not share the hole
+// TestCheckContractCapture_DetectsDotImportedConstructorViolations
+// closes: contractFileImportAliases keys aliasPaths from each import's
+// own local identifier, alias or not, so ws.GitCommand resolves exactly
+// as the unaliased workspace.GitCommand does and the hand-wired Wait
+// stays caught. The consumer keeps runVerification and its direct
+// os/exec import from TestCheckContractCapture_DetectsCrossPackageConstructorViolations's
+// fixture: every real caller of a workspace constructor, such as
+// internal/orchestrator/self_review.go, imports os/exec directly in
+// the same file, and dropping that import here would exercise this
+// function's early-return guard instead of the alias resolution this
+// test targets.
+func TestCheckContractCapture_ResolvesRenamedImportConstructorCalls(t *testing.T) {
+	t.Parallel()
+
+	const producerSrc = `package workspace
+
+import (
+	"context"
+	"os/exec"
+)
+
+func GitCommand(ctx context.Context, dir string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = dir
+	return cmd
+}
+`
+
+	const consumerSrc = `package orchestrator
+
+import (
+	"context"
+	"os/exec"
+
+	ws "github.com/sortie-ai/sortie/internal/workspace"
+)
+
+func runVerification(ctx context.Context, command string) *exec.Cmd {
+	return exec.CommandContext(ctx, "sh", "-c", command)
+}
+
+func runGitDiff(ctx context.Context, workspacePath string, args ...string) error {
+	cmd := ws.GitCommand(ctx, workspacePath, args...)
+	return cmd.Wait()
+}
+`
+
+	fset := token.NewFileSet()
+	producerFile, err := parser.ParseFile(fset, "workspace.go", producerSrc, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parser.ParseFile(producer): %v", err)
+	}
+	consumerFile, err := parser.ParseFile(fset, "orchestrator.go", consumerSrc, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parser.ParseFile(consumer): %v", err)
+	}
+
+	producerPkg := contractPackage{
+		dirName:    "workspace",
+		importPath: "github.com/sortie-ai/sortie/internal/workspace",
+		files:      []*ast.File{producerFile},
+	}
+	consumerPkg := contractPackage{
+		dirName:    "orchestrator",
+		importPath: contractOrchestratorPath,
+		files:      []*ast.File{consumerFile},
+	}
+
+	walked := []contractWalkedPackage{{pkg: producerPkg}, {pkg: consumerPkg}}
+	idx, fields := contractBuildModuleCmdIndex(walked)
+
+	got := checkContractCapture(fset, consumerPkg, idx, fields)
+	if len(got) != 1 {
+		t.Fatalf("checkContractCapture() on a renamed-import caller of a cross-package constructor returned %d violations, want 1: %+v", len(got), got)
+	}
+	const wantSubstr = "waits on an exec.Cmd directly"
+	if !strings.Contains(got[0].text, wantSubstr) {
+		t.Errorf("violations = %+v, want one containing %q", got, wantSubstr)
 	}
 }
 
