@@ -108,6 +108,13 @@ func runGitDiffCombined(ctx context.Context, workspacePath string, args ...strin
 	if result.WaitErr != nil {
 		return combined.Bytes(), result.WaitErr
 	}
+	// A descendant that outlives git can hold the capture pipe open past
+	// the drain bound, leaving combined a prefix of the real diff.
+	// Reporting that prefix as the diff would embed silently truncated
+	// input in the review prompt with no truncation marker.
+	if !result.OutputComplete {
+		return combined.Bytes(), fmt.Errorf("git %s: output did not complete within %s", args[0], procutil.DefaultDrainGrace)
+	}
 	return combined.Bytes(), nil
 }
 
