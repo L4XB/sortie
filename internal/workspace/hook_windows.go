@@ -30,8 +30,9 @@ import (
 // Output is always captured and truncated to [MaxHookOutputBytes],
 // even on failure, so callers can log diagnostic output. The hook's
 // process tree, and its Job Object, are terminated at its exit,
-// whatever the exit status: a process the script leaves running does
-// not outlive it.
+// whatever the exit status, so a process the script leaves running
+// does not outlive it. A hook whose Job Object assignment failed runs
+// without one, and the teardown then reaches only the direct process.
 func RunHook(ctx context.Context, params HookParams) (HookResult, error) {
 	if err := validateParams(params); err != nil {
 		return HookResult{}, err

@@ -33,8 +33,10 @@ import (
 //
 // Output is always captured and truncated to [MaxHookOutputBytes],
 // even on failure, so callers can log diagnostic output. The hook's
-// process tree is terminated at its exit, whatever the exit status: a
-// process the script leaves running does not outlive it.
+// process group is terminated at its exit, whatever the exit status,
+// so a process the script leaves running in that group does not
+// outlive it. A process that leaves the group, by starting a session
+// of its own, is outside that reach.
 func RunHook(ctx context.Context, params HookParams) (HookResult, error) {
 	if err := validateParams(params); err != nil {
 		return HookResult{}, err

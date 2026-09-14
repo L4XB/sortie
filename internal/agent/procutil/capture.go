@@ -11,6 +11,14 @@ import (
 )
 
 // CaptureParams configures [StartCapture] and [RunCapture].
+//
+// Every Write on Stdout and Stderr MUST return: [Capture.Wait] seals
+// each writer once the drain has ended, and sealing waits for a write
+// already in flight so the caller can read the writer afterwards
+// without racing the reader goroutine. A write that never returns
+// therefore holds Wait open past every bound it otherwise honours. An
+// in-memory sink that discards or trims what exceeds its budget meets
+// this; a pipe, socket, or file a slow consumer can block does not.
 type CaptureParams struct {
 	// Stdout receives standard output. Nil connects the stream to the
 	// null device and starts no reader.
@@ -83,6 +91,9 @@ func (s *sinkWriter) Write(p []byte) (int, error) {
 
 // seal blocks until any write already in progress returns, then marks
 // the wrapper so every later chunk is discarded rather than delivered.
+// The block is what makes the caller's writer safe to read once Wait
+// returns, so it is not bounded: a caller's writer that never returns
+// from Write breaks the contract [CaptureParams] states.
 func (s *sinkWriter) seal() {
 	s.mu.Lock()
 	s.sealed = true
