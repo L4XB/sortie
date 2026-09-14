@@ -386,12 +386,29 @@ func createToolhelp32SnapshotRetry(flags uint32, processID uint32) (windows.Hand
 	return 0, fmt.Errorf("CreateToolhelp32Snapshot: %w", lastErr)
 }
 
+// processIsRunning reports whether pid names a process that is still
+// running. Opening the identifier does not settle it on its own: a
+// process object stays openable after the process exits, for as long as
+// anything still holds a handle to it, so an exited descendant would
+// pass that check. A process handle is signaled once the process exits,
+// so only a zero-timeout wait that times out means it is still running.
+func processIsRunning(pid uint32) bool {
+	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.SYNCHRONIZE, false, pid)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = windows.CloseHandle(handle) }()
+
+	event, waitErr := windows.WaitForSingleObject(handle, 0)
+	return waitErr == nil && event == uint32(windows.WAIT_TIMEOUT)
+}
+
 // scanSurvivors reports every process descended from rootPID that is
 // still alive after the drain returned. A discovered PID is not pinned
-// by any handle of ours, so each candidate is confirmed live by opening
-// it before it is reported; a candidate that cannot be opened has
-// exited or its identifier was recycled, and is dropped rather than
-// reported as a survivor.
+// by any handle of ours, so each candidate is confirmed still running
+// before it is reported; a candidate that has exited, or whose
+// identifier was recycled, is dropped rather than reported as a
+// survivor.
 func scanSurvivors(rootPID uint32, jobPIDs []uint32) ([]jobSurvivor, error) {
 	snapshot, err := createToolhelp32SnapshotRetry(windows.TH32CS_SNAPPROCESS, 0)
 	if err != nil {
@@ -454,12 +471,9 @@ func scanSurvivors(rootPID uint32, jobPIDs []uint32) ([]jobSurvivor, error) {
 		if !closure[e.pid] {
 			continue
 		}
-		handle, openErr := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, e.pid)
-		if openErr != nil {
-			// Exited, or the identifier was recycled; not a survivor.
+		if !processIsRunning(e.pid) {
 			continue
 		}
-		_ = windows.CloseHandle(handle)
 		survivors = append(survivors, jobSurvivor{
 			PID:       e.pid,
 			ParentPID: e.parent,

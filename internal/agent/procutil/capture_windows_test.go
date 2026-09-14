@@ -934,3 +934,38 @@ func TestDrainCaptureJob_TeardownRecordAndSurvivorScan(t *testing.T) {
 		}
 	})
 }
+
+// TestProcessIsRunning pins that a survivor candidate is confirmed by
+// its run state and not merely by its identifier still opening. A
+// process object outlives the process for as long as anything holds a
+// handle to it, so an exited descendant stays openable and would
+// otherwise be reported as a survivor and raise the teardown warning.
+func TestProcessIsRunning(t *testing.T) {
+	t.Parallel()
+
+	cmd := exec.Command("cmd.exe", "/C", "ping -n 30 127.0.0.1 >nul")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("cmd.Start() = %v", err)
+	}
+	pid := uint32(cmd.Process.Pid) //nolint:gosec // G115: a Windows PID fits in uint32
+
+	if !processIsRunning(pid) {
+		t.Error("processIsRunning(running process) = false, want true")
+	}
+
+	// Hold a handle of our own so the process object, and therefore the
+	// identifier, survives the exit. That is the state in which opening
+	// the PID succeeds for a process that is already gone.
+	pinned, openErr := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.SYNCHRONIZE, false, pid)
+	if openErr != nil {
+		t.Fatalf("OpenProcess() = %v, want nil", openErr)
+	}
+	defer func() { _ = windows.CloseHandle(pinned) }()
+
+	_ = cmd.Process.Kill()
+	_ = cmd.Wait()
+
+	if processIsRunning(pid) {
+		t.Error("processIsRunning(exited process whose handle is still held) = true, want false")
+	}
+}
