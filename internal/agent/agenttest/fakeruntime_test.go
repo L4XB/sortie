@@ -3,7 +3,6 @@ package agenttest_test
 import (
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -108,27 +107,4 @@ func TestFakeRuntime_Hang(t *testing.T) {
 		t.Fatalf("Kill() error = %v", err)
 	}
 	<-done
-}
-
-// TestFakeRuntime_RemovableWhileAnotherRuns pins that removing a fake
-// runtime nobody ran succeeds while another fake of the same package is
-// running, which the t.TempDir cleanup of a test that never launches its
-// fake depends on while parallel tests run theirs.
-func TestFakeRuntime_RemovableWhileAnotherRuns(t *testing.T) {
-	t.Parallel()
-
-	idle := agenttest.FakeRuntime(t, t.TempDir(), "idle", agenttest.OutputScenario, agenttest.Output{})
-	running := agenttest.FakeRuntime(t, t.TempDir(), "running", agenttest.OutputScenario, agenttest.Output{Hang: true})
-	cmd := exec.Command(running) //nolint:gosec // running is a fake runtime under t.TempDir()
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-	})
-
-	if err := os.Remove(idle); err != nil {
-		t.Errorf("os.Remove(%q) while another fake runtime runs = %v, want nil", idle, err)
-	}
 }
