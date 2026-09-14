@@ -91,7 +91,7 @@ The request count needs a column of its own for the reason the token measurement
 | `total_tokens`      | INTEGER |                                   |
 | `cache_read_tokens` | INTEGER | Cumulative cache-read tokens (migration 002) |
 | `seconds_running`   | REAL    | Cumulative runtime seconds        |
-| `unmeasured_sessions` | INTEGER | Cumulative count of ended sessions whose usage was never recorded, backfilled from `run_history` for pre-migration rows (migration 018) |
+| `unmeasured_sessions` | INTEGER | Cumulative count of ended sessions whose usage was never recorded. The migration sets an existing `agent_totals` row to the number of `run_history` rows with `tokens_measured = 0`; a `run_history` row written before migration 012 reads `1` there and is not counted (migration 018) |
 | `updated_at`        | TEXT    | ISO-8601 timestamp                |
 
 `unmeasured_sessions` names what the four token columns above already exclude: a session whose worker entered an agent turn and never got a usage figure, whatever the reason. It is incremented once per such session at the same write that updates the token columns, so a restart restores both together and neither can drift ahead of the other.

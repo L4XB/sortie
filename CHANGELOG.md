@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- The dashboard and `GET /api/v1/state` now disclose, by reason, how many sessions the token and cost totals leave out: `running_unreported` for a running session that has not reported usage yet, `running_non_reporting` for a running session whose agent reports no usage at all, `unmeasured_sessions` for an already-ended session whose usage was never recorded, and `cost_unpriced_running` for a session `Est. Cost` excludes because no rate is configured for its agent. The dashboard's footer note for each reason now reads correctly for a single session instead of always using the plural. The already-ended count survives a restart and, once upgraded, also counts sessions recorded before the upgrade.
+- The dashboard and `GET /api/v1/state` now disclose, by reason, how many sessions the token and cost totals leave out: `running_unreported` for a running session that has not reported usage yet, `running_non_reporting` for a running session whose agent reports no usage at all, `unmeasured_sessions` for an already-ended session whose usage was never recorded, and `cost_unpriced_running` for a running session left out of `Est. Cost` because no rate is configured for its agent. The dashboard's footer note for each reason now reads correctly for a single session instead of always using the plural. The already-ended count survives a restart and, after the upgrade, also includes earlier sessions that ended without recorded usage, back to v1.19.0.
   ([#1066](https://github.com/sortie-ai/sortie/issues/1066))
 
 ### Fixed
