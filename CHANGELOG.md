@@ -24,10 +24,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sessions that end while Sortie is under load no longer undercount the tokens spent during self-review. A session that starts on an issue right after the previous one ended no longer inherits that session's token usage or self-review progress, which counted the same tokens twice against `agent.max_tokens` and could stop work on the issue before its budget was spent.
   ([#1077](https://github.com/sortie-ai/sortie/issues/1077))
 
+- The `cost_budget` agent tool now counts the tokens the running session has already spent, so `used_tokens` and `remaining_tokens` reflect that spend against `agent.max_tokens` while the session is still working, and `used_tokens_complete` stays `false` until that spend has been recorded. Previously the running session was left out, so the first session on an issue read zero spend throughout.
+  ([#1074](https://github.com/sortie-ai/sortie/issues/1074))
+
 ### Changed
 
 - On Linux and macOS, a process that a workspace hook, the reaction triage command, or a self-review verification command leaves running is now terminated when the command exits, matching what Windows hooks already did; a verification command's leftover processes on Windows are now terminated too. A service meant to outlive the command now has to start through a supervisor, which the workflow reference documents per platform, and hooks and the reaction triage command now receive `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` so they can reach the user's service manager. Two log messages are new: `leftover processes terminated after the command exited`, logged when that termination reached a process the command left behind, and `subprocess group termination failed after the launch returned`, logged whenever Sortie cannot confirm that a command's or an agent session's processes are gone. On Windows, the warnings `hook process tree did not settle`, `hook job object creation failed; child tree may survive timeout`, and `hook process resume failed` are renamed `subprocess tree did not settle`, `process group assignment failed`, and `process resume failed` and now cover launches other than hooks, while `hook job termination after wait failed; drain may not settle`, `hook job accounting query failed; drain skipped`, and `hook job processes still active after drain deadline` are no longer logged; an alert built on any of the old text stops matching.
   ([#1080](https://github.com/sortie-ai/sortie/issues/1080), [#1099](https://github.com/sortie-ai/sortie/issues/1099))
+
+### Migrations
+
+- Add `dispatch_id TEXT NOT NULL DEFAULT ''` to `session_metadata`, naming the dispatch whose running session last recorded the row; it is empty once that session has ended. A pre-migration row reads back empty, so `cost_budget` never counts it as a running session's spend.
+  ([#1074](https://github.com/sortie-ai/sortie/issues/1074))
 
 ## [1.24.0] - 2026-09-11
 

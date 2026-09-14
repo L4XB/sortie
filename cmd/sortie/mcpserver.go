@@ -103,26 +103,7 @@ func runMCPServer(ctx context.Context, args []string, stdout io.Writer, stderr i
 	// first-turn prompt. A notifier misconfiguration is fatal here, as
 	// before; a read-only DB-open failure is non-fatal and skips the two
 	// database-backed tools.
-	var attempt *int
-	if raw := os.Getenv("SORTIE_ATTEMPT"); raw != "" {
-		if n, atoiErr := strconv.Atoi(raw); atoiErr == nil {
-			attempt = &n
-		}
-	}
-	sessionTools, err := BuildSessionToolRegistry(ctx, logger, SessionToolParams{
-		TrackerAdapter: trackerAdapter,
-		Project:        cfg.Tracker.Project,
-		WorkspacePath:  os.Getenv("SORTIE_WORKSPACE"),
-		DBPath:         os.Getenv("SORTIE_DB_PATH"),
-		IssueID:        os.Getenv("SORTIE_ISSUE_ID"),
-		Identifier:     os.Getenv("SORTIE_ISSUE_IDENTIFIER"),
-		SessionID:      os.Getenv("SORTIE_SESSION_ID"),
-		Attempt:        attempt,
-		AgentKind:      os.Getenv("SORTIE_SESSION_AGENT_KIND"),
-		MaxTokens:      cfg.Agent.MaxTokens,
-		MaxSessions:    cfg.Agent.MaxSessions,
-		Notifications:  cfg.Notifications.Backends,
-	})
+	sessionTools, err := BuildSessionToolRegistry(ctx, logger, sessionToolParamsFromEnv(os.Getenv, cfg, trackerAdapter))
 	if err != nil {
 		logger.Error("failed to build session tool registry", slog.Any("error", err))
 		return 1
@@ -138,6 +119,34 @@ func runMCPServer(ctx context.Context, args []string, stdout io.Writer, stderr i
 	}
 
 	return 0
+}
+
+// sessionToolParamsFromEnv builds the per-session tool registry inputs
+// from the sidecar's process environment, read only through getenv.
+// SORTIE_ATTEMPT maps to Attempt when it parses as an integer; a
+// non-integer or absent value leaves Attempt nil.
+func sessionToolParamsFromEnv(getenv func(string) string, cfg config.ServiceConfig, trackerAdapter domain.TrackerAdapter) SessionToolParams {
+	var attempt *int
+	if raw := getenv("SORTIE_ATTEMPT"); raw != "" {
+		if n, atoiErr := strconv.Atoi(raw); atoiErr == nil {
+			attempt = &n
+		}
+	}
+	return SessionToolParams{
+		TrackerAdapter: trackerAdapter,
+		Project:        cfg.Tracker.Project,
+		WorkspacePath:  getenv("SORTIE_WORKSPACE"),
+		DBPath:         getenv("SORTIE_DB_PATH"),
+		IssueID:        getenv("SORTIE_ISSUE_ID"),
+		Identifier:     getenv("SORTIE_ISSUE_IDENTIFIER"),
+		SessionID:      getenv("SORTIE_SESSION_ID"),
+		DispatchID:     getenv("SORTIE_DISPATCH_ID"),
+		Attempt:        attempt,
+		AgentKind:      getenv("SORTIE_SESSION_AGENT_KIND"),
+		MaxTokens:      cfg.Agent.MaxTokens,
+		MaxSessions:    cfg.Agent.MaxSessions,
+		Notifications:  cfg.Notifications.Backends,
+	}
 }
 
 // buildNotifyTool resolves the configured notifier backends and returns
@@ -188,7 +197,7 @@ func resolveNotificationCap(backends []config.NotificationBackend) int {
 }
 
 func buildBudgetQuery(store *persistence.Store) budget.BudgetQueryFunc {
-	return func(ctx context.Context, issueID string, runningSessionID string) (budget.BudgetUsage, error) {
+	return func(ctx context.Context, issueID string, runningDispatchID string) (budget.BudgetUsage, error) {
 		completed, err := store.TokenUsageByIssue(ctx, issueID)
 		if err != nil {
 			return budget.BudgetUsage{}, err
@@ -202,16 +211,17 @@ func buildBudgetQuery(store *persistence.Store) budget.BudgetQueryFunc {
 
 		// The running session's recorded spend lives in session_metadata,
 		// which survives session exit. Add it only when the stored
-		// session ID matches the live session ID supplied out of band, so
-		// a stale earlier session's row is never double counted.
-		if runningSessionID == "" {
+		// dispatch ID matches the live dispatch ID supplied out of band,
+		// so neither a stale earlier dispatch's row nor a session-exit
+		// write's cleared row is ever double counted.
+		if runningDispatchID == "" {
 			return usage, nil
 		}
 		meta, found, err := store.LoadSessionMetadata(ctx, issueID)
 		if err != nil {
 			return budget.BudgetUsage{}, err
 		}
-		if found && meta.SessionID == runningSessionID {
+		if found && meta.DispatchID == runningDispatchID {
 			usage.RunningTotalTokens = meta.TotalTokens
 			usage.RunningMeasured = true
 		}

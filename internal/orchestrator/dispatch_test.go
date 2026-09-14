@@ -1211,6 +1211,92 @@ func TestDispatchIssue(t *testing.T) {
 	})
 }
 
+// TestDispatchIssue_DispatchID covers dispatch-ID minting and context
+// propagation: two dispatches mint non-empty, distinct dispatch IDs, and
+// each worker's context carries the dispatch ID [DispatchIssue] stored on
+// its own [RunningEntry].
+func TestDispatchIssue_DispatchID(t *testing.T) {
+	t.Parallel()
+
+	t.Run("two distinct issues mint distinct non-empty dispatch IDs", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestState()
+		ch := make(chan string, 2)
+		worker := func(ctx context.Context, _ domain.Issue, _ *int) {
+			ch <- dispatchIDFromContext(ctx)
+		}
+
+		DispatchIssue(context.Background(), s, testIssue("ISS-DID-A"), nil, "", worker)
+		idA := s.Running["ISS-DID-A"].DispatchID
+
+		DispatchIssue(context.Background(), s, testIssue("ISS-DID-B"), nil, "", worker)
+		idB := s.Running["ISS-DID-B"].DispatchID
+
+		if idA == "" || idB == "" {
+			t.Fatalf("RunningEntry.DispatchID = (%q, %q), want both non-empty", idA, idB)
+		}
+		if idA == idB {
+			t.Fatalf("RunningEntry.DispatchID = %q for both issues, want distinct values", idA)
+		}
+
+		want := map[string]bool{idA: true, idB: true}
+		for range 2 {
+			select {
+			case got := <-ch:
+				if !want[got] {
+					t.Errorf("dispatchIDFromContext(workerCtx) = %q, want one of %q or %q", got, idA, idB)
+				}
+				delete(want, got)
+			case <-time.After(time.Second):
+				t.Fatal("worker goroutine did not execute within 1 second")
+			}
+		}
+		if len(want) != 0 {
+			t.Errorf("worker contexts did not carry both dispatch IDs; missing %v", want)
+		}
+	})
+
+	t.Run("re-dispatching the same issue mints a new dispatch ID", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestState()
+		ch := make(chan string, 1)
+		worker := func(ctx context.Context, _ domain.Issue, _ *int) {
+			ch <- dispatchIDFromContext(ctx)
+		}
+
+		DispatchIssue(context.Background(), s, testIssue("ISS-DID-REDISPATCH"), nil, "", worker)
+		first := s.Running["ISS-DID-REDISPATCH"].DispatchID
+		select {
+		case got := <-ch:
+			if got != first {
+				t.Fatalf("first dispatch: dispatchIDFromContext(ctx) = %q, want %q", got, first)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("first worker goroutine did not execute within 1 second")
+		}
+
+		DispatchIssue(context.Background(), s, testIssue("ISS-DID-REDISPATCH"), nil, "", worker)
+		second := s.Running["ISS-DID-REDISPATCH"].DispatchID
+		select {
+		case got := <-ch:
+			if got != second {
+				t.Fatalf("second dispatch: dispatchIDFromContext(ctx) = %q, want %q", got, second)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("second worker goroutine did not execute within 1 second")
+		}
+
+		if first == "" || second == "" {
+			t.Fatalf("RunningEntry.DispatchID = (%q, %q), want both non-empty", first, second)
+		}
+		if first == second {
+			t.Fatalf("RunningEntry.DispatchID = %q for both dispatches, want distinct values", first)
+		}
+	})
+}
+
 // fakeBlockerResolver is a test double for BlockerResolver. Both
 // functions default to a no-op when nil: NeedsRead reports false and
 // Resolve returns the issue unchanged. Every Resolve call is recorded

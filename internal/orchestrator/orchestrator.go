@@ -990,6 +990,7 @@ func (o *Orchestrator) makeWorkerFn(resumeSessionID, sshHost, agentKind, templat
 				}
 			},
 			ResumeSessionID:         resumeSessionID,
+			DispatchID:              dispatchIDFromContext(ctx),
 			Logger:                  logger,
 			ToolRegistry:            o.toolRegistry,
 			SessionToolRegistryFunc: o.sessionToolRegistryFunc,
@@ -1118,6 +1119,7 @@ func (o *Orchestrator) maybeWriteIncrementalMetadata(ctx context.Context, issueI
 	meta := persistence.SessionMetadata{
 		IssueID:             issueID,
 		SessionID:           entry.SessionID,
+		DispatchID:          entry.DispatchID,
 		InputTokens:         entry.AgentInputTokens,
 		OutputTokens:        entry.AgentOutputTokens,
 		TotalTokens:         entry.AgentTotalTokens,

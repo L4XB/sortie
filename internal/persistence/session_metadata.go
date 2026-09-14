@@ -30,6 +30,11 @@ type SessionMetadata struct {
 	// written before this field existed is the exception: it keeps the
 	// count it had beside a false qualifier until its issue runs again.
 	APIRequestsMeasured bool
+
+	// DispatchID is the dispatch ID of the running session whose
+	// in-flight write last stored the row; empty when the session-exit
+	// write last stored it or the row predates the column.
+	DispatchID string
 }
 
 // UpsertSessionMetadata inserts or replaces session metadata for the given
@@ -44,8 +49,9 @@ func (s *Store) UpsertSessionMetadata(ctx context.Context, meta SessionMetadata)
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO session_metadata
 			(issue_id, session_id, agent_pid, input_tokens, output_tokens, total_tokens,
-			 cache_read_tokens, model_name, api_request_count, api_requests_measured, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 cache_read_tokens, model_name, api_request_count, api_requests_measured,
+			 dispatch_id, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (issue_id) DO UPDATE SET
 			session_id        = excluded.session_id,
 			agent_pid         = excluded.agent_pid,
@@ -56,11 +62,12 @@ func (s *Store) UpsertSessionMetadata(ctx context.Context, meta SessionMetadata)
 			model_name        = excluded.model_name,
 			api_request_count = excluded.api_request_count,
 			api_requests_measured = excluded.api_requests_measured,
+			dispatch_id       = excluded.dispatch_id,
 			updated_at        = excluded.updated_at`,
 		meta.IssueID, meta.SessionID, nullPID,
 		meta.InputTokens, meta.OutputTokens, meta.TotalTokens,
 		meta.CacheReadTokens, meta.ModelName, meta.APIRequestCount,
-		meta.APIRequestsMeasured, meta.UpdatedAt,
+		meta.APIRequestsMeasured, meta.DispatchID, meta.UpdatedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert session metadata %q: %w", meta.IssueID, err)
@@ -78,13 +85,13 @@ func (s *Store) LoadSessionMetadata(ctx context.Context, issueID string) (Sessio
 	err := s.db.QueryRowContext(ctx,
 		`SELECT issue_id, session_id, agent_pid, input_tokens, output_tokens, total_tokens,
 		        cache_read_tokens, model_name, api_request_count, api_requests_measured,
-		        updated_at
+		        dispatch_id, updated_at
 		FROM session_metadata
 		WHERE issue_id = ?`, issueID,
 	).Scan(&m.IssueID, &m.SessionID, &nullPID,
 		&m.InputTokens, &m.OutputTokens, &m.TotalTokens,
 		&m.CacheReadTokens, &m.ModelName, &m.APIRequestCount,
-		&m.APIRequestsMeasured, &m.UpdatedAt)
+		&m.APIRequestsMeasured, &m.DispatchID, &m.UpdatedAt)
 
 	if errors.Is(err, sql.ErrNoRows) {
 		return SessionMetadata{}, false, nil
@@ -105,7 +112,7 @@ func (s *Store) LoadAllSessionMetadata(ctx context.Context) ([]SessionMetadata, 
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT issue_id, session_id, agent_pid, input_tokens, output_tokens, total_tokens,
 		        cache_read_tokens, model_name, api_request_count, api_requests_measured,
-		        updated_at
+		        dispatch_id, updated_at
 		FROM session_metadata
 		ORDER BY updated_at DESC, issue_id ASC`)
 	if err != nil {
@@ -120,7 +127,7 @@ func (s *Store) LoadAllSessionMetadata(ctx context.Context) ([]SessionMetadata, 
 		if err := rows.Scan(&m.IssueID, &m.SessionID, &nullPID,
 			&m.InputTokens, &m.OutputTokens, &m.TotalTokens,
 			&m.CacheReadTokens, &m.ModelName, &m.APIRequestCount,
-			&m.APIRequestsMeasured, &m.UpdatedAt); err != nil {
+			&m.APIRequestsMeasured, &m.DispatchID, &m.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan session metadata: %w", err)
 		}
 		if nullPID.Valid {

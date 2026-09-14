@@ -225,6 +225,7 @@ func TestMigrate_ColumnCorrectness(t *testing.T) {
 				{"model_name", "TEXT", true, 0},
 				{"api_request_count", "INTEGER", true, 0},
 				{"api_requests_measured", "INTEGER", true, 0},
+				{"dispatch_id", "TEXT", true, 0},
 			},
 		},
 		{
@@ -508,6 +509,38 @@ func TestMigrate_Migration016_APIRequestsMeasuredDefault(t *testing.T) {
 	}
 	if apiRequestsMeasured != 0 {
 		t.Errorf("api_requests_measured for a pre-migration-016 row = %d, want 0 (the column default)", apiRequestsMeasured)
+	}
+}
+
+// TestMigrate_Migration017_DispatchIDDefault verifies that a
+// session_metadata row written before migration 017 reads dispatch_id
+// as the empty string once the database is migrated to the current
+// schema: a row predating the column belongs to no running dispatch and
+// must never match one.
+func TestMigrate_Migration017_DispatchIDDefault(t *testing.T) {
+	t.Parallel()
+
+	s := openTestStore(t)
+	migrateToVersion(t, s, 16)
+	ctx := context.Background()
+
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO session_metadata (issue_id, session_id, total_tokens, updated_at)
+		 VALUES ('sm-pre017', 'sess-pre017', 500, '2026-01-01T00:00:00Z')`,
+	); err != nil {
+		t.Fatalf("insert pre-migration-017 session_metadata row: %v", err)
+	}
+
+	migrateOrFatal(t, s)
+
+	var dispatchID string
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT dispatch_id FROM session_metadata WHERE issue_id = 'sm-pre017'`,
+	).Scan(&dispatchID); err != nil {
+		t.Fatalf("query dispatch_id: %v", err)
+	}
+	if dispatchID != "" {
+		t.Errorf("dispatch_id for a pre-migration-017 row = %q, want empty (the column default)", dispatchID)
 	}
 }
 

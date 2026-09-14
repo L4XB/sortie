@@ -352,6 +352,10 @@ type WorkerDeps struct {
 	// populates this from the previous RunningEntry.SessionID.
 	ResumeSessionID string
 
+	// DispatchID is this run's dispatch ID. Empty when the worker was
+	// not started through [Orchestrator.makeWorkerFn].
+	DispatchID string
+
 	// ToolRegistry holds the tools available to agent sessions. May
 	// be nil when no tools are registered. Read-only after construction.
 	ToolRegistry *domain.ToolRegistry
@@ -927,6 +931,7 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 			Identifier:            issue.Identifier,
 			DBPath:                deps.DBPath,
 			SessionID:             "",
+			DispatchID:            deps.DispatchID,
 			Attempt:               attempt,
 			AgentKind:             agentKind,
 			OperatorMCPConfigPath: settings.MCPConfigPath,

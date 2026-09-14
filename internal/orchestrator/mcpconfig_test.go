@@ -130,6 +130,7 @@ func TestGenerateMCPConfig(t *testing.T) {
 			"SORTIE_WORKSPACE":          p.WorkspacePath,
 			"SORTIE_DB_PATH":            p.DBPath,
 			"SORTIE_SESSION_ID":         p.SessionID,
+			"SORTIE_DISPATCH_ID":        p.DispatchID,
 			"SORTIE_SESSION_AGENT_KIND": p.AgentKind,
 		}
 		for k, want := range checks {
@@ -137,8 +138,8 @@ func TestGenerateMCPConfig(t *testing.T) {
 				t.Errorf("env[%q] = %q, want %q", k, env[k], want)
 			}
 		}
-		if len(env) != 6 {
-			t.Errorf("env key count = %d, want 6: %v", len(env), env)
+		if len(env) != 7 {
+			t.Errorf("env key count = %d, want 7: %v", len(env), env)
 		}
 	})
 
@@ -343,6 +344,7 @@ func TestGenerateMCPConfig(t *testing.T) {
 			"SORTIE_WORKSPACE":          p.WorkspacePath,
 			"SORTIE_DB_PATH":            p.DBPath,
 			"SORTIE_SESSION_ID":         p.SessionID,
+			"SORTIE_DISPATCH_ID":        p.DispatchID,
 			"SORTIE_SESSION_AGENT_KIND": p.AgentKind,
 		} {
 			if got, _ := env[k].(string); got != want {
@@ -350,9 +352,9 @@ func TestGenerateMCPConfig(t *testing.T) {
 			}
 		}
 
-		// 6 per-session + 2 process-level.
-		if len(env) != 8 {
-			t.Errorf("env key count = %d, want 8: %v", len(env), env)
+		// 7 per-session + 2 process-level.
+		if len(env) != 9 {
+			t.Errorf("env key count = %d, want 9: %v", len(env), env)
 		}
 	})
 
@@ -361,8 +363,9 @@ func TestGenerateMCPConfig(t *testing.T) {
 		dir := t.TempDir()
 		p := mcpParams(dir)
 		p.ProcessEnv = map[string]string{
-			"SORTIE_ISSUE_ID":   "stale-id",
-			"SORTIE_SESSION_ID": "stale-session",
+			"SORTIE_ISSUE_ID":    "stale-id",
+			"SORTIE_SESSION_ID":  "stale-session",
+			"SORTIE_DISPATCH_ID": "stale-dispatch",
 		}
 		_, err := GenerateMCPConfig(p)
 		if err != nil {
@@ -381,10 +384,13 @@ func TestGenerateMCPConfig(t *testing.T) {
 		if got, _ := env["SORTIE_SESSION_ID"].(string); got != p.SessionID {
 			t.Errorf("SORTIE_SESSION_ID = %q, want %q (per-session wins)", got, p.SessionID)
 		}
+		if got, _ := env["SORTIE_DISPATCH_ID"].(string); got != p.DispatchID {
+			t.Errorf("SORTIE_DISPATCH_ID = %q, want %q (per-session wins, even when empty)", got, p.DispatchID)
+		}
 
-		// Overwritten keys do not inflate the map; count stays at 6.
-		if len(env) != 6 {
-			t.Errorf("env key count = %d, want 6: %v", len(env), env)
+		// Overwritten keys do not inflate the map; count stays at 7.
+		if len(env) != 7 {
+			t.Errorf("env key count = %d, want 7: %v", len(env), env)
 		}
 	})
 
@@ -470,8 +476,8 @@ func TestGenerateMCPConfig_Attempt(t *testing.T) {
 		if got, ok := env["SORTIE_ATTEMPT"].(string); !ok || got != "2" {
 			t.Errorf("env[%q] = %q, want %q", "SORTIE_ATTEMPT", env["SORTIE_ATTEMPT"], "2")
 		}
-		if len(env) != 7 {
-			t.Errorf("env key count = %d, want 7: %v", len(env), env)
+		if len(env) != 8 {
+			t.Errorf("env key count = %d, want 8: %v", len(env), env)
 		}
 	})
 
@@ -494,6 +500,87 @@ func TestGenerateMCPConfig_Attempt(t *testing.T) {
 
 		if _, present := env["SORTIE_ATTEMPT"]; present {
 			t.Errorf("env[%q] = %v, want key absent when Attempt is nil", "SORTIE_ATTEMPT", env["SORTIE_ATTEMPT"])
+		}
+	})
+}
+
+// TestGenerateMCPConfig_DispatchID covers SORTIE_DISPATCH_ID delivery:
+// the generated env holds params.DispatchID, a per-session write
+// overwrites a different value already present in ProcessEnv, and an
+// empty params.DispatchID still overwrites a stale ProcessEnv value
+// rather than leaving it in place.
+func TestGenerateMCPConfig_DispatchID(t *testing.T) {
+	t.Parallel()
+
+	t.Run("written_from_params", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		p := mcpParams(dir)
+		p.DispatchID = "dispatch-abc123"
+
+		_, err := GenerateMCPConfig(p)
+		if err != nil {
+			t.Fatalf("GenerateMCPConfig: %v", err)
+		}
+
+		env, ok := sortieEntry(t, readMCPConfig(t, dir))["env"].(map[string]any)
+		if !ok {
+			t.Fatal("env is not an object")
+		}
+		got, ok := env["SORTIE_DISPATCH_ID"].(string)
+		if !ok || got != "dispatch-abc123" {
+			t.Errorf("env[%q] = %v, want %q", "SORTIE_DISPATCH_ID", env["SORTIE_DISPATCH_ID"], "dispatch-abc123")
+		}
+	})
+
+	t.Run("overwrites_process_env", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		p := mcpParams(dir)
+		p.DispatchID = "dispatch-fresh"
+		p.ProcessEnv = map[string]string{
+			"SORTIE_DISPATCH_ID": "stale-dispatch-from-process",
+		}
+
+		_, err := GenerateMCPConfig(p)
+		if err != nil {
+			t.Fatalf("GenerateMCPConfig: %v", err)
+		}
+
+		env, ok := sortieEntry(t, readMCPConfig(t, dir))["env"].(map[string]any)
+		if !ok {
+			t.Fatal("env is not an object")
+		}
+		got, _ := env["SORTIE_DISPATCH_ID"].(string)
+		if got != "dispatch-fresh" {
+			t.Errorf("env[%q] = %q (per-session), want %q; per-session write must win over ProcessEnv", "SORTIE_DISPATCH_ID", got, "dispatch-fresh")
+		}
+	})
+
+	t.Run("empty_dispatch_id_overwrites_process_env_with_empty_string", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		p := mcpParams(dir)
+		p.DispatchID = ""
+		p.ProcessEnv = map[string]string{
+			"SORTIE_DISPATCH_ID": "stale-dispatch-from-process",
+		}
+
+		_, err := GenerateMCPConfig(p)
+		if err != nil {
+			t.Fatalf("GenerateMCPConfig: %v", err)
+		}
+
+		env, ok := sortieEntry(t, readMCPConfig(t, dir))["env"].(map[string]any)
+		if !ok {
+			t.Fatal("env is not an object")
+		}
+		got, present := env["SORTIE_DISPATCH_ID"]
+		if !present {
+			t.Fatal("env[\"SORTIE_DISPATCH_ID\"] absent, want present with an empty value")
+		}
+		if got != "" {
+			t.Errorf("env[%q] = %v, want empty string (params.DispatchID empty overwrites ProcessEnv unconditionally)", "SORTIE_DISPATCH_ID", got)
 		}
 	})
 }
