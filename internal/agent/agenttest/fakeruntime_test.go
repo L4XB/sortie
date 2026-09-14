@@ -3,6 +3,8 @@ package agenttest_test
 import (
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -107,4 +109,49 @@ func TestFakeRuntime_Hang(t *testing.T) {
 		t.Fatalf("Kill() error = %v", err)
 	}
 	<-done
+}
+
+// TestFakeRuntimeRemovesItsBinaryBeforeTheDirectoryGoes pins the ordering the
+// Windows cleanup depends on: the fake runtime and its config are gone by the
+// time the directory that holds them is removed, so `t.TempDir()`'s own
+// cleanup never meets a file another process is still holding.
+func TestFakeRuntimeRemovesItsBinaryBeforeTheDirectoryGoes(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	var exe string
+
+	t.Run("inner", func(t *testing.T) {
+		exe = agenttest.FakeRuntime(t, dir, "agent", agenttest.OutputScenario, agenttest.Output{})
+		if _, err := os.Stat(exe); err != nil {
+			t.Fatalf("fake runtime was not created: %v", err)
+		}
+	})
+
+	// The subtest has finished, so its cleanups have run.
+	if _, err := os.Stat(exe); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("fake runtime still present after cleanup: %v", err)
+	}
+	config := strings.TrimSuffix(exe, ".exe") + ".fake.json"
+	if _, err := os.Stat(config); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("fake runtime config still present after cleanup: %v", err)
+	}
+}
+
+// TestFakeRuntimeCleanupSurvivesAnUnremovableFile keeps the cleanup from
+// turning a slow handle into a hard failure: the directory owner reports a
+// removal that never succeeds, this helper does not.
+func TestFakeRuntimeCleanupSurvivesAnUnremovableFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	t.Run("inner", func(t *testing.T) {
+		exe := agenttest.FakeRuntime(t, dir, "agent", agenttest.OutputScenario, agenttest.Output{})
+		// Remove it early: the cleanup then finds nothing, which is the same
+		// path a file that vanished underneath it takes.
+		if err := os.Remove(exe); err != nil {
+			t.Fatalf("remove: %v", err)
+		}
+	})
 }

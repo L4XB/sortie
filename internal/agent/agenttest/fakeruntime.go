@@ -2,8 +2,10 @@ package agenttest
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -157,7 +159,44 @@ func FakeRuntime(t testing.TB, dir, name, scenario string, params any) string {
 			t.Fatalf("FakeRuntime: %v", err)
 		}
 	}
+
+	// Windows holds the image of a process for a short while after it exits,
+	// so `t.TempDir()`'s own cleanup can meet "Access is denied" on this file
+	// and fail a test that has already passed. Cleanups run in reverse order
+	// of registration, so this one runs before the directory is removed and
+	// can wait the handle out.
+	t.Cleanup(func() {
+		removeEventually(t, path)
+		removeEventually(t, configPath(path))
+	})
+
 	return path
+}
+
+// removeEventually deletes path, retrying while the file system says it is
+// still in use. It never fails the test: a removal that does not succeed is
+// reported by whoever owns the directory, and turning a slow handle into a
+// hard failure here would trade one flake for another.
+func removeEventually(t testing.TB, path string) {
+	t.Helper()
+
+	const (
+		budget   = 2 * time.Second
+		interval = 20 * time.Millisecond
+	)
+
+	deadline := time.Now().Add(budget)
+	for {
+		err := os.Remove(path)
+		if err == nil || errors.Is(err, fs.ErrNotExist) {
+			return
+		}
+		if !time.Now().Before(deadline) {
+			t.Logf("FakeRuntime: could not remove %s after %s: %v", path, budget, err)
+			return
+		}
+		time.Sleep(interval)
+	}
 }
 
 func runScenario(config []byte, scenarios map[string]Scenario) int {
