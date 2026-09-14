@@ -56,8 +56,10 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - A retention value of `0` or below the floor disables the age bound; a value between `1` and the floor is rejected at config parse time
 - A failed tracker state read still lets the age bound evaluate and remove eligible workspaces on that pass
 - One sweep summary record is emitted per pass that produced a candidate set, including a pass that removed nothing, and its outcome counters sum to the candidate count
-- On Windows, the hook subprocess is a Job Object member before it executes whenever the Job Object was created; a creation failure is reported and the hook runs without one
-- On Windows, a hook process that cannot be resumed after job assignment is reported as a start failure rather than a timeout, unless a context error was already pending when resume was attempted
+- On Windows, the subprocess of a hook, the reaction triage command, an agent session or turn, an auxiliary launch, or a self-review verification command is a Job Object member before it executes whenever the Job Object was created; a creation failure is reported and the launch runs without one
+- On Windows, a subprocess of any of those launches that cannot be resumed after job assignment is reported as a start failure rather than a timeout, unless a context error was already pending when resume was attempted
+- An auxiliary one-shot launch whose output handle a surviving descendant holds returns within its bound with its exit status deciding the outcome
+- A hook, the reaction triage command, or a self-review verification command that exits zero while a process it started holds its output is reported as succeeding, and no process of its process group or Job Object remains when it returns, on every platform
 
 ### 17.3 Issue Tracker Client
 
