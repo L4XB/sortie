@@ -4,6 +4,7 @@ package procutil
 
 import (
 	"errors"
+	"os"
 	"os/exec"
 	"syscall"
 	"testing"
@@ -151,6 +152,37 @@ func TestKillProcessGroupReportingLeftover_ReapedFailOpenEntry(t *testing.T) {
 	}
 	if leftover {
 		t.Error("leftover = true, want false (no Job Object, so no membership was read)")
+	}
+}
+
+// TestProcessAlreadyGone pins which kill outcomes count as the process
+// having been gone. A successful Wait on Windows releases the handle
+// rather than marking the process done, so Kill answers with a bare
+// EINVAL there and never with ErrProcessDone; a kill that reached a
+// live process and failed must still be reported.
+func TestProcessAlreadyGone(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "released handle, which a reaped child leaves on Windows", err: syscall.EINVAL, want: true},
+		{name: "done process, the portable spelling", err: os.ErrProcessDone, want: true},
+		{name: "termination denied against a live process", err: os.NewSyscallError("TerminateProcess", syscall.EACCES), want: false},
+		{name: "a syscall failure carrying the same errno", err: os.NewSyscallError("TerminateProcess", syscall.EINVAL), want: false},
+		{name: "an unrelated error", err: errors.New("boom"), want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := processAlreadyGone(tt.err); got != tt.want {
+				t.Errorf("processAlreadyGone(%v) = %t, want %t", tt.err, got, tt.want)
+			}
+		})
 	}
 }
 

@@ -106,6 +106,28 @@ func KillProcessGroup(pid int) error {
 	return err
 }
 
+// processAlreadyGone reports whether err, as [os.Process.Kill]
+// returned it for a process the reap has already waited for, means the
+// process was already gone rather than that the kill could not reach a
+// live one.
+//
+// Kill answers for the two states a waited-for process is left in.
+// os/exec marks it done on Unix, which reports [os.ErrProcessDone], and
+// releases the handle on Windows, where a successful Wait deliberately
+// releases rather than marks done, which reports [syscall.EINVAL] on
+// its own. A kill that reached a live process and failed reports an
+// [os.SyscallError] naming the call it made instead, so no such failure
+// is read as the process having been gone.
+func processAlreadyGone(err error) bool {
+	if errors.Is(err, os.ErrProcessDone) {
+		return true
+	}
+	if _, ok := errors.AsType[*os.SyscallError](err); ok {
+		return false
+	}
+	return errors.Is(err, syscall.EINVAL)
+}
+
 // killProcessGroupReportingLeftover terminates the Job Object
 // registered for pid, exactly as [KillProcessGroup] does, and reports
 // whether a member other than one already exited was still running
@@ -127,7 +149,7 @@ func killProcessGroupReportingLeftover(pid int) (leftover bool, err error) {
 		// reporting it would raise the cleanup warning on every launch
 		// that ran without a Job Object. The Unix path maps ESRCH to nil
 		// for the same reason.
-		if killErr := entry.proc.Kill(); killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
+		if killErr := entry.proc.Kill(); killErr != nil && !processAlreadyGone(killErr) {
 			return false, killErr
 		}
 		return false, nil
