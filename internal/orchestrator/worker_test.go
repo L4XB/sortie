@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -2154,6 +2156,238 @@ func TestRunWorkerAttempt_TurnEndPairZeroAddedDelta(t *testing.T) {
 	if result.Usage != s2 {
 		t.Errorf("WorkerResult.Usage = %+v, want %+v (equal to S2)", result.Usage, s2)
 	}
+}
+
+// TestRunWorkerAttempt_WorkerMirrorFoldsModelAndRequestCount pins the
+// main-turn relay's fold into the worker mirror: a single turn's
+// token_usage event, carrying a model name and non-zero usage, followed
+// by its turn_completed event, delivers a WorkerResult whose
+// ModelName, APIRequestCount, UsageMeasured, and Usage all reflect
+// that one event.
+func TestRunWorkerAttempt_WorkerMirrorFoldsModelAndRequestCount(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	cfg := defaultWorkerConfig(tmpDir)
+	cfg.Agent.MaxTurns = 1
+
+	usage := domain.TokenUsage{InputTokens: 80, OutputTokens: 20, TotalTokens: 100}
+	ec := newExitCapture()
+
+	deps := WorkerDeps{
+		TrackerAdapter: &mockTrackerAdapter{},
+		AgentAdapter: &mockAgentAdapter{
+			runTurnFn: func(_ context.Context, session domain.Session, params domain.RunTurnParams) (domain.TurnResult, error) {
+				params.OnEvent(domain.AgentEvent{Type: domain.EventTokenUsage, Timestamp: time.Now().UTC(), Model: "m", Usage: usage})
+				params.OnEvent(domain.AgentEvent{Type: domain.EventTurnCompleted, Timestamp: time.Now().UTC(), Usage: usage})
+				return domain.TurnResult{SessionID: session.ID, ExitReason: domain.EventTurnCompleted}, nil
+			},
+		},
+		ConfigFunc:             func() config.ServiceConfig { return cfg },
+		PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "do work on {{ .issue.title }}") },
+		OnEvent:                func(_ string, _ domain.AgentEvent) {},
+		OnExit:                 ec.onExit,
+		Logger:                 discardLogger(),
+	}
+
+	RunWorkerAttempt(context.Background(), workerTestIssue(), nil, deps)
+
+	result := ec.waitResult(t)
+	if result.ModelName != "m" {
+		t.Errorf("WorkerResult.ModelName = %q, want %q", result.ModelName, "m")
+	}
+	if result.APIRequestCount != 1 {
+		t.Errorf("WorkerResult.APIRequestCount = %d, want 1", result.APIRequestCount)
+	}
+	if !result.UsageMeasured {
+		t.Error("WorkerResult.UsageMeasured = false, want true")
+	}
+	if result.Usage != usage {
+		t.Errorf("WorkerResult.Usage = %+v, want %+v", result.Usage, usage)
+	}
+
+	store := &mockExitStore{}
+	state := exitState(t, result.IssueID, nil)
+
+	HandleWorkerExit(state, result, defaultExitParams(t, store))
+
+	if len(store.sessionMetadata) != 1 {
+		t.Fatalf("UpsertSessionMetadata called %d times, want 1", len(store.sessionMetadata))
+	}
+	if got := store.sessionMetadata[0].ModelName; got != "m" {
+		t.Errorf("SessionMetadata.ModelName = %q, want %q (survives an entry that applied no event)", got, "m")
+	}
+}
+
+// TestRunWorkerAttempt_SelfReviewFoldsWorkerMirror pins the self-review
+// relay's fold into the worker mirror: a main turn reporting total 100
+// on one token_usage event named "m" and on its TurnResult, followed by
+// a self-review event named "r" at total 150, delivers a WorkerResult
+// whose ModelName is "r", whose APIRequestCount is 2, and whose
+// Usage.TotalTokens is 150. It also pins that deps.OnEvent receives
+// every emitted event exactly once, in emission order, equal to the
+// emitted event across every field, including a self-review event's
+// RateLimits compared by content and unaffected by a later mutation of
+// the emitted map, and that .sortie/state.json is untouched by the
+// self-review phase. Covered once for the event emitted during the
+// review turn, and once for the event emitted during the fix turn.
+func TestRunWorkerAttempt_SelfReviewFoldsWorkerMirror(t *testing.T) {
+	t.Parallel()
+
+	mainUsage := domain.TokenUsage{InputTokens: 80, OutputTokens: 20, TotalTokens: 100}
+	reviewUsage := domain.TokenUsage{InputTokens: 100, OutputTokens: 50, TotalTokens: 150}
+
+	type receivedEvent struct {
+		issueID string
+		event   domain.AgentEvent
+	}
+
+	type buildRunTurnFn func(t *testing.T, wsPath func() string, rateLimits map[string]any, record func(domain.AgentEvent)) func(context.Context, domain.Session, domain.RunTurnParams) (domain.TurnResult, error)
+
+	runVariant := func(t *testing.T, build buildRunTurnFn, maxIterations int) {
+		t.Helper()
+
+		tmpDir := t.TempDir()
+		cfg := defaultWorkerConfig(tmpDir)
+		cfg.Agent.MaxTurns = 10
+		cfg.SelfReview = config.SelfReviewConfig{
+			Enabled:               true,
+			MaxIterations:         maxIterations,
+			VerificationCommands:  []string{"echo ok"},
+			VerificationTimeoutMS: 5000,
+		}
+
+		rateLimits := map[string]any{"limit": int64(5)}
+		startFn, wsPath := captureWorkspacePath()
+		var received []receivedEvent
+		var emitted []domain.AgentEvent
+		record := func(event domain.AgentEvent) {
+			if event.RateLimits != nil {
+				event.RateLimits = maps.Clone(event.RateLimits)
+			}
+			emitted = append(emitted, event)
+		}
+		ec := newExitCapture()
+
+		deps := WorkerDeps{
+			TrackerAdapter: &mockTrackerAdapter{},
+			AgentAdapter: &mockAgentAdapter{
+				startSessionFn: startFn,
+				runTurnFn:      build(t, wsPath, rateLimits, record),
+			},
+			ConfigFunc:             func() config.ServiceConfig { return cfg },
+			PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "{{ .issue.title }}") },
+			OnEvent: func(issueID string, event domain.AgentEvent) {
+				received = append(received, receivedEvent{issueID: issueID, event: event})
+			},
+			OnExit:       ec.onExit,
+			Logger:       discardLogger(),
+			WorkflowPath: "/fake/WORKFLOW.md",
+		}
+
+		RunWorkerAttempt(context.Background(), workerTestIssue(), nil, deps)
+		result := ec.waitResult(t)
+
+		if result.ExitKind != WorkerExitNormal {
+			t.Fatalf("ExitKind = %q, want %q", result.ExitKind, WorkerExitNormal)
+		}
+		if result.ModelName != "r" {
+			t.Errorf("WorkerResult.ModelName = %q, want %q", result.ModelName, "r")
+		}
+		if result.APIRequestCount != 2 {
+			t.Errorf("WorkerResult.APIRequestCount = %d, want 2", result.APIRequestCount)
+		}
+		if result.Usage.TotalTokens != reviewUsage.TotalTokens {
+			t.Errorf("WorkerResult.Usage.TotalTokens = %d, want %d", result.Usage.TotalTokens, reviewUsage.TotalTokens)
+		}
+
+		if len(received) != len(emitted) {
+			t.Fatalf("deps.OnEvent received %d events, want %d (one per emitted event): %+v", len(received), len(emitted), received)
+		}
+		for i, want := range emitted {
+			got := received[i]
+			if got.issueID != workerTestIssue().ID {
+				t.Errorf("received[%d].issueID = %q, want %q", i, got.issueID, workerTestIssue().ID)
+			}
+			if !reflect.DeepEqual(got.event, want) {
+				t.Errorf("received[%d].event = %+v, want %+v (equal to the emitted event across every field)", i, got.event, want)
+			}
+		}
+
+		// The review-phase event's RateLimits must reach deps.OnEvent as a
+		// copy: the mock's runTurnFn mutates the original map after
+		// emitting the event, and the defensive copy in the self-review
+		// relay must keep that mutation from reaching the recorded event.
+		gotLimits := received[1].event.RateLimits
+		if gotLimits == nil {
+			t.Fatal("received[1].RateLimits = nil, want a non-nil copy")
+		}
+		if gotLimits["limit"] != int64(5) {
+			t.Errorf(`received[1].RateLimits["limit"] = %v, want 5 (unaffected by the later mutation)`, gotLimits["limit"])
+		}
+
+		state := readWorkerStateFile(t, result.WorkspacePath)
+		if state.TotalTokens == nil || *state.TotalTokens != mainUsage.TotalTokens {
+			t.Errorf(".sortie/state.json total_tokens = %v, want %d (self-review phase leaves it unwritten)", state.TotalTokens, mainUsage.TotalTokens)
+		}
+	}
+
+	t.Run("event emitted during the review turn", func(t *testing.T) {
+		t.Parallel()
+
+		build := buildRunTurnFn(func(t *testing.T, wsPath func() string, rateLimits map[string]any, record func(domain.AgentEvent)) func(context.Context, domain.Session, domain.RunTurnParams) (domain.TurnResult, error) {
+			var codingTurnDone bool
+			return func(_ context.Context, session domain.Session, params domain.RunTurnParams) (domain.TurnResult, error) {
+				switch {
+				case isSelfReviewTurnPrompt(params.Prompt):
+					event := domain.AgentEvent{Type: domain.EventTokenUsage, Timestamp: time.Now().UTC(), Model: "r", Usage: reviewUsage, Message: "review notes", RateLimits: rateLimits}
+					params.OnEvent(event)
+					record(event)
+					rateLimits["limit"] = int64(999)
+					writeVerdictFile(t, wsPath(), domain.ReviewVerdict{Verdict: "pass", Summary: "looks good"})
+				case !codingTurnDone:
+					codingTurnDone = true
+					event := domain.AgentEvent{Type: domain.EventTokenUsage, Timestamp: time.Now().UTC(), Model: "m", Usage: mainUsage}
+					params.OnEvent(event)
+					record(event)
+					writeStatusFile(t, wsPath(), "needs-human-review")
+					return domain.TurnResult{SessionID: session.ID, ExitReason: domain.EventTurnCompleted, Usage: mainUsage}, nil
+				}
+				return domain.TurnResult{SessionID: session.ID, ExitReason: domain.EventTurnCompleted}, nil
+			}
+		})
+
+		runVariant(t, build, 1)
+	})
+
+	t.Run("event emitted during the fix turn", func(t *testing.T) {
+		t.Parallel()
+
+		build := buildRunTurnFn(func(t *testing.T, wsPath func() string, rateLimits map[string]any, record func(domain.AgentEvent)) func(context.Context, domain.Session, domain.RunTurnParams) (domain.TurnResult, error) {
+			var codingTurnDone bool
+			return func(_ context.Context, session domain.Session, params domain.RunTurnParams) (domain.TurnResult, error) {
+				switch {
+				case isSelfReviewFixPrompt(params.Prompt):
+					event := domain.AgentEvent{Type: domain.EventTokenUsage, Timestamp: time.Now().UTC(), Model: "r", Usage: reviewUsage, Message: "review notes", RateLimits: rateLimits}
+					params.OnEvent(event)
+					record(event)
+					rateLimits["limit"] = int64(999)
+				case isSelfReviewTurnPrompt(params.Prompt):
+					writeVerdictFile(t, wsPath(), domain.ReviewVerdict{Verdict: "iterate", Summary: "needs fix"})
+				case !codingTurnDone:
+					codingTurnDone = true
+					event := domain.AgentEvent{Type: domain.EventTokenUsage, Timestamp: time.Now().UTC(), Model: "m", Usage: mainUsage}
+					params.OnEvent(event)
+					record(event)
+					writeStatusFile(t, wsPath(), "needs-human-review")
+					return domain.TurnResult{SessionID: session.ID, ExitReason: domain.EventTurnCompleted, Usage: mainUsage}, nil
+				}
+				return domain.TurnResult{SessionID: session.ID, ExitReason: domain.EventTurnCompleted}, nil
+			}
+		})
+
+		runVariant(t, build, 2)
+	})
 }
 
 // TestRunWorkerAttempt_ObservedIssueStatePropagated verifies that

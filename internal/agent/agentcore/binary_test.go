@@ -1,9 +1,9 @@
 package agentcore
 
 import (
+	"os"
 	"testing"
 
-	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
@@ -12,7 +12,10 @@ func TestResolveBinary(t *testing.T) {
 
 	t.Run("binary on PATH", func(t *testing.T) {
 		t.Parallel()
-		bin := agenttest.FakeRuntime(t, t.TempDir(), "agent", agenttest.OutputScenario, agenttest.Output{})
+		bin, err := os.Executable()
+		if err != nil {
+			t.Fatalf("os.Executable() unexpected error: %v", err)
+		}
 
 		got, agentErr := ResolveBinary(bin)
 
