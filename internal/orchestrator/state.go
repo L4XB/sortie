@@ -100,6 +100,10 @@ type RunningEntry struct {
 	// empty; populated when the worker reports session_started.
 	SessionID string
 
+	// DispatchID is the dispatch ID minted by [DispatchIssue] for this
+	// running entry. Never reassigned for the lifetime of the entry.
+	DispatchID string
+
 	// ThreadID is the adapter-assigned thread identifier. Populated by
 	// adapters that expose thread/turn granularity; empty otherwise.
 	ThreadID string

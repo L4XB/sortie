@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"cmp"
 	"context"
+	"crypto/rand"
 	"errors"
 	"log/slog"
 	"slices"
@@ -631,6 +632,23 @@ func ScheduleRetry(state *State, params ScheduleRetryParams, onFire func(issueID
 	}
 }
 
+// dispatchIDCtxKey is the context key for the dispatch ID passed from
+// the dispatch site to the worker goroutine via context.WithValue.
+type dispatchIDCtxKey struct{}
+
+// withDispatchID returns a child context carrying the dispatch ID
+// minted for a run. The worker reads this with [dispatchIDFromContext].
+func withDispatchID(ctx context.Context, dispatchID string) context.Context {
+	return context.WithValue(ctx, dispatchIDCtxKey{}, dispatchID)
+}
+
+// dispatchIDFromContext extracts the dispatch ID injected by
+// [withDispatchID]. Returns "" when ctx carries none.
+func dispatchIDFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(dispatchIDCtxKey{}).(string)
+	return v
+}
+
 // WorkerFunc is the function signature for the worker goroutine spawned by
 // [DispatchIssue]. The orchestrator provides the actual worker implementation
 // at call time; tests inject a controllable stub.
@@ -664,11 +682,15 @@ func DispatchIssue(ctx context.Context, state *State, issue domain.Issue, attemp
 		attemptCopy = new(*attempt)
 	}
 
+	dispatchID := rand.Text()
+	workerCtx = withDispatchID(workerCtx, dispatchID)
+
 	state.Claimed[issue.ID] = struct{}{}
 
 	state.Running[issue.ID] = &RunningEntry{
 		Identifier:   issue.Identifier,
 		Issue:        issue,
+		DispatchID:   dispatchID,
 		RetryAttempt: attemptCopy,
 		StartedAt:    time.Now().UTC(),
 		CancelFunc:   cancelFn,

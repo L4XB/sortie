@@ -61,6 +61,10 @@ type MCPConfigParams struct {
 	// SessionID is the agent session identifier (may be empty).
 	SessionID string
 
+	// DispatchID is written to the tool server environment as
+	// SORTIE_DISPATCH_ID.
+	DispatchID string
+
 	// Attempt is the retry attempt number for this worker session.
 	// Nil on the first run; non-nil on retries and continuations.
 	// When non-nil, written to the env block as SORTIE_ATTEMPT.
@@ -82,8 +86,8 @@ type MCPConfigParams struct {
 	// indirection in the workflow file (e.g., tracker credentials).
 	//
 	// Per-session variables (IssueID, Identifier, WorkspacePath,
-	// DBPath, SessionID) take precedence over same-named keys in
-	// ProcessEnv.
+	// DBPath, SessionID, DispatchID) take precedence over same-named
+	// keys in ProcessEnv.
 	ProcessEnv map[string]string
 }
 
@@ -105,6 +109,7 @@ func GenerateMCPConfig(params MCPConfigParams) (string, error) {
 	env["SORTIE_WORKSPACE"] = params.WorkspacePath
 	env["SORTIE_DB_PATH"] = params.DBPath
 	env["SORTIE_SESSION_ID"] = params.SessionID
+	env["SORTIE_DISPATCH_ID"] = params.DispatchID
 	env["SORTIE_SESSION_AGENT_KIND"] = params.AgentKind
 	if params.Attempt != nil {
 		env["SORTIE_ATTEMPT"] = strconv.Itoa(*params.Attempt)
