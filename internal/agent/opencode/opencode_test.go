@@ -774,15 +774,15 @@ func TestRunTurn_MultiTurnAccumulation(t *testing.T) {
 	}
 
 	export1Path := filepath.Join(tmpDir, "export1.json")
-	export1 := `{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123","providerID":"anthropic","modelID":"claude-sonnet-4-5","tokens":{"input":0,"output":100,"total":100,"cache":{"read":0,"write":0}}}}]}`
+	export1 := `{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123","providerID":"anthropic","modelID":"claude-sonnet-4-5","finish":"stop","tokens":{"input":0,"output":100,"total":100,"cache":{"read":0,"write":0}}}}]}`
 	if err := os.WriteFile(export1Path, []byte(export1), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	export2Path := filepath.Join(tmpDir, "export2.json")
 	export2 := `{"messages":[` +
-		`{"info":{"role":"assistant","sessionID":"ses_abc123","providerID":"anthropic","modelID":"claude-sonnet-4-5","tokens":{"input":0,"output":100,"total":100,"cache":{"read":0,"write":0}}}},` +
-		`{"info":{"role":"assistant","sessionID":"ses_abc123","providerID":"anthropic","modelID":"claude-sonnet-4-5","tokens":{"input":0,"output":60,"total":60,"cache":{"read":0,"write":0}}}}` +
+		`{"info":{"role":"assistant","sessionID":"ses_abc123","providerID":"anthropic","modelID":"claude-sonnet-4-5","finish":"stop","tokens":{"input":0,"output":100,"total":100,"cache":{"read":0,"write":0}}}},` +
+		`{"info":{"role":"assistant","sessionID":"ses_abc123","providerID":"anthropic","modelID":"claude-sonnet-4-5","finish":"stop","tokens":{"input":0,"output":60,"total":60,"cache":{"read":0,"write":0}}}}` +
 		`]}`
 	if err := os.WriteFile(export2Path, []byte(export2), 0o644); err != nil {
 		t.Fatal(err)
@@ -847,7 +847,7 @@ func TestRunTurn_UsageMeasuredPersistsAcrossCancelledTurn(t *testing.T) {
 	}
 
 	exportPath := filepath.Join(tmpDir, "export.json")
-	const export = `{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123","providerID":"anthropic","modelID":"claude-sonnet-4-5","tokens":{"input":10,"output":20,"total":30,"cache":{"read":0,"write":0}}}}]}`
+	const export = `{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123","providerID":"anthropic","modelID":"claude-sonnet-4-5","finish":"stop","tokens":{"input":10,"output":20,"total":30,"cache":{"read":0,"write":0}}}}]}`
 	if err := os.WriteFile(exportPath, []byte(export), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1465,7 +1465,7 @@ func TestRunTurn_UsageMeasured_TrueWhenExportYieldsUsage(t *testing.T) {
 	}
 
 	exportPath := filepath.Join(tmpDir, "export.json")
-	const export = `{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123","providerID":"anthropic","modelID":"claude-sonnet-4-5","tokens":{"input":10,"output":20,"total":30,"cache":{"read":0,"write":0}}}}]}`
+	const export = `{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123","providerID":"anthropic","modelID":"claude-sonnet-4-5","finish":"stop","tokens":{"input":10,"output":20,"total":30,"cache":{"read":0,"write":0}}}}]}`
 	if err := os.WriteFile(exportPath, []byte(export), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1506,7 +1506,7 @@ func TestRunTurn_UsageMeasured_TrueWhenTheExportIsAGenuineZero(t *testing.T) {
 
 	exportPath := filepath.Join(tmpDir, "export.json")
 	const export = `{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123",` +
-		`"providerID":"anthropic","modelID":"claude-sonnet-4-5",` +
+		`"providerID":"anthropic","modelID":"claude-sonnet-4-5","finish":"stop",` +
 		`"tokens":{"input":0,"output":0,"total":0,"cache":{"read":0,"write":0}}}}]}`
 	if err := os.WriteFile(exportPath, []byte(export), 0o644); err != nil {
 		t.Fatal(err)
@@ -2954,7 +2954,7 @@ func TestRunTurn_CancelledTurnRecoversUsageFromExport(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	exportPath := filepath.Join(tmpDir, "export.json")
-	const export = `{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123","providerID":"anthropic","modelID":"claude-sonnet-4-5","tokens":{"input":10,"output":20,"total":30,"cache":{"read":0,"write":0}}}}]}`
+	const export = `{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123","providerID":"anthropic","modelID":"claude-sonnet-4-5","finish":"stop","tokens":{"input":10,"output":20,"total":30,"cache":{"read":0,"write":0}}}}]}`
 	if err := os.WriteFile(exportPath, []byte(export), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -3049,7 +3049,7 @@ func TestRunTurn_ReadTimeoutRecoversUsageFromExport(t *testing.T) {
 	createdMS := time.Now().Add(time.Minute).UnixMilli()
 	exportPath := filepath.Join(tmpDir, "export.json")
 	export := fmt.Sprintf(`{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123",`+
-		`"providerID":"anthropic","modelID":"claude-sonnet-4-5","time":{"created":%d},`+
+		`"providerID":"anthropic","modelID":"claude-sonnet-4-5","finish":"stop","time":{"created":%d},`+
 		`"tokens":{"input":7,"output":3,"total":10,"cache":{"read":0,"write":0}}}}]}`, createdMS)
 	if err := os.WriteFile(exportPath, []byte(export), 0o644); err != nil {
 		t.Fatal(err)

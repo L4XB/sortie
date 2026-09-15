@@ -346,6 +346,13 @@ func parseExportOutput(data []byte, sessionID string, sinceUnixMS int64) exportU
 				continue
 			}
 		}
+		// The runtime saves an assistant message with all-zero tokens before
+		// it calls the model, and fills them in together with `finish` when
+		// the step finishes. A message without `finish` is that placeholder,
+		// which a turn killed mid-step leaves behind, not a measurement.
+		if stringFromAny(info["finish"]) == "" {
+			continue
+		}
 		tokens := mapFromAny(info["tokens"])
 		if tokens == nil {
 			continue

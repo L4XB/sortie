@@ -291,7 +291,7 @@ func TestQueryExportUsage(t *testing.T) {
 		// recovered turned that known zero into an unknown spend, and
 		// threw away the model the export named along with it.
 		data := []byte(`{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123",` +
-			`"providerID":"anthropic","modelID":"claude-sonnet-4-5",` +
+			`"providerID":"anthropic","modelID":"claude-sonnet-4-5","finish":"stop",` +
 			`"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}}]}`)
 		usage := parseExportOutput(data, "ses_abc123", 0)
 
@@ -320,9 +320,11 @@ func TestQueryExportUsage(t *testing.T) {
 			"empty_messages": []byte(`{"messages":[]}`),
 			"invalid_json":   []byte("not valid json"),
 			"user_message":   []byte(`{"messages":[{"info":{"role":"user","sessionID":"ses_abc123","tokens":{"input":100,"output":50}}}]}`),
-			"missing_tokens": []byte(`{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123"}}]}`),
-			"other_session":  []byte(`{"messages":[{"info":{"role":"assistant","sessionID":"ses_other","tokens":{"input":1,"output":1}}}]}`),
-			"unparseable_in": []byte(`{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123","tokens":{"input":"x","output":1}}}]}`),
+			"missing_tokens": []byte(`{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123","finish":"stop"}}]}`),
+			"other_session":  []byte(`{"messages":[{"info":{"role":"assistant","sessionID":"ses_other","finish":"stop","tokens":{"input":1,"output":1}}}]}`),
+			"unparseable_in": []byte(`{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123","finish":"stop","tokens":{"input":"x","output":1}}}]}`),
+			"unfinished_step": []byte(`{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123",` +
+				`"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}}]}`),
 		} {
 			usage := parseExportOutput(data, "ses_abc123", 0)
 			if usage.Recovered {
@@ -433,7 +435,7 @@ func TestQueryExportUsage(t *testing.T) {
 	t.Run("parse_export_without_tokens_object_returns_zero", func(t *testing.T) {
 		t.Parallel()
 
-		data := []byte(`{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123","providerID":"anthropic","modelID":"claude-sonnet-4-5"}}]}`)
+		data := []byte(`{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123","providerID":"anthropic","modelID":"claude-sonnet-4-5","finish":"stop"}}]}`)
 		usage := parseExportOutput(data, "ses_abc123", 0)
 		if usage != (exportUsage{}) {
 			t.Errorf("usage = %+v, want zero value (no tokens object)", usage)
