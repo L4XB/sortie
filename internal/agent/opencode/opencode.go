@@ -467,7 +467,7 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 				if readErr := runtime.reader.Err(); readErr != nil && !errors.Is(readErr, procutil.ErrStdoutAbandoned) {
 					killTurnProcess(runtime)
 					_ = waitForProcess(runtime)
-					recovered := recoverUsage(ctx, state, turnWindow(state))
+					recovered := recoverUsage(ctx, state, runWindow(state))
 					clearActive(state, runtime)
 
 					ev := agentcore.TurnEvidence{Terminal: agentcore.TerminalCancelled, TerminalMessage: "turn cancelled"}
@@ -524,7 +524,7 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 			killTurnProcess(runtime)
 			_ = waitForProcess(runtime)
 			drainReaderBounded(runtime.reader, runtime.drainGrace)
-			recovered := recoverUsage(ctx, state, turnWindow(state))
+			recovered := recoverUsage(ctx, state, runWindow(state))
 			clearActive(state, runtime)
 			ev := agentcore.TurnEvidence{Terminal: agentcore.TerminalCancelled, TerminalMessage: "turn cancelled"}
 			result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, recovered)
@@ -550,7 +550,7 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 			_ = waitForProcess(runtime)
 			drainReaderBounded(runtime.reader, runtime.drainGrace)
 			procutil.EmitWarnLines(runtime.stderrCollector.Lines(), state.logger())
-			recovered := recoverUsage(ctx, state, turnWindow(state))
+			recovered := recoverUsage(ctx, state, runWindow(state))
 			clearActive(state, runtime)
 			ev := agentcore.TurnEvidence{
 				Terminal:          agentcore.TerminalFailure,
@@ -593,7 +593,7 @@ func (a *OpenCodeAdapter) StopSession(ctx context.Context, session domain.Sessio
 // not reset the read timer the way a stdout line does, neither of which is
 // a regression because the warning has never actually reached stdout.
 func (a *OpenCodeAdapter) finalizeExitedTurn(ctx context.Context, state *sessionState, runtime *turnRuntime, emit func(domain.AgentEvent), exit waitResult) (domain.TurnResult, error) {
-	recovered := recoverUsage(ctx, state, turnWindow(state))
+	recovered := recoverUsage(ctx, state, runWindow(state))
 
 	clearActive(state, runtime)
 	stderrLines := runtime.stderrCollector.Lines()
@@ -908,10 +908,11 @@ func recoverUsage(ctx context.Context, state *sessionState, sinceUnixMS int64) *
 	}
 }
 
-// turnWindow is the timestamp the export filters messages by: the turn's
-// own start for a session this adapter did not create, and none at all for
-// one it did, where every message in the session belongs to this run.
-func turnWindow(state *sessionState) int64 {
+// runWindow is the timestamp the export filters messages by: the run's start
+// for a session this adapter did not create, so the history a resumed
+// session brought with it stays out while every turn of this run stays in,
+// and none at all for one it did, where every message belongs to this run.
+func runWindow(state *sessionState) int64 {
 	if state.createdSession {
 		return 0
 	}

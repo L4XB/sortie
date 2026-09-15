@@ -3101,7 +3101,7 @@ func TestRunTurn_ReadTimeoutRecoversUsageFromExport(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// A resumed session exports the whole history, so the adapter filters
-	// on the turn's start time. This message has to fall inside that
+	// on the run's start time. This message has to fall inside that
 	// window; the window itself is covered by TestQueryExportUsage.
 	createdMS := time.Now().Add(time.Minute).UnixMilli()
 	exportPath := filepath.Join(tmpDir, "export.json")
