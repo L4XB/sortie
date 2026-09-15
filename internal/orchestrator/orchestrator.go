@@ -841,13 +841,14 @@ func (o *Orchestrator) handleTick(ctx context.Context) {
 		if !ok {
 			break
 		}
-		DispatchIssue(ctx, o.state, issue, nil, host, o.makeWorkerFn("", host, resolution.AgentKind, resolution.TemplateID, "", adapter))
+		arrival, attribution := o.resolveUsageDisposition(resolution.AgentKind, host)
+		DispatchIssue(ctx, o.state, issue, nil, host, o.makeWorkerFn("", host, resolution.AgentKind, resolution.TemplateID, "", adapter, arrival))
 		if entry := o.state.Running[issue.ID]; entry != nil {
 			entry.WorkflowFile = o.workflowFile()
 			entry.AgentKind = resolution.AgentKind
 			entry.RuleName = resolution.RuleName
 			entry.TemplateID = resolution.TemplateID
-			entry.UsageArrival, entry.UsageAttribution = o.resolveUsageDisposition(resolution.AgentKind, host)
+			entry.UsageArrival, entry.UsageAttribution = arrival, attribution
 			freezeIssueTokenBaseline(ctx, o.state, issue.ID, o.store, o.logger)
 		}
 		o.metrics.IncDispatches(outcomeSuccess)
@@ -943,12 +944,13 @@ func (o *Orchestrator) recordCandidateHold(decision CandidateDecision, pass *Tic
 // The closure captures channel references for OnEvent and OnExit
 // delivery. agentKind, templateID, and adapter carry the rule-resolved
 // selection from the caller (handleTick for initial dispatches,
-// HandleRetryTimer for retries). reactionKind selects the worker
-// posture via [dispatchPostureForReactionKind]. The
+// HandleRetryTimer for retries). usageArrival must be the value the
+// caller freezes onto the running entry. reactionKind selects the
+// worker posture via [dispatchPostureForReactionKind]. The
 // resumeSessionID must be read by the caller (on the event loop
 // goroutine) before the goroutine starts, to avoid a data race on the
 // Running map.
-func (o *Orchestrator) makeWorkerFn(resumeSessionID, sshHost, agentKind, templateID, reactionKind string, adapter domain.AgentAdapter) WorkerFunc {
+func (o *Orchestrator) makeWorkerFn(resumeSessionID, sshHost, agentKind, templateID, reactionKind string, adapter domain.AgentAdapter, usageArrival registry.UsageArrival) WorkerFunc {
 	strictHostKeyChecking := o.sshStrictHostKeyChecking
 	posture := dispatchPostureForReactionKind(reactionKind)
 	if adapter == nil {
@@ -968,6 +970,7 @@ func (o *Orchestrator) makeWorkerFn(resumeSessionID, sshHost, agentKind, templat
 			PromptTemplateByIDFunc: o.workflowManager.PromptTemplateByID,
 			TemplateID:             templateID,
 			AgentKind:              agentKind,
+			UsageArrival:           usageArrival,
 			OnEvent: func(issueID string, event domain.AgentEvent) {
 				select {
 				case o.agentEventCh <- agentEventMsg{IssueID: issueID, Event: event}:
@@ -1093,7 +1096,8 @@ const sessionMetadataWriteInterval = 2 * time.Second
 // component, makes a session_metadata row exist exactly when the
 // session has reported a measurement, including one that reports zero.
 // It is a no-op for an event carrying neither signal, for unknown
-// issues, and while throttled. Must be called from the orchestrator's
+// issues, for a session whose usage arrival is none, and while
+// throttled. Must be called from the orchestrator's
 // single-writer event loop so it shares the one SQLite writer and the
 // running entry it mutates.
 func (o *Orchestrator) maybeWriteIncrementalMetadata(ctx context.Context, issueID string, event domain.AgentEvent) {
@@ -1102,6 +1106,9 @@ func (o *Orchestrator) maybeWriteIncrementalMetadata(ctx context.Context, issueI
 	}
 	entry := o.state.Running[issueID]
 	if entry == nil {
+		return
+	}
+	if !admitsUsageFigures(entry.UsageArrival) {
 		return
 	}
 	now := time.Now().UTC()

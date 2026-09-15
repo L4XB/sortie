@@ -238,6 +238,7 @@ func TestMigrate_ColumnCorrectness(t *testing.T) {
 				{"seconds_running", "REAL", true, 0},
 				{"updated_at", "TEXT", true, 0},
 				{"cache_read_tokens", "INTEGER", true, 0},
+				{"unmeasured_sessions", "INTEGER", true, 0},
 			},
 		},
 	}
@@ -329,6 +330,32 @@ func TestMigrate_DefaultValues(t *testing.T) {
 	}
 	if secRunning != 0.0 {
 		t.Errorf("aggregate_metrics.seconds_running default = %f, want 0.0", secRunning)
+	}
+}
+
+// TestMigrate_Migration018_UnmeasuredSessionsDefault verifies the column
+// defaults to 0 when omitted from an insert.
+func TestMigrate_Migration018_UnmeasuredSessionsDefault(t *testing.T) {
+	t.Parallel()
+
+	s := openTestStore(t)
+	migrateOrFatal(t, s)
+	ctx := context.Background()
+
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO aggregate_metrics (key, updated_at)
+		 VALUES ('agent_totals', '2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatalf("insert aggregate_metrics: %v", err)
+	}
+
+	var unmeasured int64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT unmeasured_sessions FROM aggregate_metrics WHERE key='agent_totals'`,
+	).Scan(&unmeasured); err != nil {
+		t.Fatalf("query aggregate_metrics.unmeasured_sessions: %v", err)
+	}
+	if unmeasured != 0 {
+		t.Errorf("aggregate_metrics.unmeasured_sessions default = %d, want 0", unmeasured)
 	}
 }
 
@@ -621,5 +648,90 @@ func TestMigrate_Migration002_SchemaMigrationsTracking(t *testing.T) {
 	}
 	if _, err := time.Parse(time.RFC3339, appliedAt); err != nil {
 		t.Errorf("applied_at %q is not valid RFC 3339: %v", appliedAt, err)
+	}
+}
+
+// insertPreMigration018AggregateMetrics inserts a row using the pre-018 column set (no unmeasured_sessions).
+func insertPreMigration018AggregateMetrics(t *testing.T, s *Store, key string, inputTokens int64) {
+	t.Helper()
+	if _, err := s.db.ExecContext(context.Background(),
+		`INSERT INTO aggregate_metrics (key, input_tokens, output_tokens, total_tokens, cache_read_tokens, seconds_running, updated_at)
+		 VALUES (?, ?, 0, 0, 0, 0, '2026-01-01T00:00:00Z')`, key, inputTokens,
+	); err != nil {
+		t.Fatalf("insert pre-migration-018 aggregate_metrics row: %v", err)
+	}
+}
+
+// insertRunHistoryRow inserts a minimal run_history row with the given status and tokens_measured verdict.
+func insertRunHistoryRow(t *testing.T, s *Store, issueID, status string, tokensMeasured bool) {
+	t.Helper()
+	if _, err := s.db.ExecContext(context.Background(),
+		`INSERT INTO run_history (issue_id, identifier, attempt, agent_adapter, workspace, started_at, completed_at, status, tokens_measured)
+		 VALUES (?, 'MT-1', 1, 'mock', '/tmp', '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z', ?, ?)`,
+		issueID, status, tokensMeasured,
+	); err != nil {
+		t.Fatalf("insert run_history row %q: %v", issueID, err)
+	}
+}
+
+// TestMigrate_Migration018_BackfillsUnmeasuredSessionCount verifies the
+// backfill counts only the tokens_measured = 0 run_history rows.
+func TestMigrate_Migration018_BackfillsUnmeasuredSessionCount(t *testing.T) {
+	t.Parallel()
+
+	s := openTestStore(t)
+	migrateToVersion(t, s, 17)
+	insertPreMigration018AggregateMetrics(t, s, "agent_totals", 1000)
+
+	insertRunHistoryRow(t, s, "rh-unmeasured-1", "succeeded", false)
+	insertRunHistoryRow(t, s, "rh-unmeasured-2", "failed", false)
+	insertRunHistoryRow(t, s, "rh-unmeasured-3", "needs_person", false)
+	insertRunHistoryRow(t, s, "rh-measured-1", "succeeded", true)
+	insertRunHistoryRow(t, s, "rh-measured-2", "budget_stopped", true)
+	insertRunHistoryRow(t, s, "rh-ci-failed", "ci_failed", true)
+
+	migrateOrFatal(t, s)
+
+	var unmeasured int64
+	if err := s.db.QueryRowContext(context.Background(),
+		`SELECT unmeasured_sessions FROM aggregate_metrics WHERE key = 'agent_totals'`,
+	).Scan(&unmeasured); err != nil {
+		t.Fatalf("query aggregate_metrics.unmeasured_sessions: %v", err)
+	}
+	if unmeasured != 3 {
+		t.Errorf("aggregate_metrics.unmeasured_sessions = %d, want 3 (the tokens_measured = 0 rows only)", unmeasured)
+	}
+
+	var inputTokens int64
+	if err := s.db.QueryRowContext(context.Background(),
+		`SELECT input_tokens FROM aggregate_metrics WHERE key = 'agent_totals'`,
+	).Scan(&inputTokens); err != nil {
+		t.Fatalf("query aggregate_metrics.input_tokens: %v", err)
+	}
+	if inputTokens != 1000 {
+		t.Errorf("aggregate_metrics.input_tokens = %d, want 1000 (unrelated column left untouched by the backfill)", inputTokens)
+	}
+}
+
+// TestMigrate_Migration018_NoAgentTotalsRow verifies the backfill inserts
+// no row when no agent_totals row exists to update.
+func TestMigrate_Migration018_NoAgentTotalsRow(t *testing.T) {
+	t.Parallel()
+
+	s := openTestStore(t)
+	migrateToVersion(t, s, 17)
+	insertRunHistoryRow(t, s, "rh-orphan-1", "succeeded", false)
+	insertRunHistoryRow(t, s, "rh-orphan-2", "succeeded", true)
+
+	migrateOrFatal(t, s)
+
+	var count int
+	if err := s.db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM aggregate_metrics WHERE key = 'agent_totals'`,
+	).Scan(&count); err != nil {
+		t.Fatalf("count aggregate_metrics rows: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("aggregate_metrics row count for key 'agent_totals' = %d, want 0 (no row existed to backfill)", count)
 	}
 }

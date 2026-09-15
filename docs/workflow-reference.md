@@ -1559,7 +1559,10 @@ Returns the system-wide runtime state including running sessions, retry queue, a
     "output_tokens": 2400,
     "total_tokens": 7400,
     "cache_read_tokens": 1500,
-    "seconds_running": 1834.2
+    "seconds_running": 1834.2,
+    "unmeasured_sessions": 2,
+    "running_unreported": 1,
+    "running_non_reporting": 0
   },
   "rate_limits": {}
 }
@@ -1571,12 +1574,12 @@ Returns the system-wide runtime state including running sessions, retry queue, a
 | ------------------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
 | `tokens`                  | object            | Token counts for this session. Each of the four members, `input_tokens`, `output_tokens`, `total_tokens`, and `cache_read_tokens`, is an integer or `null`. The four are `null` together, exactly when `tokens_measured` is `false`, and each carries its figure otherwise. |
 | `tokens.cache_read_tokens` | integer or `null` | Cumulative cache-read token count. Reflects tokens served from the LLM provider's prompt cache rather than reprocessed. `null` when `tokens_measured` is `false`; `0` when the session is measured and the agent adapter reports no cache data. |
-| `model_name`              | string or absent  | LLM model identifier reported by the agent (e.g. `"claude-sonnet-4-20250514"`). Omitted when the adapter does not report a model.         |
+| `model_name`              | string or absent  | LLM model identifier reported by the agent (e.g. `"claude-sonnet-4-20250514"`). Omitted when the adapter does not report a model, and when `usage_arrival` is `none`.         |
 | `api_request_count` | integer or `null` | Number of `token_usage` events received during this session, and a count of actual API requests only when `api_requests_measured` is `true`. `null` exactly when that field is `false`. |
 | `requests_by_model` | object or absent  | Map of model name to request count (e.g. `{"claude-sonnet-4-20250514": 3}`). Omitted when `api_requests_measured` is `false`, and when `usage_attribution` does not name a model. Enables tracking model usage when the agent switches models mid-session. |
 | `tool_time_percent` | number or `null`  | Cumulative tool call execution time as a percentage of session wall-clock time. Computed at response time. `null` when no tool timing data has been received. |
 | `api_time_percent`  | number or `null`  | Cumulative LLM API response wait time as a percentage of session wall-clock time. Computed at response time. `null` when no API timing data has been received. |
-| `tokens_measured`    | boolean           | True once at least one usage measurement has been reported in this session. The four members of `tokens` are `null` when it is `false`.   |
+| `tokens_measured`    | boolean           | True once at least one usage measurement has been reported in this session. The four members of `tokens` are `null` when it is `false`. False for a session whose `usage_arrival` is `none`, whatever its runtime reports.   |
 | `usage_arrival`      | string            | The session's kind's declared usage-reporting arrival, frozen at dispatch: `incremental`, `turn_end`, `none`, or `""` when undeclared.    |
 | `usage_attribution`  | string            | The session's kind's declared usage-reporting attribution, frozen at dispatch: `per_model`, `session_total`, `none`, or `""` when undeclared. |
 | `tokens_pending`     | boolean           | True only when `usage_arrival` is `turn_end`, the session is measured, and the turn that figure would settle for is still in flight.      |
@@ -1591,6 +1594,13 @@ Returns the system-wide runtime state including running sessions, retry queue, a
 | `total_tokens`      | integer | Total tokens consumed.                                                                                  |
 | `cache_read_tokens` | integer | Total cache-read tokens across all sessions. Follows the same cumulative-delta accounting as other token counters. |
 | `seconds_running`   | number  | Aggregate wall-clock runtime — completed-session time plus elapsed time from currently running sessions. |
+| `unmeasured_sessions` | integer | Ended sessions whose token usage was never recorded, which the token totals above leave out. Survives a restart. |
+| `running_unreported` | integer | Running sessions whose `usage_arrival` reports usage but that have not reported a figure yet. |
+| `running_non_reporting` | integer | Running sessions whose `usage_arrival` is `none`. |
+
+A session whose `usage_arrival` is `none` contributes nothing to the token totals, even when its runtime reports a figure.
+
+`cost_unpriced_running` is a top-level field, present, zero included, whenever `token_rates` configures a rate for any agent kind, and omitted otherwise. It counts the running, measured sessions that `active_estimated_cost_usd` leaves out because their agent kind has no rate. `active_estimated_cost_usd` sums the estimated USD cost of the running, measured sessions that have one, and is omitted when none of them prices.
 
 #### `GET /api/v1/{identifier}` — Per-Issue Detail
 

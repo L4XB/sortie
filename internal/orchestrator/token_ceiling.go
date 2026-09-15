@@ -94,6 +94,9 @@ func enforceInFlightTokenCeiling(ctx context.Context, state *State, issueID stri
 	if !ok || entry.TokenCeilingStopped {
 		return
 	}
+	if !admitsUsageFigures(entry.UsageArrival) {
+		return
+	}
 	if entry.IssueTokensCompleted+entry.AgentTotalTokens < int64(ceiling) {
 		return
 	}

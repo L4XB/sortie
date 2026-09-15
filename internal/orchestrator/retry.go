@@ -75,12 +75,12 @@ type HandleRetryTimerParams struct {
 
 	// MakeWorkerFn constructs a [WorkerFunc] for the given resume
 	// session ID, SSH host, dispatch-frozen agent kind and template
-	// ID, dispatch reaction kind, and resolved adapter. The retry
-	// handler resolves the adapter through AgentAdapterByKind before
-	// invoking this constructor; the closure no longer performs adapter
-	// lookup itself. The reaction kind selects the read-only worker
-	// posture for label-review dispatches.
-	MakeWorkerFn func(resumeSessionID, sshHost, agentKind, templateID, reactionKind string, adapter domain.AgentAdapter) WorkerFunc
+	// ID, dispatch reaction kind, resolved adapter, and usage arrival.
+	// The retry handler resolves the adapter through AgentAdapterByKind
+	// before invoking this constructor; the closure no longer performs
+	// adapter lookup itself. The reaction kind selects the read-only
+	// worker posture for label-review dispatches.
+	MakeWorkerFn func(resumeSessionID, sshHost, agentKind, templateID, reactionKind string, adapter domain.AgentAdapter, usageArrival registry.UsageArrival) WorkerFunc
 
 	// AgentAdapterByKind resolves the agent adapter for the given
 	// kind. Required when MakeWorkerFn is set. Returns a wrapped
@@ -667,7 +667,8 @@ func HandleRetryTimer(state *State, issueID string, params HandleRetryTimerParam
 	if popped.ContinuationContext != nil {
 		dispatchCtx = WithContinuationContext(ctx, popped.ContinuationContext)
 	}
-	DispatchIssue(dispatchCtx, state, issue, &attempt, host, params.MakeWorkerFn(popped.SessionID, host, agentKind, popped.TemplateID, popped.ReactionKind, adapter))
+	arrival, attribution := params.ResolveUsageDisposition(agentKind, host)
+	DispatchIssue(dispatchCtx, state, issue, &attempt, host, params.MakeWorkerFn(popped.SessionID, host, agentKind, popped.TemplateID, popped.ReactionKind, adapter, arrival))
 	if entry := state.Running[issue.ID]; entry != nil {
 		entry.WorkflowFile = params.WorkflowFile
 		entry.AgentKind = agentKind
@@ -675,7 +676,7 @@ func HandleRetryTimer(state *State, issueID string, params HandleRetryTimerParam
 		entry.TemplateID = popped.TemplateID
 		entry.ContinuationContext = popped.ContinuationContext
 		entry.ReactionKind = popped.ReactionKind
-		entry.UsageArrival, entry.UsageAttribution = params.ResolveUsageDisposition(agentKind, host)
+		entry.UsageArrival, entry.UsageAttribution = arrival, attribution
 		freezeIssueTokenBaseline(ctx, state, issueID, params.Store, params.Logger)
 	}
 	metrics.IncDispatches(outcomeSuccess)

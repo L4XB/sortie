@@ -18,7 +18,13 @@ type AggregateMetrics struct {
 	TotalTokens     int64
 	CacheReadTokens int64
 	SecondsRunning  float64
-	UpdatedAt       string // ISO-8601 timestamp of last update.
+
+	// UnmeasuredSessions is a cumulative count of ended sessions whose
+	// usage was never recorded, marking the totals above as a lower
+	// bound.
+	UnmeasuredSessions int64
+
+	UpdatedAt string // ISO-8601 timestamp of last update.
 }
 
 // UpsertAggregateMetrics inserts or replaces aggregate metrics for the given
@@ -28,17 +34,19 @@ type AggregateMetrics struct {
 func (s *Store) UpsertAggregateMetrics(ctx context.Context, metrics AggregateMetrics) error {
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO aggregate_metrics
-			(key, input_tokens, output_tokens, total_tokens, cache_read_tokens, seconds_running, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+			(key, input_tokens, output_tokens, total_tokens, cache_read_tokens, seconds_running, unmeasured_sessions, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (key) DO UPDATE SET
-			input_tokens      = excluded.input_tokens,
-			output_tokens     = excluded.output_tokens,
-			total_tokens      = excluded.total_tokens,
-			cache_read_tokens = excluded.cache_read_tokens,
-			seconds_running   = excluded.seconds_running,
-			updated_at        = excluded.updated_at`,
+			input_tokens        = excluded.input_tokens,
+			output_tokens       = excluded.output_tokens,
+			total_tokens        = excluded.total_tokens,
+			cache_read_tokens   = excluded.cache_read_tokens,
+			seconds_running     = excluded.seconds_running,
+			unmeasured_sessions = excluded.unmeasured_sessions,
+			updated_at          = excluded.updated_at`,
 		metrics.Key, metrics.InputTokens, metrics.OutputTokens,
-		metrics.TotalTokens, metrics.CacheReadTokens, metrics.SecondsRunning, metrics.UpdatedAt,
+		metrics.TotalTokens, metrics.CacheReadTokens, metrics.SecondsRunning,
+		metrics.UnmeasuredSessions, metrics.UpdatedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert aggregate metrics %q: %w", metrics.Key, err)
@@ -53,11 +61,11 @@ func (s *Store) LoadAggregateMetrics(ctx context.Context, key string) (Aggregate
 	var m AggregateMetrics
 
 	err := s.db.QueryRowContext(ctx,
-		`SELECT key, input_tokens, output_tokens, total_tokens, cache_read_tokens, seconds_running, updated_at
+		`SELECT key, input_tokens, output_tokens, total_tokens, cache_read_tokens, seconds_running, unmeasured_sessions, updated_at
 		FROM aggregate_metrics
 		WHERE key = ?`, key,
 	).Scan(&m.Key, &m.InputTokens, &m.OutputTokens,
-		&m.TotalTokens, &m.CacheReadTokens, &m.SecondsRunning, &m.UpdatedAt)
+		&m.TotalTokens, &m.CacheReadTokens, &m.SecondsRunning, &m.UnmeasuredSessions, &m.UpdatedAt)
 
 	if errors.Is(err, sql.ErrNoRows) {
 		return AggregateMetrics{}, false, nil
