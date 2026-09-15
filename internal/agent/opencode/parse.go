@@ -114,6 +114,14 @@ type exportUsage struct {
 	CacheReadTokens int64
 	Model           string
 	Cost            float64
+
+	// Recovered reports whether the export produced a figure at all,
+	// which is not the same question as whether that figure is non-zero.
+	// The runtime's assistant message carries `tokens` as a required
+	// object rather than one present only when something was spent, so a
+	// turn that genuinely cost zero exports the same shape as any other
+	// and must not read back as "nothing was recovered".
+	Recovered bool
 }
 
 func parseRunEvent(line []byte) (rawRunEvent, error) {
@@ -219,7 +227,7 @@ func queryExportUsage(ctx context.Context, state *sessionState, sinceUnixMS int6
 	}
 
 	usage := parseExportOutput(stdout.Bytes(), sessionID, sinceUnixMS)
-	if usage.InputTokens == 0 && usage.OutputTokens == 0 {
+	if !usage.Recovered {
 		state.logger().Warn("no assistant token usage found in opencode export")
 	}
 	return usage
@@ -338,6 +346,13 @@ func parseExportOutput(data []byte, sessionID string, sinceUnixMS int64) exportU
 				continue
 			}
 		}
+		// The runtime saves an assistant message with all-zero tokens before
+		// it calls the model, and fills them in together with `finish` when
+		// the step finishes. A message without `finish` is that placeholder,
+		// which a turn killed mid-step leaves behind, not a measurement.
+		if stringFromAny(info["finish"]) == "" {
+			continue
+		}
 		tokens := mapFromAny(info["tokens"])
 		if tokens == nil {
 			continue
@@ -383,6 +398,7 @@ func parseExportOutput(data []byte, sessionID string, sinceUnixMS int64) exportU
 	}
 
 	sum.TotalTokens = sum.InputTokens + sum.OutputTokens
+	sum.Recovered = true
 	return sum
 }
 

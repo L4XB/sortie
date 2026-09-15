@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -773,15 +774,15 @@ func TestRunTurn_MultiTurnAccumulation(t *testing.T) {
 	}
 
 	export1Path := filepath.Join(tmpDir, "export1.json")
-	export1 := `{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123","providerID":"anthropic","modelID":"claude-sonnet-4-5","tokens":{"input":0,"output":100,"total":100,"cache":{"read":0,"write":0}}}}]}`
+	export1 := `{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123","providerID":"anthropic","modelID":"claude-sonnet-4-5","finish":"stop","tokens":{"input":0,"output":100,"total":100,"cache":{"read":0,"write":0}}}}]}`
 	if err := os.WriteFile(export1Path, []byte(export1), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	export2Path := filepath.Join(tmpDir, "export2.json")
 	export2 := `{"messages":[` +
-		`{"info":{"role":"assistant","sessionID":"ses_abc123","providerID":"anthropic","modelID":"claude-sonnet-4-5","tokens":{"input":0,"output":100,"total":100,"cache":{"read":0,"write":0}}}},` +
-		`{"info":{"role":"assistant","sessionID":"ses_abc123","providerID":"anthropic","modelID":"claude-sonnet-4-5","tokens":{"input":0,"output":60,"total":60,"cache":{"read":0,"write":0}}}}` +
+		`{"info":{"role":"assistant","sessionID":"ses_abc123","providerID":"anthropic","modelID":"claude-sonnet-4-5","finish":"stop","tokens":{"input":0,"output":100,"total":100,"cache":{"read":0,"write":0}}}},` +
+		`{"info":{"role":"assistant","sessionID":"ses_abc123","providerID":"anthropic","modelID":"claude-sonnet-4-5","finish":"stop","tokens":{"input":0,"output":60,"total":60,"cache":{"read":0,"write":0}}}}` +
 		`]}`
 	if err := os.WriteFile(export2Path, []byte(export2), 0o644); err != nil {
 		t.Fatal(err)
@@ -846,7 +847,7 @@ func TestRunTurn_UsageMeasuredPersistsAcrossCancelledTurn(t *testing.T) {
 	}
 
 	exportPath := filepath.Join(tmpDir, "export.json")
-	const export = `{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123","providerID":"anthropic","modelID":"claude-sonnet-4-5","tokens":{"input":10,"output":20,"total":30,"cache":{"read":0,"write":0}}}}]}`
+	const export = `{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123","providerID":"anthropic","modelID":"claude-sonnet-4-5","finish":"stop","tokens":{"input":10,"output":20,"total":30,"cache":{"read":0,"write":0}}}}]}`
 	if err := os.WriteFile(exportPath, []byte(export), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1353,6 +1354,63 @@ printf '\n'`)
 	}, result, err)
 }
 
+// TestRunTurn_ReadErrorRecoversUsageFromExport pins recovery on the stdout
+// read-error arm. That arm also kills and waits for the process itself, and a
+// cancellation can surface through it as well as through the context case, so
+// without its own recovery the same work reports a figure or nothing
+// depending on which one fired first.
+func TestRunTurn_ReadErrorRecoversUsageFromExport(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+
+	exportPath := filepath.Join(tmpDir, "export.json")
+	const export = `{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123","providerID":"anthropic","modelID":"claude-sonnet-4-5","finish":"stop","tokens":{"input":10,"output":20,"total":30,"cache":{"read":0,"write":0}}}}]}`
+	if err := os.WriteFile(exportPath, []byte(export), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The first event teaches the adapter the session id an export needs;
+	// the oversized line after it is what fails the read.
+	script := writeOpenCodeScript(t, tmpDir, `case "$1" in
+  export) cat '`+exportPath+`'; exit 0;;
+esac
+printf '{"type":"step_start","timestamp":1000,"sessionID":"ses_abc123","part":{"id":"p1","messageID":"m1","sessionID":"ses_abc123","snapshot":"","type":"step-start"}}\n'
+head -c $((10*1024*1024+1)) /dev/zero | tr '\000' 'a'
+printf '\n'`)
+
+	a, _ := NewOpenCodeAdapter(map[string]any{})
+	session := mustStartSession(t, a, tmpDir, script)
+
+	events, result, err := collectEvents(t, a, session, "work")
+	if err == nil {
+		t.Fatal("RunTurn() error = nil, want oversized-line failure")
+	}
+	if result.ExitReason != domain.EventTurnFailed {
+		t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnFailed)
+	}
+	if !result.UsageMeasured {
+		t.Error("UsageMeasured = false; the export was readable and named a figure")
+	}
+	if result.Usage.InputTokens != 10 || result.Usage.OutputTokens != 20 {
+		t.Errorf("Usage = in:%d out:%d, want in:10 out:20",
+			result.Usage.InputTokens, result.Usage.OutputTokens)
+	}
+
+	var usageEvents []domain.AgentEvent
+	for _, ev := range events {
+		if ev.Type == domain.EventTokenUsage {
+			usageEvents = append(usageEvents, ev)
+		}
+	}
+	if len(usageEvents) != 1 {
+		t.Fatalf("token-usage events = %d, want exactly 1", len(usageEvents))
+	}
+	if usageEvents[0].Model != "anthropic/claude-sonnet-4-5" {
+		t.Errorf("Model = %q, want the model the export named", usageEvents[0].Model)
+	}
+}
+
 func TestRunTurn_EventAgentPID(t *testing.T) {
 	t.Parallel()
 
@@ -1464,7 +1522,7 @@ func TestRunTurn_UsageMeasured_TrueWhenExportYieldsUsage(t *testing.T) {
 	}
 
 	exportPath := filepath.Join(tmpDir, "export.json")
-	const export = `{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123","providerID":"anthropic","modelID":"claude-sonnet-4-5","tokens":{"input":10,"output":20,"total":30,"cache":{"read":0,"write":0}}}}]}`
+	const export = `{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123","providerID":"anthropic","modelID":"claude-sonnet-4-5","finish":"stop","tokens":{"input":10,"output":20,"total":30,"cache":{"read":0,"write":0}}}}]}`
 	if err := os.WriteFile(exportPath, []byte(export), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1484,6 +1542,69 @@ cat '`+runPath+`'`)
 
 	if !result.UsageMeasured {
 		t.Error("RunTurn().UsageMeasured = false, want true when the session export yielded a usage figure")
+	}
+}
+
+// TestRunTurn_UsageMeasured_TrueWhenTheExportIsAGenuineZero is the same
+// property as the test above on the COMPLETION path, for the export shape the
+// value-based check used to throw away: an assistant message whose tokens are
+// all zero. The terminal-turn tests all use non-zero exports, so none of them
+// would notice a finalizer that went back to reading the values.
+func TestRunTurn_UsageMeasured_TrueWhenTheExportIsAGenuineZero(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+
+	runFixture := loadFixture(t, "simple_turn.jsonl")
+	runPath := filepath.Join(tmpDir, "run.jsonl")
+	if err := os.WriteFile(runPath, runFixture, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	exportPath := filepath.Join(tmpDir, "export.json")
+	const export = `{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123",` +
+		`"providerID":"anthropic","modelID":"claude-sonnet-4-5","finish":"stop",` +
+		`"tokens":{"input":0,"output":0,"total":0,"cache":{"read":0,"write":0}}}}]}`
+	if err := os.WriteFile(exportPath, []byte(export), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	script := writeOpenCodeScript(t, tmpDir, `case "$1" in
+  export) cat '`+exportPath+`'; exit 0;;
+esac
+cat '`+runPath+`'`)
+
+	a, _ := NewOpenCodeAdapter(map[string]any{})
+	session := mustStartSession(t, a, tmpDir, script)
+
+	events, result, err := collectEvents(t, a, session, "work")
+	if err != nil {
+		t.Fatalf("RunTurn() error = %v", err)
+	}
+
+	// A known zero is a MEASURED spend, not an unknown one -- that is the
+	// distinction the verdict exists to make.
+	if !result.UsageMeasured {
+		t.Error("UsageMeasured = false; the export was readable and reported zero")
+	}
+	if result.Usage.InputTokens != 0 || result.Usage.OutputTokens != 0 {
+		t.Errorf("Usage = in:%d out:%d, want in:0 out:0",
+			result.Usage.InputTokens, result.Usage.OutputTokens)
+	}
+
+	var usageEvents []domain.AgentEvent
+	for _, ev := range events {
+		if ev.Type == domain.EventTokenUsage {
+			usageEvents = append(usageEvents, ev)
+		}
+	}
+	if len(usageEvents) != 1 {
+		t.Fatalf("token-usage events = %d, want exactly 1", len(usageEvents))
+	}
+	// The model the export named rides along with the zero; dropping the
+	// recovery dropped this too.
+	if usageEvents[0].Model != "anthropic/claude-sonnet-4-5" {
+		t.Errorf("Model = %q, want the model the export named", usageEvents[0].Model)
 	}
 }
 
@@ -2873,5 +2994,160 @@ exit 0
 	}
 	if result.ExitReason != domain.EventTurnCompleted {
 		t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnCompleted)
+	}
+}
+
+// TestRunTurn_CancelledTurnRecoversUsageFromExport pins recovery on the
+// cancellation branch of the turn's select. That branch terminates the process
+// itself rather than routing through the normal-exit finalization, so without
+// its own recovery the same completed work reports a figure or nothing
+// depending only on which case won.
+//
+// The turn cancelled here is the FIRST one, so `measured` starts false and a
+// true verdict can only have come from recovery on this path.
+func TestRunTurn_CancelledTurnRecoversUsageFromExport(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+
+	exportPath := filepath.Join(tmpDir, "export.json")
+	const export = `{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123","providerID":"anthropic","modelID":"claude-sonnet-4-5","finish":"stop","tokens":{"input":10,"output":20,"total":30,"cache":{"read":0,"write":0}}}}]}`
+	if err := os.WriteFile(exportPath, []byte(export), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// One event so the test knows the turn is running, then block until
+	// the context is cancelled.
+	script := writeOpenCodeScript(t, tmpDir, `case "$1" in
+  export) cat '`+exportPath+`'; exit 0;;
+esac
+printf '{"type":"step_start","timestamp":1000,"sessionID":"ses_abc123","part":{"id":"p1","messageID":"m1","sessionID":"ses_abc123","snapshot":"","type":"step-start"}}\n'
+sleep 1000`)
+
+	outerCtx, outerCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer outerCancel()
+
+	a, _ := NewOpenCodeAdapter(map[string]any{})
+	session, err := a.StartSession(outerCtx, domain.StartSessionParams{
+		WorkspacePath: tmpDir,
+		AgentConfig:   domain.AgentConfig{Command: script},
+	})
+	if err != nil {
+		t.Fatalf("StartSession() error = %v", err)
+	}
+
+	turnCtx, turnCancel := context.WithCancel(outerCtx)
+	gotEvent := make(chan struct{}, 1)
+	resultCh := make(chan domain.TurnResult, 1)
+	var mu sync.Mutex
+	var usageEvents []domain.AgentEvent
+	go func() {
+		result, _ := a.RunTurn(turnCtx, session, domain.RunTurnParams{
+			Prompt: "only prompt",
+			OnEvent: func(ev domain.AgentEvent) {
+				if ev.Type == domain.EventTokenUsage {
+					mu.Lock()
+					usageEvents = append(usageEvents, ev)
+					mu.Unlock()
+				}
+				select {
+				case gotEvent <- struct{}{}:
+				default:
+				}
+			},
+		})
+		resultCh <- result
+	}()
+
+	select {
+	case <-gotEvent:
+	case <-outerCtx.Done():
+		t.Fatal("timed out waiting for the turn's first event")
+	}
+	turnCancel()
+
+	select {
+	case result := <-resultCh:
+		if result.ExitReason != domain.EventTurnCancelled {
+			t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnCancelled)
+		}
+		if !result.UsageMeasured {
+			t.Error("UsageMeasured = false; the export was readable and named a figure")
+		}
+		if result.Usage.InputTokens != 10 || result.Usage.OutputTokens != 20 {
+			t.Errorf("Usage = in:%d out:%d, want in:10 out:20",
+				result.Usage.InputTokens, result.Usage.OutputTokens)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if len(usageEvents) != 1 {
+			t.Fatalf("token-usage events = %d, want exactly 1", len(usageEvents))
+		}
+		if usageEvents[0].Model != "anthropic/claude-sonnet-4-5" {
+			t.Errorf("Model = %q, want the model the export named", usageEvents[0].Model)
+		}
+	case <-outerCtx.Done():
+		t.Fatal("RunTurn did not return after context cancel")
+	}
+}
+
+// TestRunTurn_ReadTimeoutRecoversUsageFromExport is the same defect on the
+// other abnormal branch: a turn killed for producing no first event still has
+// a readable session export, because the process is already gone by the time
+// the branch finalizes.
+func TestRunTurn_ReadTimeoutRecoversUsageFromExport(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+
+	// A resumed session exports the whole history, so the adapter filters
+	// on the run's start time. This message has to fall inside that
+	// window; the window itself is covered by TestQueryExportUsage.
+	createdMS := time.Now().Add(time.Minute).UnixMilli()
+	exportPath := filepath.Join(tmpDir, "export.json")
+	export := fmt.Sprintf(`{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123",`+
+		`"providerID":"anthropic","modelID":"claude-sonnet-4-5","finish":"stop","time":{"created":%d},`+
+		`"tokens":{"input":7,"output":3,"total":10,"cache":{"read":0,"write":0}}}}]}`, createdMS)
+	if err := os.WriteFile(exportPath, []byte(export), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Never emits a json event, so the read timer is what ends the turn.
+	script := writeOpenCodeScript(t, tmpDir, `case "$1" in
+  export) cat '`+exportPath+`'; exit 0;;
+esac
+sleep 1000`)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Resumed, so the session id is known before the turn starts. A turn
+	// that emits nothing never learns one, and an export needs one -- which
+	// is a separate reason to recover nothing, and not the one under test.
+	a, _ := NewOpenCodeAdapter(map[string]any{})
+	session, err := a.StartSession(ctx, domain.StartSessionParams{
+		WorkspacePath: tmpDir,
+		// The export's own budget is 2x this, so a value tight enough to
+		// keep the test quick still has to leave the export room to run
+		// on a loaded machine -- at 300ms it flaked under `go test` for
+		// the whole package.
+		AgentConfig:     domain.AgentConfig{Command: script, ReadTimeoutMS: 1500},
+		ResumeSessionID: "ses_abc123",
+	})
+	if err != nil {
+		t.Fatalf("StartSession() error = %v", err)
+	}
+
+	result, _ := a.RunTurn(ctx, session, domain.RunTurnParams{
+		Prompt:  "only prompt",
+		OnEvent: func(domain.AgentEvent) {},
+	})
+
+	if !result.UsageMeasured {
+		t.Error("UsageMeasured = false; the export was readable and named a figure")
+	}
+	if result.Usage.InputTokens != 7 || result.Usage.OutputTokens != 3 {
+		t.Errorf("Usage = in:%d out:%d, want in:7 out:3",
+			result.Usage.InputTokens, result.Usage.OutputTokens)
 	}
 }
