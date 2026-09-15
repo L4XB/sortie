@@ -140,60 +140,53 @@ func HandleAgentEvent(state *State, issueID string, event domain.AgentEvent, log
 	// RequestsByModel stay bound to token_usage events, mirroring the
 	// existing treatment of APIDurationMS.
 	var usageDelta domain.TokenUsage
-	if hasUsage(event.Usage) {
-		usageDelta = applyUsageDelta(state, entry, event.Usage, metrics)
-	}
-
-	// A token_usage event, even one carrying an all-zero payload, or any
-	// event carrying a non-zero usage component asserts that the agent's
-	// runtime reported a measurement. Monotone from false: set once and
-	// never cleared.
-	if event.Type == domain.EventTokenUsage || hasUsage(event.Usage) {
-		entry.UsageMeasured = true
-	}
-
-	// A token_usage event for a kind whose frozen declaration says it
-	// reports no usage contradicts that declaration: a runtime release
-	// started feeding a path the declaration assumed starved.
-	if event.Type == domain.EventTokenUsage && entry.UsageArrival == registry.UsageArrivalNone {
-		log.Debug("token_usage event contradicts the declared usage arrival",
-			slog.String("usage_arrival", string(entry.UsageArrival)),
-		)
-	}
-
-	if event.Type == domain.EventTokenUsage {
-		// The counter counts token_usage events, including one whose
-		// reported usage is entirely zero. That is a round-trip count
-		// only for a session the measurement verdict admits, and the
-		// increment stays unconditional so the verdict, not the
-		// counter, carries the distinction.
-		entry.APIRequestCount++
-
-		// A turn_end kind settles at most one figure per turn; more
-		// than one within the current turn contradicts that
-		// declaration. The comparison is scoped to the turn via the
-		// per-turn baseline, not via TurnCount, which undercounts for
-		// a kind emitting session_started once per session rather
-		// than once per turn.
-		if entry.UsageArrival == registry.UsageArrivalTurnEnd &&
-			entry.APIRequestCount-entry.APIRequestCountAtLastTurnEnd > 1 {
-			log.Debug("turn_end arrival reported more than one usage figure within a turn",
-				slog.Int("excess_count", entry.APIRequestCount-entry.APIRequestCountAtLastTurnEnd-1),
-			)
+	if admitsUsageFigures(entry.UsageArrival) {
+		if hasUsage(event.Usage) {
+			usageDelta = applyUsageDelta(state, entry, event.Usage, metrics)
 		}
 
-		// Track model: prefer the event's model, fall back to last known.
-		model := tokenUsageModel(event)
-		if model != "" {
-			entry.ModelName = model
-		} else {
-			model = entry.ModelName
+		// A token_usage event, even one carrying an all-zero payload, or
+		// any event carrying a non-zero usage component asserts that the
+		// agent's runtime reported a measurement. Monotone from false:
+		// set once and never cleared.
+		if event.Type == domain.EventTokenUsage || hasUsage(event.Usage) {
+			entry.UsageMeasured = true
 		}
-		if model != "" {
-			if entry.RequestsByModel == nil {
-				entry.RequestsByModel = make(map[string]int)
+
+		if event.Type == domain.EventTokenUsage {
+			// The counter counts token_usage events, including one whose
+			// reported usage is entirely zero. That is a round-trip count
+			// only for a session the measurement verdict admits, and the
+			// increment stays unconditional so the verdict, not the
+			// counter, carries the distinction.
+			entry.APIRequestCount++
+
+			// A turn_end kind settles at most one figure per turn; more
+			// than one within the current turn contradicts that
+			// declaration. The comparison is scoped to the turn via the
+			// per-turn baseline, not via TurnCount, which undercounts for
+			// a kind emitting session_started once per session rather
+			// than once per turn.
+			if entry.UsageArrival == registry.UsageArrivalTurnEnd &&
+				entry.APIRequestCount-entry.APIRequestCountAtLastTurnEnd > 1 {
+				log.Debug("turn_end arrival reported more than one usage figure within a turn",
+					slog.Int("excess_count", entry.APIRequestCount-entry.APIRequestCountAtLastTurnEnd-1),
+				)
 			}
-			entry.RequestsByModel[model]++
+
+			// Track model: prefer the event's model, fall back to last known.
+			model := tokenUsageModel(event)
+			if model != "" {
+				entry.ModelName = model
+			} else {
+				model = entry.ModelName
+			}
+			if model != "" {
+				if entry.RequestsByModel == nil {
+					entry.RequestsByModel = make(map[string]int)
+				}
+				entry.RequestsByModel[model]++
+			}
 		}
 	}
 
@@ -258,6 +251,13 @@ func HandleAgentEvent(state *State, issueID string, event domain.AgentEvent, log
 // four sites apply the same usage-bearing-event condition.
 func hasUsage(usage domain.TokenUsage) bool {
 	return usage.InputTokens != 0 || usage.OutputTokens != 0 || usage.TotalTokens != 0 || usage.CacheReadTokens != 0
+}
+
+// admitsUsageFigures reports whether a session with the given arrival
+// may record usage. A figure reported under arrival none contradicts
+// the declaration and is discarded rather than trusted.
+func admitsUsageFigures(arrival registry.UsageArrival) bool {
+	return arrival != registry.UsageArrivalNone
 }
 
 // tokenUsageModel returns the model name a token_usage event carries,

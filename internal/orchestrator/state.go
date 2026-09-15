@@ -73,6 +73,12 @@ type AgentTotals struct {
 	TotalTokens     int64
 	CacheReadTokens int64
 	SecondsRunning  float64
+
+	// UnmeasuredSessions counts ended sessions whose usage was never
+	// recorded, cumulatively across process restarts. The token
+	// counters above exclude these sessions; this is how many there
+	// were.
+	UnmeasuredSessions int64
 }
 
 // RateLimitSnapshot holds the latest rate-limit information received from
@@ -274,7 +280,8 @@ type RunningEntry struct {
 
 	// UsageMeasured is true once at least one usage measurement has been
 	// reported so far in this running session. Monotone: set true by
-	// [HandleAgentEvent] and never cleared.
+	// [HandleAgentEvent] and never cleared. Never set when UsageArrival
+	// is none.
 	UsageMeasured bool
 
 	// UsageArrival and UsageAttribution are the usage-reporting
@@ -1221,12 +1228,21 @@ type SnapshotBudgetEntry struct {
 // SnapshotAgentTotals holds aggregate token counts and runtime seconds
 // at a point in time. Unlike [AgentTotals], SecondsRunning includes
 // elapsed time from currently active sessions.
+//
+// UnmeasuredSessions, RunningUnreported, and RunningNonReporting
+// count, by reason, the sessions the four token counters leave out:
+// ended sessions with no recorded usage, running sessions whose kind
+// reports usage but none has arrived yet, and running sessions whose
+// kind reports none at all.
 type SnapshotAgentTotals struct {
-	InputTokens     int64   `json:"input_tokens"`
-	OutputTokens    int64   `json:"output_tokens"`
-	TotalTokens     int64   `json:"total_tokens"`
-	CacheReadTokens int64   `json:"cache_read_tokens"`
-	SecondsRunning  float64 `json:"seconds_running"`
+	InputTokens         int64   `json:"input_tokens"`
+	OutputTokens        int64   `json:"output_tokens"`
+	TotalTokens         int64   `json:"total_tokens"`
+	CacheReadTokens     int64   `json:"cache_read_tokens"`
+	SecondsRunning      float64 `json:"seconds_running"`
+	UnmeasuredSessions  int64   `json:"unmeasured_sessions"`
+	RunningUnreported   int     `json:"running_unreported"`
+	RunningNonReporting int     `json:"running_non_reporting"`
 }
 
 // RuntimeSnapshotResult is a point-in-time capture of the orchestrator's
@@ -1308,8 +1324,16 @@ func RuntimeSnapshot(state *State, now time.Time) RuntimeSnapshotResult {
 	}
 
 	var activeElapsedTotal float64
+	var runningUnreported, runningNonReporting int
 	for _, entry := range state.Running {
 		requestsMeasured := apiRequestsMeasured(entry.UsageArrival, entry.TurnCount, entry.APIRequestCount)
+
+		switch {
+		case entry.UsageArrival == registry.UsageArrivalNone:
+			runningNonReporting++
+		case entry.UsageArrival.ReportsAnyFigure() && !entry.UsageMeasured:
+			runningUnreported++
+		}
 
 		// A map has no null on the wire, so absence is the only way to
 		// say the breakdown means nothing. Gating it here rather than
@@ -1375,11 +1399,14 @@ func RuntimeSnapshot(state *State, now time.Time) RuntimeSnapshotResult {
 	}
 
 	snap.AgentTotals = SnapshotAgentTotals{
-		InputTokens:     state.AgentTotals.InputTokens,
-		OutputTokens:    state.AgentTotals.OutputTokens,
-		TotalTokens:     state.AgentTotals.TotalTokens,
-		CacheReadTokens: state.AgentTotals.CacheReadTokens,
-		SecondsRunning:  state.AgentTotals.SecondsRunning + activeElapsedTotal,
+		InputTokens:         state.AgentTotals.InputTokens,
+		OutputTokens:        state.AgentTotals.OutputTokens,
+		TotalTokens:         state.AgentTotals.TotalTokens,
+		CacheReadTokens:     state.AgentTotals.CacheReadTokens,
+		SecondsRunning:      state.AgentTotals.SecondsRunning + activeElapsedTotal,
+		UnmeasuredSessions:  state.AgentTotals.UnmeasuredSessions,
+		RunningUnreported:   runningUnreported,
+		RunningNonReporting: runningNonReporting,
 	}
 
 	snap.BudgetExhaustedCount = len(state.BudgetExhausted)

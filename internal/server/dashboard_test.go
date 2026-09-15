@@ -1930,9 +1930,6 @@ func TestBuildDashboardData_TokenRates(t *testing.T) {
 		if data.EstimatedCostUSD == nil || *data.EstimatedCostUSD != "$3.00" {
 			t.Errorf("EstimatedCostUSD = %v, want $3.00 (only the measured entry)", data.EstimatedCostUSD)
 		}
-		if data.UnmeasuredRunningCount != 1 {
-			t.Errorf("UnmeasuredRunningCount = %d, want 1", data.UnmeasuredRunningCount)
-		}
 
 		var measured, unmeasured dashboardRunningEntry
 		for _, e := range data.Running {
@@ -1957,27 +1954,6 @@ func TestBuildDashboardData_TokenRates(t *testing.T) {
 		}
 	})
 
-	t.Run("no unmeasured entries leaves UnmeasuredRunningCount at zero", func(t *testing.T) {
-		t.Parallel()
-
-		snap := orchestrator.RuntimeSnapshotResult{
-			GeneratedAt: now,
-			Running: []orchestrator.SnapshotRunningEntry{
-				{
-					Identifier:    "MT-ALL-MEASURED",
-					State:         "In Progress",
-					StartedAt:     now.Add(-5 * time.Minute),
-					UsageMeasured: true,
-				},
-			},
-		}
-
-		data := buildDashboardData(snap, "v1", now.Add(-1*time.Hour), nil, now, rates)
-
-		if data.UnmeasuredRunningCount != 0 {
-			t.Errorf("UnmeasuredRunningCount = %d, want 0", data.UnmeasuredRunningCount)
-		}
-	})
 }
 
 func TestHandleDashboard_WithTokenRates(t *testing.T) {
@@ -2095,6 +2071,7 @@ func TestHandleDashboard_UnmeasuredRunningEntry(t *testing.T) {
 				UsageAttribution: registry.UsageAttributionPerModel,
 			},
 		},
+		AgentTotals: orchestrator.SnapshotAgentTotals{RunningUnreported: 1},
 	}
 
 	ts := dashboardServer(t, fixedSnapshot(snap), "1.0.0", nil)
@@ -2106,8 +2083,291 @@ func TestHandleDashboard_UnmeasuredRunningEntry(t *testing.T) {
 	if !strings.Contains(dr.Body, "not reported") {
 		t.Error("body missing \"not reported\" for an unmeasured running entry's Tokens cell")
 	}
-	if !strings.Contains(dr.Body, "1 running sessions have not reported token usage; the totals above exclude them.") {
+	if !strings.Contains(dr.Body, "1 running session has not reported token usage yet; the totals above exclude it.") {
 		t.Errorf("body = %q, want the footer note naming the unmeasured count", dr.Body)
+	}
+}
+
+// TestCountedNote verifies the singular/plural selection and the
+// empty-string result for a non-positive count.
+func TestCountedNote(t *testing.T) {
+	t.Parallel()
+
+	const singular = "%d thing has happened."
+	const plural = "%d things have happened."
+
+	tests := []struct {
+		name string
+		n    int64
+		want string
+	}{
+		{"zero returns empty", 0, ""},
+		{"negative returns empty", -1, ""},
+		{"one uses singular form", 1, "1 thing has happened."},
+		{"two uses plural form", 2, "2 things have happened."},
+		{"large count uses plural form", 42, "42 things have happened."},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := countedNote(tt.n, singular, plural)
+
+			if got != tt.want {
+				t.Errorf("countedNote(%d, ...) = %q, want %q", tt.n, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestBuildDashboardData_ExclusionNotes verifies each footer note's text,
+// singular/plural form, and that none leaks an internal identifier.
+func TestBuildDashboardData_ExclusionNotes(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
+	fptr := func(v float64) *float64 { return &v }
+	rates := TokenRates{"claude": TokenRateConfig{InputPerMtok: fptr(3.0)}}
+
+	t.Run("singular forms", func(t *testing.T) {
+		t.Parallel()
+
+		snap := orchestrator.RuntimeSnapshotResult{
+			GeneratedAt: now,
+			Running: []orchestrator.SnapshotRunningEntry{
+				{
+					Identifier:   "MT-UNREPORTED",
+					StartedAt:    now.Add(-time.Minute),
+					UsageArrival: registry.UsageArrivalIncremental,
+				},
+				{
+					Identifier:   "MT-NOARRIVAL",
+					StartedAt:    now.Add(-time.Minute),
+					UsageArrival: registry.UsageArrivalNone,
+				},
+				{
+					Identifier:       "MT-UNPRICED",
+					StartedAt:        now.Add(-time.Minute),
+					AgentKind:        "unpriced-kind",
+					UsageMeasured:    true,
+					AgentInputTokens: 1000,
+					UsageArrival:     registry.UsageArrivalIncremental,
+				},
+			},
+			AgentTotals: orchestrator.SnapshotAgentTotals{UnmeasuredSessions: 1, RunningUnreported: 1, RunningNonReporting: 1},
+		}
+
+		data := buildDashboardData(snap, "test", now.Add(-time.Hour), nil, now, rates)
+
+		if data.RunningUnreportedNote != "1 running session has not reported token usage yet; the totals above exclude it." {
+			t.Errorf("RunningUnreportedNote = %q", data.RunningUnreportedNote)
+		}
+		if data.RunningNonReportingNote != "1 running session runs an agent that reports no token usage; the totals above exclude it." {
+			t.Errorf("RunningNonReportingNote = %q", data.RunningNonReportingNote)
+		}
+		if data.EndedUnmeasuredNote != "1 session that already ended never reported token usage; the totals above exclude it too." {
+			t.Errorf("EndedUnmeasuredNote = %q", data.EndedUnmeasuredNote)
+		}
+		if data.CostUnpricedNote != "1 running session is excluded from Est. Cost because token_rates has no price for its agent." {
+			t.Errorf("CostUnpricedNote = %q", data.CostUnpricedNote)
+		}
+
+		for _, note := range []string{
+			data.RunningUnreportedNote, data.RunningNonReportingNote,
+			data.EndedUnmeasuredNote, data.CostUnpricedNote,
+		} {
+			for _, forbidden := range []string{"aggregate_metrics", "unmeasured_sessions", "run_history", "SELECT", "sqlite"} {
+				if strings.Contains(note, forbidden) {
+					t.Errorf("note %q contains internal identifier %q", note, forbidden)
+				}
+			}
+		}
+	})
+
+	t.Run("plural forms", func(t *testing.T) {
+		t.Parallel()
+
+		snap := orchestrator.RuntimeSnapshotResult{
+			GeneratedAt: now,
+			Running: []orchestrator.SnapshotRunningEntry{
+				{Identifier: "MT-U1", StartedAt: now.Add(-time.Minute), UsageArrival: registry.UsageArrivalIncremental},
+				{Identifier: "MT-U2", StartedAt: now.Add(-time.Minute), UsageArrival: registry.UsageArrivalTurnEnd},
+				{Identifier: "MT-N1", StartedAt: now.Add(-time.Minute), UsageArrival: registry.UsageArrivalNone},
+				{Identifier: "MT-N2", StartedAt: now.Add(-time.Minute), UsageArrival: registry.UsageArrivalNone},
+				{
+					Identifier: "MT-P1", StartedAt: now.Add(-time.Minute), AgentKind: "unpriced-kind",
+					UsageMeasured: true, AgentInputTokens: 1000, UsageArrival: registry.UsageArrivalIncremental,
+				},
+				{
+					Identifier: "MT-P2", StartedAt: now.Add(-time.Minute), AgentKind: "other-unpriced",
+					UsageMeasured: true, AgentInputTokens: 1000, UsageArrival: registry.UsageArrivalIncremental,
+				},
+			},
+			AgentTotals: orchestrator.SnapshotAgentTotals{UnmeasuredSessions: 2, RunningUnreported: 2, RunningNonReporting: 2},
+		}
+
+		data := buildDashboardData(snap, "test", now.Add(-time.Hour), nil, now, rates)
+
+		if data.RunningUnreportedNote != "2 running sessions have not reported token usage yet; the totals above exclude them." {
+			t.Errorf("RunningUnreportedNote = %q", data.RunningUnreportedNote)
+		}
+		if data.RunningNonReportingNote != "2 running sessions run agents that report no token usage; the totals above exclude them." {
+			t.Errorf("RunningNonReportingNote = %q", data.RunningNonReportingNote)
+		}
+		if data.EndedUnmeasuredNote != "2 sessions that already ended never reported token usage; the totals above exclude them too." {
+			t.Errorf("EndedUnmeasuredNote = %q", data.EndedUnmeasuredNote)
+		}
+		if data.CostUnpricedNote != "2 running sessions are excluded from Est. Cost because token_rates has no price for their agents." {
+			t.Errorf("CostUnpricedNote = %q", data.CostUnpricedNote)
+		}
+	})
+
+	t.Run("all counts zero leaves every note empty", func(t *testing.T) {
+		t.Parallel()
+
+		snap := orchestrator.RuntimeSnapshotResult{
+			GeneratedAt: now,
+			Running: []orchestrator.SnapshotRunningEntry{
+				{
+					Identifier:       "MT-ALL-GOOD",
+					StartedAt:        now.Add(-time.Minute),
+					AgentKind:        "claude",
+					UsageMeasured:    true,
+					AgentInputTokens: 1000,
+					UsageArrival:     registry.UsageArrivalIncremental,
+				},
+			},
+		}
+
+		data := buildDashboardData(snap, "test", now.Add(-time.Hour), nil, now, rates)
+
+		if data.RunningUnreportedNote != "" {
+			t.Errorf("RunningUnreportedNote = %q, want empty", data.RunningUnreportedNote)
+		}
+		if data.RunningNonReportingNote != "" {
+			t.Errorf("RunningNonReportingNote = %q, want empty", data.RunningNonReportingNote)
+		}
+		if data.EndedUnmeasuredNote != "" {
+			t.Errorf("EndedUnmeasuredNote = %q, want empty", data.EndedUnmeasuredNote)
+		}
+		if data.CostUnpricedNote != "" {
+			t.Errorf("CostUnpricedNote = %q, want empty", data.CostUnpricedNote)
+		}
+	})
+
+	t.Run("no token rates leaves the cost note empty", func(t *testing.T) {
+		t.Parallel()
+
+		snap := orchestrator.RuntimeSnapshotResult{
+			GeneratedAt: now,
+			Running: []orchestrator.SnapshotRunningEntry{
+				{
+					Identifier: "MT-NO-RATES", StartedAt: now.Add(-time.Minute), AgentKind: "claude",
+					UsageMeasured: true, AgentInputTokens: 1000, UsageArrival: registry.UsageArrivalIncremental,
+				},
+			},
+		}
+
+		data := buildDashboardData(snap, "test", now.Add(-time.Hour), nil, now, nil)
+
+		if data.CostUnpricedNote != "" {
+			t.Errorf("CostUnpricedNote = %q, want empty: Est. Cost is not shown without token rates", data.CostUnpricedNote)
+		}
+	})
+
+	t.Run("no-usage-arrival session never contributes to the unreported note", func(t *testing.T) {
+		t.Parallel()
+
+		snap := orchestrator.RuntimeSnapshotResult{
+			GeneratedAt: now,
+			Running: []orchestrator.SnapshotRunningEntry{
+				{Identifier: "MT-NOARR", StartedAt: now.Add(-time.Minute), UsageArrival: registry.UsageArrivalNone},
+			},
+			AgentTotals: orchestrator.SnapshotAgentTotals{RunningNonReporting: 1},
+		}
+
+		data := buildDashboardData(snap, "test", now.Add(-time.Hour), nil, now, rates)
+
+		if data.RunningUnreportedNote != "" {
+			t.Errorf("RunningUnreportedNote = %q, want empty: an arrival-none session must not read as \"not reported yet\"", data.RunningUnreportedNote)
+		}
+		if data.RunningNonReportingNote == "" {
+			t.Error("RunningNonReportingNote is empty, want the no-usage-arrival note")
+		}
+	})
+
+	// Each reason gets a distinct count so a note sourced from the wrong
+	// population wouldn't pass by accident.
+	t.Run("each note counts only its own population, not a neighboring one", func(t *testing.T) {
+		t.Parallel()
+
+		snap := orchestrator.RuntimeSnapshotResult{
+			GeneratedAt: now,
+			Running: []orchestrator.SnapshotRunningEntry{
+				{Identifier: "MT-U1", StartedAt: now.Add(-time.Minute), UsageArrival: registry.UsageArrivalIncremental},
+				{
+					Identifier: "MT-P1", StartedAt: now.Add(-time.Minute), AgentKind: "unpriced-kind",
+					UsageMeasured: true, AgentInputTokens: 1000, UsageArrival: registry.UsageArrivalIncremental,
+				},
+				{
+					Identifier: "MT-P2", StartedAt: now.Add(-time.Minute), AgentKind: "other-unpriced",
+					UsageMeasured: true, AgentInputTokens: 1000, UsageArrival: registry.UsageArrivalIncremental,
+				},
+				{
+					Identifier: "MT-P3", StartedAt: now.Add(-time.Minute), AgentKind: "third-unpriced",
+					UsageMeasured: true, AgentInputTokens: 1000, UsageArrival: registry.UsageArrivalIncremental,
+				},
+			},
+			AgentTotals: orchestrator.SnapshotAgentTotals{UnmeasuredSessions: 7, RunningUnreported: 1},
+		}
+
+		data := buildDashboardData(snap, "test", now.Add(-time.Hour), nil, now, rates)
+
+		if data.RunningUnreportedNote != "1 running session has not reported token usage yet; the totals above exclude it." {
+			t.Errorf("RunningUnreportedNote = %q, want the count of running-unreported sessions (1)", data.RunningUnreportedNote)
+		}
+		if data.RunningNonReportingNote != "" {
+			t.Errorf("RunningNonReportingNote = %q, want empty (no arrival-none sessions present)", data.RunningNonReportingNote)
+		}
+		if data.EndedUnmeasuredNote != "7 sessions that already ended never reported token usage; the totals above exclude them too." {
+			t.Errorf("EndedUnmeasuredNote = %q, want the persisted count (7), not the running count", data.EndedUnmeasuredNote)
+		}
+		if data.CostUnpricedNote != "3 running sessions are excluded from Est. Cost because token_rates has no price for their agents." {
+			t.Errorf("CostUnpricedNote = %q, want the count of unpriced measured sessions (3)", data.CostUnpricedNote)
+		}
+	})
+}
+
+// TestHandleDashboard_NoUsageArrivalAndEndedUnmeasuredNotesRendered verifies
+// the footer notes render through the actual template, not just the struct.
+func TestHandleDashboard_NoUsageArrivalAndEndedUnmeasuredNotesRendered(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
+
+	snap := orchestrator.RuntimeSnapshotResult{
+		GeneratedAt: now,
+		Running: []orchestrator.SnapshotRunningEntry{
+			{IssueID: "id-noarr", Identifier: "MT-NOARR", StartedAt: now.Add(-time.Minute), UsageArrival: registry.UsageArrivalNone},
+		},
+		AgentTotals: orchestrator.SnapshotAgentTotals{UnmeasuredSessions: 1, RunningNonReporting: 1},
+	}
+
+	ts := dashboardServer(t, fixedSnapshot(snap), "1.0.0", nil)
+	dr := getDashboard(t, ts, "/")
+
+	if dr.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", dr.StatusCode, http.StatusOK)
+	}
+	if !strings.Contains(dr.Body, "1 running session runs an agent that reports no token usage; the totals above exclude it.") {
+		t.Errorf("body missing the no-usage-arrival footer note; body = %q", dr.Body)
+	}
+	if !strings.Contains(dr.Body, "1 session that already ended never reported token usage; the totals above exclude it too.") {
+		t.Errorf("body missing the ended-unmeasured footer note; body = %q", dr.Body)
+	}
+	if strings.Contains(dr.Body, "has not reported token usage yet") {
+		t.Error("body contains the running-unreported note for an arrival-none session, want it absent")
 	}
 }
 

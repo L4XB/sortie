@@ -3,6 +3,8 @@ package server
 import (
 	"fmt"
 	"math"
+
+	"github.com/sortie-ai/sortie/internal/orchestrator"
 )
 
 // TokenRateConfig holds per-token-type USD rates for cost estimation.
@@ -136,6 +138,30 @@ func EstimateCost(input, output, cacheRead int64, rates *TokenRateConfig) *float
 		return nil
 	}
 	return &cost
+}
+
+// activeCostTotal sums the estimated USD cost of running, measured
+// sessions with a configured rate, and counts the measured sessions
+// left out for want of one. anySet is false when no session priced,
+// distinguishing that from a priced total of zero.
+func activeCostTotal(running []orchestrator.SnapshotRunningEntry, tokenRates TokenRates) (total float64, anySet bool, unpriced int) {
+	for _, e := range running {
+		if !e.UsageMeasured {
+			continue
+		}
+		rc, ok := tokenRates[e.AgentKind]
+		if !ok {
+			unpriced++
+			continue
+		}
+		if c := EstimateCost(e.AgentInputTokens, e.AgentOutputTokens, e.CacheReadTokens, &rc); c != nil {
+			total += *c
+			anySet = true
+		} else {
+			unpriced++
+		}
+	}
+	return total, anySet, unpriced
 }
 
 // FormatCost formats a USD cost value as a string with two decimal places.
