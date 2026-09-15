@@ -2940,11 +2940,11 @@ exit 0
 	}
 }
 
-// TestRunTurn_CancelledTurnRecoversUsageFromExport pins the second half of
-// #1078: the cancellation branch of the turn's select terminated the process
-// and finalized with no recovered figure, while the normal-exit branch ran the
-// session export. The same completed work therefore reported a figure or
-// reported nothing depending only on which case won.
+// TestRunTurn_CancelledTurnRecoversUsageFromExport pins recovery on the
+// cancellation branch of the turn's select. That branch terminates the process
+// itself rather than routing through the normal-exit finalization, so without
+// its own recovery the same completed work reports a figure or nothing
+// depending only on which case won.
 //
 // The turn cancelled here is the FIRST one, so `measured` starts false and a
 // true verdict can only have come from recovery on this path.
