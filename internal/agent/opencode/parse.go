@@ -227,7 +227,7 @@ func queryExportUsage(ctx context.Context, state *sessionState, sinceUnixMS int6
 	}
 
 	usage := parseExportOutput(stdout.Bytes(), sessionID, sinceUnixMS)
-	if usage.InputTokens == 0 && usage.OutputTokens == 0 {
+	if !usage.Recovered {
 		state.logger().Warn("no assistant token usage found in opencode export")
 	}
 	return usage

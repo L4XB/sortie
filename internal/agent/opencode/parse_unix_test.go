@@ -3,6 +3,7 @@
 package opencode
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"os"
@@ -173,6 +174,40 @@ func TestQueryExportSubprocess(t *testing.T) {
 		if recovered.Run.InputTokens != 1750 || recovered.Run.OutputTokens != 300 {
 			t.Errorf("Run = in:%d out:%d, want in:1750 out:300",
 				recovered.Run.InputTokens, recovered.Run.OutputTokens)
+		}
+	})
+
+	t.Run("the_warning_reports_an_export_that_recovered_nothing", func(t *testing.T) {
+		t.Parallel()
+
+		// A finished step whose provider reported zero is a measurement, so
+		// saying no usage was found contradicts the verdict it produces. The
+		// unfinished placeholder recovers nothing and must still say so.
+		for name, tc := range map[string]struct {
+			finish   string
+			wantWarn bool
+		}{
+			"finished_zero_step": {finish: `"finish":"stop",`, wantWarn: false},
+			"unfinished_step":    {finish: ``, wantWarn: true},
+		} {
+			tmpDir := t.TempDir()
+			exportPath := filepath.Join(tmpDir, "export.json")
+			export := `{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123",` + tc.finish +
+				`"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}}]}`
+			if err := os.WriteFile(exportPath, []byte(export), 0o644); err != nil { //nolint:gosec // fixture file under t.TempDir()
+				t.Fatal(err)
+			}
+			script := agenttest.WriteScript(t, tmpDir, "fake-export", "cat '"+exportPath+"'")
+
+			var logs bytes.Buffer
+			state := testExportState(script, tmpDir)
+			state.baseLogger = slog.New(slog.NewTextHandler(&logs, nil))
+
+			queryExportUsage(context.Background(), state, 0)
+
+			if got := strings.Contains(logs.String(), "no assistant token usage found"); got != tc.wantWarn {
+				t.Errorf("%s: warned = %v, want %v", name, got, tc.wantWarn)
+			}
 		}
 	})
 
