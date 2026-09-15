@@ -422,6 +422,68 @@ func TestEnforceInFlightTokenCeiling(t *testing.T) {
 		}
 	})
 
+	t.Run("none arrival at the ceiling performs no store read, sets no latch, and cancels nothing", func(t *testing.T) {
+		t.Parallel()
+
+		_, logger := textLogger()
+		spy := &spyMetrics{}
+		var cancelCalls int
+		state := NewState(5000, 4, 100, nil, AgentTotals{})
+		state.Running["ISS-NONE-CEIL"] = &RunningEntry{
+			Identifier:           "ISS-NONE-CEIL-ident",
+			UsageArrival:         registry.UsageArrivalNone,
+			IssueTokensCompleted: 100,
+			CancelFunc:           func() { cancelCalls++ },
+		}
+		store := &failingIssueTokenStore{t: t}
+
+		enforceInFlightTokenCeiling(context.Background(), state, "ISS-NONE-CEIL",
+			domain.AgentEvent{Type: domain.EventTokenUsage, Usage: domain.TokenUsage{TotalTokens: 1}},
+			store, spy, logger)
+
+		entry := state.Running["ISS-NONE-CEIL"]
+		if entry.TokenCeilingStopped {
+			t.Error("entry.TokenCeilingStopped = true, want false (none arrival)")
+		}
+		if cancelCalls != 0 {
+			t.Errorf("entry.CancelFunc called %d times, want 0", cancelCalls)
+		}
+		if len(spy.runsStoppedByBudget) != 0 {
+			t.Errorf("IncRunsStoppedByBudget calls = %v, want none", spy.runsStoppedByBudget)
+		}
+	})
+
+	t.Run("incremental arrival at the ceiling reads and stops for the same event", func(t *testing.T) {
+		t.Parallel()
+
+		_, logger := textLogger()
+		spy := &spyMetrics{}
+		var cancelCalls int
+		state := NewState(5000, 4, 100, nil, AgentTotals{})
+		state.Running["ISS-INC-CEIL"] = &RunningEntry{
+			Identifier:           "ISS-INC-CEIL-ident",
+			UsageArrival:         registry.UsageArrivalIncremental,
+			IssueTokensCompleted: 100,
+			CancelFunc:           func() { cancelCalls++ },
+		}
+		store := &fakeTokenStore{responses: []tokenStoreResponse{{usage: persistence.IssueTokenUsage{TotalTokens: 100}}}}
+
+		enforceInFlightTokenCeiling(context.Background(), state, "ISS-INC-CEIL",
+			domain.AgentEvent{Type: domain.EventTokenUsage, Usage: domain.TokenUsage{TotalTokens: 1}},
+			store, spy, logger)
+
+		entry := state.Running["ISS-INC-CEIL"]
+		if !entry.TokenCeilingStopped {
+			t.Fatal("entry.TokenCeilingStopped = false, want true (incremental arrival at the ceiling)")
+		}
+		if cancelCalls != 1 {
+			t.Errorf("entry.CancelFunc called %d times, want 1", cancelCalls)
+		}
+		if len(store.calls) != 1 {
+			t.Errorf("TokenUsageByIssue calls = %v, want exactly one", store.calls)
+		}
+	})
+
 	t.Run("used_tokens on the stop record equals the confirming read's sum plus AgentTotalTokens", func(t *testing.T) {
 		t.Parallel()
 

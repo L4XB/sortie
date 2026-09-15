@@ -238,7 +238,7 @@ func defaultRetryParams(t *testing.T, store *mockRetryStore, tracker *mockRetryT
 		ActiveStates:      []string{"To Do", "In Progress"},
 		TerminalStates:    []string{"Done"},
 		MaxRetryBackoffMS: 300_000,
-		MakeWorkerFn: func(_, _, _, _, _ string, _ domain.AgentAdapter) WorkerFunc {
+		MakeWorkerFn: func(_, _, _, _, _ string, _ domain.AgentAdapter, _ registry.UsageArrival) WorkerFunc {
 			return func(_ context.Context, _ domain.Issue, _ *int) {}
 		},
 		AgentAdapterByKind: func(_ string) (domain.AgentAdapter, error) { return &mockAgentAdapter{}, nil },
@@ -1428,7 +1428,7 @@ func TestHandleRetryTimer(t *testing.T) {
 			if tt.workerFn != nil {
 				ch := make(chan struct{}, 1)
 				wf := tt.workerFn(ch)
-				params.MakeWorkerFn = func(_, _, _, _, _ string, _ domain.AgentAdapter) WorkerFunc { return wf }
+				params.MakeWorkerFn = func(_, _, _, _, _ string, _ domain.AgentAdapter, _ registry.UsageArrival) WorkerFunc { return wf }
 				HandleRetryTimer(state, id, params)
 				select {
 				case <-ch:
@@ -1505,7 +1505,7 @@ func TestHandleRetryTimer_TokenBudgetIncomplete(t *testing.T) {
 	params := defaultRetryParams(t, store, tracker)
 	params.MaxTokens = 1000
 	params.Logger = logger
-	params.MakeWorkerFn = func(_, _, _, _, _ string, _ domain.AgentAdapter) WorkerFunc {
+	params.MakeWorkerFn = func(_, _, _, _, _ string, _ domain.AgentAdapter, _ registry.UsageArrival) WorkerFunc {
 		return func(_ context.Context, _ domain.Issue, _ *int) {
 			dispatched <- struct{}{}
 		}
@@ -1569,7 +1569,7 @@ func TestHandleRetryTimer_TokenBudgetFailOpenLogsWarning(t *testing.T) {
 	params := defaultRetryParams(t, store, tracker)
 	params.MaxTokens = 1000
 	params.Logger = logger
-	params.MakeWorkerFn = func(_, _, _, _, _ string, _ domain.AgentAdapter) WorkerFunc {
+	params.MakeWorkerFn = func(_, _, _, _, _ string, _ domain.AgentAdapter, _ registry.UsageArrival) WorkerFunc {
 		return func(_ context.Context, _ domain.Issue, _ *int) {
 			dispatched <- struct{}{}
 		}
@@ -1609,7 +1609,7 @@ func TestHandleRetryTimer_WorkerStillRunningReschedulesInsteadOfDispatching(t *t
 	params := defaultRetryParams(t, store, tracker)
 
 	workerCalled := false
-	params.MakeWorkerFn = func(_, _, _, _, _ string, _ domain.AgentAdapter) WorkerFunc {
+	params.MakeWorkerFn = func(_, _, _, _, _ string, _ domain.AgentAdapter, _ registry.UsageArrival) WorkerFunc {
 		return func(_ context.Context, _ domain.Issue, _ *int) {
 			workerCalled = true
 		}
@@ -1673,7 +1673,7 @@ func TestHandleRetryTimer_SSHHostAcquisition(t *testing.T) {
 		params.HostPool = hp
 
 		ch := make(chan struct{}, 1)
-		params.MakeWorkerFn = func(_, sshHost, _, _, _ string, _ domain.AgentAdapter) WorkerFunc {
+		params.MakeWorkerFn = func(_, sshHost, _, _, _ string, _ domain.AgentAdapter, _ registry.UsageArrival) WorkerFunc {
 			return func(_ context.Context, _ domain.Issue, _ *int) {
 				if sshHost != "host-b" {
 					t.Errorf("MakeWorkerFn sshHost = %q, want \"host-b\" (preferred)", sshHost)
@@ -1820,7 +1820,7 @@ func TestHandleRetryTimer_WorkflowFilePropagated(t *testing.T) {
 	params.WorkflowFile = "infra.WORKFLOW.md"
 
 	workerCalled := make(chan struct{}, 1)
-	params.MakeWorkerFn = func(_, _, _, _, _ string, _ domain.AgentAdapter) WorkerFunc {
+	params.MakeWorkerFn = func(_, _, _, _, _ string, _ domain.AgentAdapter, _ registry.UsageArrival) WorkerFunc {
 		return func(_ context.Context, _ domain.Issue, _ *int) {
 			workerCalled <- struct{}{}
 		}
@@ -1857,12 +1857,16 @@ func TestHandleRetryTimer_UsageDispositionFrozen(t *testing.T) {
 	state := retryState(t, "ISS-UD", "ISS-UD", 1)
 
 	params := defaultRetryParams(t, store, tracker)
+	var resolveCalls int
 	params.ResolveUsageDisposition = func(kind, sshHost string) (registry.UsageArrival, registry.UsageAttribution) {
-		return registry.UsageArrivalTurnEnd, registry.UsageAttributionSessionTotal
+		resolveCalls++
+		return registry.UsageArrivalNone, registry.UsageAttributionNone
 	}
 
 	workerCalled := make(chan struct{}, 1)
-	params.MakeWorkerFn = func(_, _, _, _, _ string, _ domain.AgentAdapter) WorkerFunc {
+	var capturedArrival registry.UsageArrival
+	params.MakeWorkerFn = func(_, _, _, _, _ string, _ domain.AgentAdapter, arrival registry.UsageArrival) WorkerFunc {
+		capturedArrival = arrival
 		return func(_ context.Context, _ domain.Issue, _ *int) {
 			workerCalled <- struct{}{}
 		}
@@ -1880,9 +1884,15 @@ func TestHandleRetryTimer_UsageDispositionFrozen(t *testing.T) {
 	if !ok {
 		t.Fatal("Running[ISS-UD] missing after dispatch")
 	}
-	if running.UsageArrival != registry.UsageArrivalTurnEnd || running.UsageAttribution != registry.UsageAttributionSessionTotal {
+	if running.UsageArrival != registry.UsageArrivalNone || running.UsageAttribution != registry.UsageAttributionNone {
 		t.Errorf("Running[ISS-UD] (UsageArrival, UsageAttribution) = (%q, %q), want (%q, %q)",
-			running.UsageArrival, running.UsageAttribution, registry.UsageArrivalTurnEnd, registry.UsageAttributionSessionTotal)
+			running.UsageArrival, running.UsageAttribution, registry.UsageArrivalNone, registry.UsageAttributionNone)
+	}
+	if capturedArrival != registry.UsageArrivalNone {
+		t.Errorf("MakeWorkerFn received arrival = %q, want %q (the same value frozen onto the entry)", capturedArrival, registry.UsageArrivalNone)
+	}
+	if resolveCalls != 1 {
+		t.Errorf("ResolveUsageDisposition called %d times, want 1 (resolved once and shared with the worker)", resolveCalls)
 	}
 }
 
@@ -2416,7 +2426,7 @@ func TestHandleRetryTimer_SessionID_PassedToMakeWorkerFn(t *testing.T) {
 
 	var gotSessionID string
 	ch := make(chan struct{}, 1)
-	params.MakeWorkerFn = func(resumeSessionID, _, _, _, _ string, _ domain.AgentAdapter) WorkerFunc {
+	params.MakeWorkerFn = func(resumeSessionID, _, _, _, _ string, _ domain.AgentAdapter, _ registry.UsageArrival) WorkerFunc {
 		gotSessionID = resumeSessionID
 		return func(_ context.Context, _ domain.Issue, _ *int) {
 			ch <- struct{}{}
@@ -2455,7 +2465,7 @@ func TestHandleRetryTimer_PassesReactionKindToMakeWorkerFn(t *testing.T) {
 
 	var gotReactionKind string
 	ch := make(chan struct{}, 1)
-	params.MakeWorkerFn = func(_, _, _, _, reactionKind string, _ domain.AgentAdapter) WorkerFunc {
+	params.MakeWorkerFn = func(_, _, _, _, reactionKind string, _ domain.AgentAdapter, _ registry.UsageArrival) WorkerFunc {
 		gotReactionKind = reactionKind
 		return func(_ context.Context, _ domain.Issue, _ *int) {
 			ch <- struct{}{}
@@ -3155,7 +3165,7 @@ func TestHandleRetryTimer_FrozenFieldsPropagatedToRunningEntry(t *testing.T) {
 
 	var capturedAgentKind, capturedTemplateID string
 	params := defaultRetryParams(t, store, tracker)
-	params.MakeWorkerFn = func(_, _, agentKind, templateID, _ string, _ domain.AgentAdapter) WorkerFunc {
+	params.MakeWorkerFn = func(_, _, agentKind, templateID, _ string, _ domain.AgentAdapter, _ registry.UsageArrival) WorkerFunc {
 		capturedAgentKind = agentKind
 		capturedTemplateID = templateID
 		return func(_ context.Context, _ domain.Issue, _ *int) {}

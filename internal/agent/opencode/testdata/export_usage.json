@@ -12,6 +12,7 @@
         "sessionID": "ses_abc123",
         "providerID": "anthropic",
         "modelID": "claude-sonnet-4-5",
+        "finish": "stop",
         "tokens": {
           "input": 1500,
           "output": 300,

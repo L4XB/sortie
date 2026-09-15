@@ -2411,6 +2411,63 @@ func TestUpsertAggregateMetrics_CacheReadTokensUpdate(t *testing.T) {
 	}
 }
 
+// TestUpsertAggregateMetrics_UnmeasuredSessions verifies the field survives a round-trip.
+func TestUpsertAggregateMetrics_UnmeasuredSessions(t *testing.T) {
+	t.Parallel()
+
+	s := openTestStore(t)
+	migrateOrFatal(t, s)
+	ctx := context.Background()
+
+	metrics := AggregateMetrics{
+		Key:                "agent_totals",
+		InputTokens:        1000,
+		UnmeasuredSessions: 42,
+		UpdatedAt:          "2026-04-01T12:00:00Z",
+	}
+	if err := s.UpsertAggregateMetrics(ctx, metrics); err != nil {
+		t.Fatalf("UpsertAggregateMetrics: %v", err)
+	}
+
+	got, found, err := s.LoadAggregateMetrics(ctx, "agent_totals")
+	if err != nil {
+		t.Fatalf("LoadAggregateMetrics: %v", err)
+	}
+	if !found {
+		t.Fatal("expected found=true, got false")
+	}
+	if got.UnmeasuredSessions != 42 {
+		t.Errorf("UnmeasuredSessions = %d, want 42", got.UnmeasuredSessions)
+	}
+}
+
+// TestUpsertAggregateMetrics_UnmeasuredSessionsUpdate verifies a second update overwrites the value.
+func TestUpsertAggregateMetrics_UnmeasuredSessionsUpdate(t *testing.T) {
+	t.Parallel()
+
+	s := openTestStore(t)
+	migrateOrFatal(t, s)
+	ctx := context.Background()
+
+	m1 := AggregateMetrics{Key: "agent_totals", UnmeasuredSessions: 3, UpdatedAt: "2026-04-01T10:00:00Z"}
+	if err := s.UpsertAggregateMetrics(ctx, m1); err != nil {
+		t.Fatalf("UpsertAggregateMetrics (first): %v", err)
+	}
+
+	m2 := AggregateMetrics{Key: "agent_totals", UnmeasuredSessions: 7, UpdatedAt: "2026-04-01T11:00:00Z"}
+	if err := s.UpsertAggregateMetrics(ctx, m2); err != nil {
+		t.Fatalf("UpsertAggregateMetrics (second): %v", err)
+	}
+
+	got, _, err := s.LoadAggregateMetrics(ctx, "agent_totals")
+	if err != nil {
+		t.Fatalf("LoadAggregateMetrics: %v", err)
+	}
+	if got.UnmeasuredSessions != 7 {
+		t.Errorf("UnmeasuredSessions = %d, want 7", got.UnmeasuredSessions)
+	}
+}
+
 func TestOpenReadOnly(t *testing.T) {
 	t.Parallel()
 

@@ -12,6 +12,7 @@
         "sessionID": "ses_18c61ba15ffe1524eHja237B0R",
         "providerID": "anthropic",
         "modelID": "claude-haiku-4-5",
+        "finish": "tool-calls",
         "tokens": {
           "total": 16593,
           "input": 3,
@@ -34,6 +35,7 @@
         "sessionID": "ses_18c61ba15ffe1524eHja237B0R",
         "providerID": "anthropic",
         "modelID": "claude-haiku-4-5",
+        "finish": "tool-calls",
         "tokens": {
           "total": 16609,
           "input": 3,
@@ -56,6 +58,7 @@
         "sessionID": "ses_18c61ba15ffe1524eHja237B0R",
         "providerID": "anthropic",
         "modelID": "claude-haiku-4-5",
+        "finish": "stop",
         "tokens": {
           "total": 16626,
           "input": 3,

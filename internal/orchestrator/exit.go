@@ -308,6 +308,9 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 		elapsed = 0
 	}
 	state.AgentTotals.SecondsRunning += elapsed
+	if !measured {
+		state.AgentTotals.UnmeasuredSessions++
+	}
 
 	exitType := mapExitKindToExitType(workerResult.ExitKind)
 	if workerResult.SoftStop {
@@ -593,13 +596,14 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 	}
 
 	aggMetrics := persistence.AggregateMetrics{
-		Key:             "agent_totals",
-		InputTokens:     state.AgentTotals.InputTokens,
-		OutputTokens:    state.AgentTotals.OutputTokens,
-		TotalTokens:     state.AgentTotals.TotalTokens,
-		CacheReadTokens: state.AgentTotals.CacheReadTokens,
-		SecondsRunning:  state.AgentTotals.SecondsRunning,
-		UpdatedAt:       now.Format(time.RFC3339),
+		Key:                "agent_totals",
+		InputTokens:        state.AgentTotals.InputTokens,
+		OutputTokens:       state.AgentTotals.OutputTokens,
+		TotalTokens:        state.AgentTotals.TotalTokens,
+		CacheReadTokens:    state.AgentTotals.CacheReadTokens,
+		SecondsRunning:     state.AgentTotals.SecondsRunning,
+		UnmeasuredSessions: state.AgentTotals.UnmeasuredSessions,
+		UpdatedAt:          now.Format(time.RFC3339),
 	}
 	if err := params.Store.UpsertAggregateMetrics(ctx, aggMetrics); err != nil {
 		log.Error("failed to persist aggregate metrics",

@@ -1272,6 +1272,203 @@ func TestToStateResponse(t *testing.T) {
 	})
 }
 
+// TestToStateResponse_AgentTotalsExclusionFieldsJSON binds the
+// unmeasured_sessions, running_unreported, and running_non_reporting
+// members of the nested agent_totals object to their JSON key names.
+func TestToStateResponse_AgentTotalsExclusionFieldsJSON(t *testing.T) {
+	t.Parallel()
+
+	snap := orchestrator.RuntimeSnapshotResult{
+		GeneratedAt: time.Now().UTC(),
+		AgentTotals: orchestrator.SnapshotAgentTotals{
+			UnmeasuredSessions:  3,
+			RunningUnreported:   1,
+			RunningNonReporting: 2,
+		},
+	}
+
+	got := toStateResponse(snap, nil)
+	data, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+
+	var decoded struct {
+		AgentTotals struct {
+			UnmeasuredSessions  int64 `json:"unmeasured_sessions"`
+			RunningUnreported   int   `json:"running_unreported"`
+			RunningNonReporting int   `json:"running_non_reporting"`
+		} `json:"agent_totals"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+
+	if decoded.AgentTotals.UnmeasuredSessions != 3 {
+		t.Errorf("agent_totals.unmeasured_sessions = %d, want 3", decoded.AgentTotals.UnmeasuredSessions)
+	}
+	if decoded.AgentTotals.RunningUnreported != 1 {
+		t.Errorf("agent_totals.running_unreported = %d, want 1", decoded.AgentTotals.RunningUnreported)
+	}
+	if decoded.AgentTotals.RunningNonReporting != 2 {
+		t.Errorf("agent_totals.running_non_reporting = %d, want 2", decoded.AgentTotals.RunningNonReporting)
+	}
+}
+
+// requireCostUnpricedRunning fails unless got is non-nil and dereferences to want.
+func requireCostUnpricedRunning(t *testing.T, got *int, want int) {
+	t.Helper()
+	if got == nil {
+		t.Fatalf("CostUnpricedRunning = nil, want %d", want)
+	}
+	if *got != want {
+		t.Errorf("CostUnpricedRunning = %d, want %d", *got, want)
+	}
+}
+
+// TestToStateResponse_CostUnpricedRunning verifies the count includes only
+// running, measured sessions with no configured token rate, and is omitted
+// from JSON when zero.
+func TestToStateResponse_CostUnpricedRunning(t *testing.T) {
+	t.Parallel()
+
+	fptr := func(v float64) *float64 { return &v }
+	rates := TokenRates{
+		"claude": TokenRateConfig{InputPerMtok: fptr(3.0)},
+	}
+
+	t.Run("measured session with no configured rate is counted", func(t *testing.T) {
+		t.Parallel()
+
+		snap := orchestrator.RuntimeSnapshotResult{
+			GeneratedAt: time.Now().UTC(),
+			Running: []orchestrator.SnapshotRunningEntry{
+				{IssueID: "a", Identifier: "MT-A", AgentKind: "unpriced-kind", UsageMeasured: true, AgentInputTokens: 1000},
+			},
+		}
+
+		got := toStateResponse(snap, rates)
+
+		requireCostUnpricedRunning(t, got.CostUnpricedRunning, 1)
+	})
+
+	t.Run("measured session with a configured rate is not counted", func(t *testing.T) {
+		t.Parallel()
+
+		snap := orchestrator.RuntimeSnapshotResult{
+			GeneratedAt: time.Now().UTC(),
+			Running: []orchestrator.SnapshotRunningEntry{
+				{IssueID: "b", Identifier: "MT-B", AgentKind: "claude", UsageMeasured: true, AgentInputTokens: 1000},
+			},
+		}
+
+		got := toStateResponse(snap, rates)
+
+		requireCostUnpricedRunning(t, got.CostUnpricedRunning, 0)
+	})
+
+	t.Run("unmeasured session with no configured rate is not counted", func(t *testing.T) {
+		t.Parallel()
+
+		snap := orchestrator.RuntimeSnapshotResult{
+			GeneratedAt: time.Now().UTC(),
+			Running: []orchestrator.SnapshotRunningEntry{
+				{IssueID: "c", Identifier: "MT-C", AgentKind: "unpriced-kind", UsageMeasured: false},
+			},
+		}
+
+		got := toStateResponse(snap, rates)
+
+		requireCostUnpricedRunning(t, got.CostUnpricedRunning, 0)
+	})
+
+	t.Run("mixed population counts only the unpriced measured sessions", func(t *testing.T) {
+		t.Parallel()
+
+		snap := orchestrator.RuntimeSnapshotResult{
+			GeneratedAt: time.Now().UTC(),
+			Running: []orchestrator.SnapshotRunningEntry{
+				{IssueID: "priced", Identifier: "MT-PRICED", AgentKind: "claude", UsageMeasured: true, AgentInputTokens: 1000},
+				{IssueID: "unpriced-1", Identifier: "MT-UNP1", AgentKind: "unpriced-kind", UsageMeasured: true, AgentInputTokens: 1000},
+				{IssueID: "unpriced-2", Identifier: "MT-UNP2", AgentKind: "other-unpriced", UsageMeasured: true, AgentInputTokens: 1000},
+				{IssueID: "unmeasured", Identifier: "MT-UNM", AgentKind: "unpriced-kind", UsageMeasured: false},
+			},
+		}
+
+		got := toStateResponse(snap, rates)
+
+		requireCostUnpricedRunning(t, got.CostUnpricedRunning, 2)
+	})
+
+	t.Run("zero count with rates configured is present as zero", func(t *testing.T) {
+		t.Parallel()
+
+		snap := orchestrator.RuntimeSnapshotResult{
+			GeneratedAt: time.Now().UTC(),
+			Running: []orchestrator.SnapshotRunningEntry{
+				{IssueID: "b", Identifier: "MT-B", AgentKind: "claude", UsageMeasured: true, AgentInputTokens: 1000},
+			},
+		}
+
+		got := toStateResponse(snap, rates)
+		data, err := json.Marshal(got)
+		if err != nil {
+			t.Fatalf("json.Marshal: %v", err)
+		}
+		var decoded map[string]any
+		if err := json.Unmarshal(data, &decoded); err != nil {
+			t.Fatalf("json.Unmarshal: %v", err)
+		}
+		if v, ok := decoded["cost_unpriced_running"]; !ok || v != float64(0) {
+			t.Errorf(`JSON cost_unpriced_running = %v (present=%v), want 0`, v, ok)
+		}
+	})
+
+	t.Run("no rates configured omits the field from JSON", func(t *testing.T) {
+		t.Parallel()
+
+		snap := orchestrator.RuntimeSnapshotResult{
+			GeneratedAt: time.Now().UTC(),
+			Running: []orchestrator.SnapshotRunningEntry{
+				{IssueID: "b", Identifier: "MT-B", AgentKind: "claude", UsageMeasured: true, AgentInputTokens: 1000},
+			},
+		}
+
+		got := toStateResponse(snap, nil)
+		data, err := json.Marshal(got)
+		if err != nil {
+			t.Fatalf("json.Marshal: %v", err)
+		}
+		if strings.Contains(string(data), "cost_unpriced_running") {
+			t.Errorf("JSON = %s, want cost_unpriced_running omitted when no token rate is configured", data)
+		}
+	})
+
+	t.Run("non-zero count is present in JSON under the correct key", func(t *testing.T) {
+		t.Parallel()
+
+		snap := orchestrator.RuntimeSnapshotResult{
+			GeneratedAt: time.Now().UTC(),
+			Running: []orchestrator.SnapshotRunningEntry{
+				{IssueID: "a", Identifier: "MT-A", AgentKind: "unpriced-kind", UsageMeasured: true, AgentInputTokens: 1000},
+			},
+		}
+
+		got := toStateResponse(snap, rates)
+		data, err := json.Marshal(got)
+		if err != nil {
+			t.Fatalf("json.Marshal: %v", err)
+		}
+		var decoded map[string]any
+		if err := json.Unmarshal(data, &decoded); err != nil {
+			t.Fatalf("json.Unmarshal: %v", err)
+		}
+		if v, ok := decoded["cost_unpriced_running"]; !ok || v != float64(1) {
+			t.Errorf(`JSON cost_unpriced_running = %v (present=%v), want 1`, v, ok)
+		}
+	})
+}
+
 func TestBuildIssueDetail(t *testing.T) {
 	t.Parallel()
 

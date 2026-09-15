@@ -58,10 +58,14 @@ type dashboardData struct {
 	EstimatedCostUSD   *string
 	EstimatedCostLabel string
 
-	// UnmeasuredRunningCount is the number of running sessions that have
-	// reported no token measurement so far. Excluded from TotalTokens,
-	// InputTokens, OutputTokens, CacheReadTokens, and EstimatedCostUSD.
-	UnmeasuredRunningCount int
+	// RunningUnreportedNote, RunningNonReportingNote, EndedUnmeasuredNote,
+	// and CostUnpricedNote are singular/plural-correct sentences naming
+	// a count the footer totals exclude, or the empty string when that
+	// count is zero.
+	RunningUnreportedNote   string
+	RunningNonReportingNote string
+	EndedUnmeasuredNote     string
+	CostUnpricedNote        string
 }
 
 type dashboardRunningEntry struct {
@@ -330,6 +334,19 @@ func FormatDuration(d time.Duration) string {
 	return fmt.Sprintf("%ds", seconds)
 }
 
+// countedNote renders n as a singular or plural %d-format sentence,
+// or returns the empty string when n <= 0.
+func countedNote(n int64, singular, plural string) string {
+	switch {
+	case n <= 0:
+		return ""
+	case n == 1:
+		return fmt.Sprintf(singular, n)
+	default:
+		return fmt.Sprintf(plural, n)
+	}
+}
+
 // formatRelativeTime formats a due-at timestamp (milliseconds since
 // epoch) relative to now. Returns "overdue" if the time has passed,
 // "now" if within one second, or "in <duration>" for future times.
@@ -395,9 +412,6 @@ func buildDashboardData(
 	running := make([]dashboardRunningEntry, len(sortedRunning))
 	hasSSH := false
 	hasRates := len(tokenRates) > 0
-	var aggregateCost float64
-	aggregateCostSet := false
-	unmeasuredCount := 0
 	for i, e := range sortedRunning {
 		dur := max(snap.GeneratedAt.Sub(e.StartedAt), 0)
 		if e.SSHHost != "" {
@@ -421,17 +435,11 @@ func buildDashboardData(
 			displayID = e.DisplayID
 		}
 
-		if e.UsageArrival.ReportsAnyFigure() && !e.UsageMeasured {
-			unmeasuredCount++
-		}
-
 		var entryCostStr string
 		if hasRates && e.UsageMeasured {
 			if rc, ok := tokenRates[e.AgentKind]; ok {
 				if c := EstimateCost(e.AgentInputTokens, e.AgentOutputTokens, e.CacheReadTokens, &rc); c != nil {
 					entryCostStr = FormatCost(*c)
-					aggregateCost += *c
-					aggregateCostSet = true
 				}
 			}
 		}
@@ -468,8 +476,21 @@ func buildDashboardData(
 	data.Running = running
 	data.HasSSH = hasSSH
 	data.HasTokenRates = hasRates
-	data.UnmeasuredRunningCount = unmeasuredCount
+	data.RunningUnreportedNote = countedNote(int64(snap.AgentTotals.RunningUnreported),
+		"%d running session has not reported token usage yet; the totals above exclude it.",
+		"%d running sessions have not reported token usage yet; the totals above exclude them.")
+	data.RunningNonReportingNote = countedNote(int64(snap.AgentTotals.RunningNonReporting),
+		"%d running session runs an agent that reports no token usage; the totals above exclude it.",
+		"%d running sessions run agents that report no token usage; the totals above exclude them.")
+	data.EndedUnmeasuredNote = countedNote(snap.AgentTotals.UnmeasuredSessions,
+		"%d session that already ended never reported token usage; the totals above exclude it too.",
+		"%d sessions that already ended never reported token usage; the totals above exclude them too.")
+
+	aggregateCost, aggregateCostSet, unpricedCount := activeCostTotal(sortedRunning, tokenRates)
 	if hasRates {
+		data.CostUnpricedNote = countedNote(int64(unpricedCount),
+			"%d running session is excluded from Est. Cost because token_rates has no price for its agent.",
+			"%d running sessions are excluded from Est. Cost because token_rates has no price for their agents.")
 		data.EstimatedCostLabel = "Active Est. Cost (USD)"
 	}
 	if aggregateCostSet {

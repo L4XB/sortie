@@ -18,6 +18,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/logging"
 	"github.com/sortie-ai/sortie/internal/prompt"
+	"github.com/sortie-ai/sortie/internal/registry"
 	"github.com/sortie-ai/sortie/internal/workspace"
 )
 
@@ -207,27 +208,29 @@ type WorkerResult struct {
 	// Usage is the run-cumulative token usage the adapter reported for
 	// this run, as of worker exit. Folded from every usage-bearing
 	// event and every TurnResult.Usage the worker observed; zero for an
-	// exit before the first turn returns.
+	// exit before the first turn returns. Excludes figures the run's
+	// usage arrival rejects.
 	Usage domain.TokenUsage
 
 	// UsageMeasured is true when the run's spend is known: either no
 	// agent turn was entered before exit, so a zero spend is exact, or
 	// at least one usage-bearing event, one token_usage event, or one
 	// TurnResult reporting UsageMeasured true was observed since the
-	// first turn began. False means the run entered a turn and no
-	// measurement ever arrived, so the spend is unknown rather than
-	// zero.
+	// first turn began and admitted by the run's usage arrival. False
+	// means the run entered a turn and no admitted measurement ever
+	// arrived, so the spend is unknown rather than zero.
 	UsageMeasured bool
 
-	// ModelName is the model name carried by the last token_usage event
-	// the worker relayed during this run that carried one. Empty when
-	// no relayed token_usage event carried a model name, including an
-	// exit before the first turn began.
+	// ModelName is the model name carried by the last admitted
+	// token_usage event the worker relayed during this run that carried
+	// one. Empty when no admitted token_usage event carried a model name,
+	// including an exit before the first turn began.
 	ModelName string
 
-	// APIRequestCount is the number of token_usage events the worker
-	// relayed during this run, whether or not the orchestrator's event
-	// loop applied them. Zero for an exit before the first turn began.
+	// APIRequestCount is the number of admitted token_usage events the
+	// worker relayed during this run, whether or not the orchestrator's
+	// event loop applied them. Zero for an exit before the first turn
+	// began.
 	APIRequestCount int
 }
 
@@ -335,6 +338,10 @@ type WorkerDeps struct {
 	// from config.Agent.Kind, preserving pre-routing behavior for
 	// callers that have not wired the freeze-on-dispatch selection.
 	AgentKind string
+
+	// UsageArrival is the usage arrival frozen on the run's entry. The
+	// zero value admits every figure.
+	UsageArrival registry.UsageArrival
 
 	// OnEvent relays agent events to the orchestrator's serialized
 	// event loop. Called from the worker goroutine; must be safe for
@@ -649,6 +656,7 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 	// feed the matching WorkerResult fields; this mirror never touches
 	// orchestrator state and never calls applyUsageDelta.
 	localMeasured := true
+	discardWarned := false
 	var (
 		localUsage        domain.TokenUsage
 		localLastUsage    domain.TokenUsage
@@ -656,12 +664,32 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 		localRequestCount int
 	)
 
+	// admitMeasurement reports whether the run's usage arrival admits a
+	// figure. It warns on the first rejection only, not once per turn.
+	admitMeasurement := func() bool {
+		if admitsUsageFigures(deps.UsageArrival) {
+			return true
+		}
+		if !discardWarned {
+			logger.Warn("token usage discarded: agent kind declares this session reports none",
+				slog.String("agent_kind", agentKind),
+			)
+			discardWarned = true
+		}
+		return false
+	}
+
 	// foldRelayedEvent is the only code in RunWorkerAttempt that folds a
 	// relayed event into the worker mirror. Both the main-turn relay and
 	// the self-review relay call it for every event they receive from
-	// the adapter, so the mirror covers every turn of the run.
+	// the adapter, so the mirror covers every turn of the run. A
+	// rejected measurement reports false, so the caller skips the
+	// state-file write.
 	foldRelayedEvent := func(event domain.AgentEvent) (measurementArrived bool) {
 		measurementArrived = event.Type == domain.EventTokenUsage || hasUsage(event.Usage)
+		if measurementArrived && !admitMeasurement() {
+			return false
+		}
 		if measurementArrived {
 			localMeasured = true
 		}
@@ -1174,7 +1202,9 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 		// not it also sets the flag, which is how the event path above
 		// already reads a non-zero payload.
 		resultCarriesMeasurement := hasUsage(turnResult.Usage) || turnResult.UsageMeasured
-		if hasUsage(turnResult.Usage) {
+		if resultCarriesMeasurement && !admitMeasurement() {
+			resultCarriesMeasurement = false
+		} else if hasUsage(turnResult.Usage) {
 			localUsage, localLastUsage = foldLocalUsage(turnResult.Usage, localUsage, localLastUsage)
 		}
 		if resultCarriesMeasurement {

@@ -282,6 +282,60 @@ func TestQueryExportUsage(t *testing.T) {
 		}
 	})
 
+	t.Run("a_genuinely_zero_export_is_recovered_not_discarded", func(t *testing.T) {
+		t.Parallel()
+
+		// The runtime's assistant message carries `tokens` as a required
+		// object, so a turn that cost nothing exports the same shape as
+		// any other. Reading the VALUES to decide whether anything was
+		// recovered turned that known zero into an unknown spend, and
+		// threw away the model the export named along with it.
+		data := []byte(`{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123",` +
+			`"providerID":"anthropic","modelID":"claude-sonnet-4-5","finish":"stop",` +
+			`"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}}]}`)
+		usage := parseExportOutput(data, "ses_abc123", 0)
+
+		if !usage.Recovered {
+			t.Error("Recovered = false, want true for an export that reported zero tokens")
+		}
+		if !hasUsage(usage) {
+			t.Error("hasUsage = false; a zero figure is a figure")
+		}
+		if usage.Model != "anthropic/claude-sonnet-4-5" {
+			t.Errorf("Model = %q, want the model the export named", usage.Model)
+		}
+		if usage.InputTokens != 0 || usage.OutputTokens != 0 || usage.TotalTokens != 0 {
+			t.Errorf("a zero export must stay zero, got in=%d out=%d total=%d",
+				usage.InputTokens, usage.OutputTokens, usage.TotalTokens)
+		}
+	})
+
+	t.Run("nothing_kept_is_not_recovered", func(t *testing.T) {
+		t.Parallel()
+
+		// The accept control for the cell above: "no figure" must stay
+		// distinguishable from "a figure that happens to be zero", or the
+		// presence test is just a way of always saying yes.
+		for name, data := range map[string][]byte{
+			"empty_messages": []byte(`{"messages":[]}`),
+			"invalid_json":   []byte("not valid json"),
+			"user_message":   []byte(`{"messages":[{"info":{"role":"user","sessionID":"ses_abc123","tokens":{"input":100,"output":50}}}]}`),
+			"missing_tokens": []byte(`{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123","finish":"stop"}}]}`),
+			"other_session":  []byte(`{"messages":[{"info":{"role":"assistant","sessionID":"ses_other","finish":"stop","tokens":{"input":1,"output":1}}}]}`),
+			"unparseable_in": []byte(`{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123","finish":"stop","tokens":{"input":"x","output":1}}}]}`),
+			"unfinished_step": []byte(`{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123",` +
+				`"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}}]}`),
+		} {
+			usage := parseExportOutput(data, "ses_abc123", 0)
+			if usage.Recovered {
+				t.Errorf("%s: Recovered = true, want false", name)
+			}
+			if hasUsage(usage) {
+				t.Errorf("%s: hasUsage = true, want false", name)
+			}
+		}
+	})
+
 	t.Run("parse_session_id_mismatch_returns_zero", func(t *testing.T) {
 		t.Parallel()
 
@@ -381,7 +435,7 @@ func TestQueryExportUsage(t *testing.T) {
 	t.Run("parse_export_without_tokens_object_returns_zero", func(t *testing.T) {
 		t.Parallel()
 
-		data := []byte(`{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123","providerID":"anthropic","modelID":"claude-sonnet-4-5"}}]}`)
+		data := []byte(`{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123","providerID":"anthropic","modelID":"claude-sonnet-4-5","finish":"stop"}}]}`)
 		usage := parseExportOutput(data, "ses_abc123", 0)
 		if usage != (exportUsage{}) {
 			t.Errorf("usage = %+v, want zero value (no tokens object)", usage)

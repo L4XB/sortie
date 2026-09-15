@@ -24,6 +24,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/prompt"
+	"github.com/sortie-ai/sortie/internal/registry"
 	"github.com/sortie-ai/sortie/internal/workspace"
 )
 
@@ -4428,6 +4429,197 @@ func TestRunWorkerAttempt_StateFileTokenGate(t *testing.T) {
 			if *c.got != c.want {
 				t.Errorf("%s = %d, want %d", name, *c.got, c.want)
 			}
+		}
+	})
+}
+
+// TestRunWorkerAttempt_UsageArrivalNoneDiscardsFigures verifies the worker
+// mirror discards a none run's figures from both the event relay and the
+// turn result.
+func TestRunWorkerAttempt_UsageArrivalNoneDiscardsFigures(t *testing.T) {
+	t.Parallel()
+
+	reportingRunTurnFn := func(t *testing.T, wsPath func() string, model string, postEvent, turnTwoStart *workerState, turnNum *int) func(context.Context, domain.Session, domain.RunTurnParams) (domain.TurnResult, error) {
+		return func(_ context.Context, session domain.Session, params domain.RunTurnParams) (domain.TurnResult, error) {
+			*turnNum++
+			if *turnNum == 2 {
+				*turnTwoStart = readWorkerStateFile(t, wsPath())
+			}
+			params.OnEvent(domain.AgentEvent{
+				Type:      domain.EventTokenUsage,
+				Timestamp: time.Now().UTC(),
+				Model:     model,
+				Usage:     domain.TokenUsage{InputTokens: 120, OutputTokens: 30, TotalTokens: 150, CacheReadTokens: 10},
+			})
+			if *turnNum == 1 {
+				*postEvent = readWorkerStateFile(t, wsPath())
+			}
+			return domain.TurnResult{
+				SessionID:     session.ID,
+				ExitReason:    domain.EventTurnCompleted,
+				Usage:         domain.TokenUsage{InputTokens: 120, OutputTokens: 30, TotalTokens: 150, CacheReadTokens: 10},
+				UsageMeasured: true,
+			}, nil
+		}
+	}
+
+	const discardMessage = "token usage discarded: agent kind declares this session reports none"
+
+	t.Run("none arrival discards every figure and warns exactly once", func(t *testing.T) {
+		t.Parallel()
+
+		tmpDir := t.TempDir()
+		cfg := defaultWorkerConfig(tmpDir)
+		cfg.Agent.MaxTurns = 2
+
+		startFn, wsPath := captureWorkspacePath()
+		lb, logger := textLogger()
+		ec := newExitCapture()
+
+		var onEventCount atomic.Int64
+		var postEventState, turnTwoStartState workerState
+		turnNum := 0
+
+		deps := WorkerDeps{
+			TrackerAdapter: &mockTrackerAdapter{},
+			AgentAdapter: &mockAgentAdapter{
+				startSessionFn: startFn,
+				runTurnFn:      reportingRunTurnFn(t, wsPath, "discarded-model", &postEventState, &turnTwoStartState, &turnNum),
+			},
+			ConfigFunc:             func() config.ServiceConfig { return cfg },
+			PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "{{ .issue.title }}") },
+			OnEvent:                func(_ string, _ domain.AgentEvent) { onEventCount.Add(1) },
+			OnExit:                 ec.onExit,
+			Logger:                 logger,
+			WorkflowPath:           "/fake/WORKFLOW.md",
+			AgentKind:              "mock",
+			UsageArrival:           registry.UsageArrivalNone,
+		}
+
+		RunWorkerAttempt(context.Background(), workerTestIssue(), nil, deps)
+
+		result := ec.waitResult(t)
+		if result.ExitKind != WorkerExitNormal {
+			t.Fatalf("ExitKind = %q, want %q", result.ExitKind, WorkerExitNormal)
+		}
+
+		assertUnmeasuredNull(t, postEventState)
+		assertUnmeasuredNull(t, turnTwoStartState)
+
+		if result.Usage != (domain.TokenUsage{}) {
+			t.Errorf("WorkerResult.Usage = %+v, want zero", result.Usage)
+		}
+		if result.UsageMeasured {
+			t.Error("WorkerResult.UsageMeasured = true, want false")
+		}
+		if result.ModelName != "" {
+			t.Errorf("WorkerResult.ModelName = %q, want empty", result.ModelName)
+		}
+		if result.APIRequestCount != 0 {
+			t.Errorf("WorkerResult.APIRequestCount = %d, want 0", result.APIRequestCount)
+		}
+		if got := onEventCount.Load(); got != 2 {
+			t.Errorf("OnEvent relayed %d times, want 2 (every emitted event still reaches deps.OnEvent)", got)
+		}
+
+		if got := strings.Count(lb.String(), discardMessage); got != 1 {
+			t.Errorf("log contains %d %q records, want exactly 1:\n%s", got, discardMessage, lb.String())
+		}
+		if !strings.Contains(lb.String(), "agent_kind=mock") {
+			t.Errorf("discard record missing agent_kind=mock:\n%s", lb.String())
+		}
+	})
+
+	t.Run("incremental arrival keeps mirroring and never warns", func(t *testing.T) {
+		t.Parallel()
+
+		tmpDir := t.TempDir()
+		cfg := defaultWorkerConfig(tmpDir)
+		cfg.Agent.MaxTurns = 2
+
+		startFn, wsPath := captureWorkspacePath()
+		lb, logger := textLogger()
+		ec := newExitCapture()
+
+		var postEventState, turnTwoStartState workerState
+		turnNum := 0
+
+		deps := WorkerDeps{
+			TrackerAdapter: &mockTrackerAdapter{},
+			AgentAdapter: &mockAgentAdapter{
+				startSessionFn: startFn,
+				runTurnFn:      reportingRunTurnFn(t, wsPath, "mirrored-model", &postEventState, &turnTwoStartState, &turnNum),
+			},
+			ConfigFunc:             func() config.ServiceConfig { return cfg },
+			PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "{{ .issue.title }}") },
+			OnEvent:                func(_ string, _ domain.AgentEvent) {},
+			OnExit:                 ec.onExit,
+			Logger:                 logger,
+			WorkflowPath:           "/fake/WORKFLOW.md",
+			AgentKind:              "mock",
+			UsageArrival:           registry.UsageArrivalIncremental,
+		}
+
+		RunWorkerAttempt(context.Background(), workerTestIssue(), nil, deps)
+
+		result := ec.waitResult(t)
+		if result.ExitKind != WorkerExitNormal {
+			t.Fatalf("ExitKind = %q, want %q", result.ExitKind, WorkerExitNormal)
+		}
+
+		wantUsage := domain.TokenUsage{InputTokens: 120, OutputTokens: 30, TotalTokens: 150, CacheReadTokens: 10}
+		if result.Usage != wantUsage {
+			t.Errorf("WorkerResult.Usage = %+v, want %+v", result.Usage, wantUsage)
+		}
+		if !result.UsageMeasured {
+			t.Error("WorkerResult.UsageMeasured = false, want true")
+		}
+		if result.ModelName != "mirrored-model" {
+			t.Errorf("WorkerResult.ModelName = %q, want %q", result.ModelName, "mirrored-model")
+		}
+
+		if strings.Contains(lb.String(), discardMessage) {
+			t.Errorf("log unexpectedly contains the discard record for an incremental-arrival run:\n%s", lb.String())
+		}
+	})
+
+	t.Run("none arrival with an adapter reporting nothing produces no discard record", func(t *testing.T) {
+		t.Parallel()
+
+		tmpDir := t.TempDir()
+		cfg := defaultWorkerConfig(tmpDir)
+		cfg.Agent.MaxTurns = 1
+
+		startFn, _ := captureWorkspacePath()
+		lb, logger := textLogger()
+		ec := newExitCapture()
+
+		deps := WorkerDeps{
+			TrackerAdapter: &mockTrackerAdapter{},
+			AgentAdapter: &mockAgentAdapter{
+				startSessionFn: startFn,
+				runTurnFn: func(_ context.Context, session domain.Session, _ domain.RunTurnParams) (domain.TurnResult, error) {
+					return domain.TurnResult{SessionID: session.ID, ExitReason: domain.EventTurnCompleted}, nil
+				},
+			},
+			ConfigFunc:             func() config.ServiceConfig { return cfg },
+			PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "{{ .issue.title }}") },
+			OnEvent:                func(_ string, _ domain.AgentEvent) {},
+			OnExit:                 ec.onExit,
+			Logger:                 logger,
+			WorkflowPath:           "/fake/WORKFLOW.md",
+			AgentKind:              "mock",
+			UsageArrival:           registry.UsageArrivalNone,
+		}
+
+		RunWorkerAttempt(context.Background(), workerTestIssue(), nil, deps)
+
+		result := ec.waitResult(t)
+		if result.ExitKind != WorkerExitNormal {
+			t.Fatalf("ExitKind = %q, want %q", result.ExitKind, WorkerExitNormal)
+		}
+		if strings.Contains(lb.String(), discardMessage) {
+			t.Errorf("log unexpectedly contains the discard record for a run whose adapter reported nothing:\n%s", lb.String())
 		}
 	})
 }
