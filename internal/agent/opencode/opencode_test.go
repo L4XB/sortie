@@ -1354,6 +1354,63 @@ printf '\n'`)
 	}, result, err)
 }
 
+// TestRunTurn_ReadErrorRecoversUsageFromExport pins recovery on the stdout
+// read-error arm. That arm also kills and waits for the process itself, and a
+// cancellation can surface through it as well as through the context case, so
+// without its own recovery the same work reports a figure or nothing
+// depending on which one fired first.
+func TestRunTurn_ReadErrorRecoversUsageFromExport(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+
+	exportPath := filepath.Join(tmpDir, "export.json")
+	const export = `{"messages":[{"info":{"role":"assistant","sessionID":"ses_abc123","providerID":"anthropic","modelID":"claude-sonnet-4-5","finish":"stop","tokens":{"input":10,"output":20,"total":30,"cache":{"read":0,"write":0}}}}]}`
+	if err := os.WriteFile(exportPath, []byte(export), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The first event teaches the adapter the session id an export needs;
+	// the oversized line after it is what fails the read.
+	script := writeOpenCodeScript(t, tmpDir, `case "$1" in
+  export) cat '`+exportPath+`'; exit 0;;
+esac
+printf '{"type":"step_start","timestamp":1000,"sessionID":"ses_abc123","part":{"id":"p1","messageID":"m1","sessionID":"ses_abc123","snapshot":"","type":"step-start"}}\n'
+head -c $((10*1024*1024+1)) /dev/zero | tr '\000' 'a'
+printf '\n'`)
+
+	a, _ := NewOpenCodeAdapter(map[string]any{})
+	session := mustStartSession(t, a, tmpDir, script)
+
+	events, result, err := collectEvents(t, a, session, "work")
+	if err == nil {
+		t.Fatal("RunTurn() error = nil, want oversized-line failure")
+	}
+	if result.ExitReason != domain.EventTurnFailed {
+		t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnFailed)
+	}
+	if !result.UsageMeasured {
+		t.Error("UsageMeasured = false; the export was readable and named a figure")
+	}
+	if result.Usage.InputTokens != 10 || result.Usage.OutputTokens != 20 {
+		t.Errorf("Usage = in:%d out:%d, want in:10 out:20",
+			result.Usage.InputTokens, result.Usage.OutputTokens)
+	}
+
+	var usageEvents []domain.AgentEvent
+	for _, ev := range events {
+		if ev.Type == domain.EventTokenUsage {
+			usageEvents = append(usageEvents, ev)
+		}
+	}
+	if len(usageEvents) != 1 {
+		t.Fatalf("token-usage events = %d, want exactly 1", len(usageEvents))
+	}
+	if usageEvents[0].Model != "anthropic/claude-sonnet-4-5" {
+		t.Errorf("Model = %q, want the model the export named", usageEvents[0].Model)
+	}
+}
+
 func TestRunTurn_EventAgentPID(t *testing.T) {
 	t.Parallel()
 

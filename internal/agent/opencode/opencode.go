@@ -467,6 +467,7 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 				if readErr := runtime.reader.Err(); readErr != nil && !errors.Is(readErr, procutil.ErrStdoutAbandoned) {
 					killTurnProcess(runtime)
 					_ = waitForProcess(runtime)
+					recovered := recoverUsage(ctx, state, turnWindow(state))
 					clearActive(state, runtime)
 
 					ev := agentcore.TurnEvidence{Terminal: agentcore.TerminalCancelled, TerminalMessage: "turn cancelled"}
@@ -479,7 +480,7 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 							Cause:             readErr,
 						}
 					}
-					result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, nil)
+					result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, recovered)
 					if agentErr != nil {
 						return result, agentErr
 					}
@@ -876,12 +877,13 @@ func isMaskedServerError(message string) bool {
 // recoverUsage runs the session export and returns what it recovered, or
 // nil when it recovered nothing.
 //
-// Every path that ends a turn needs this, not only the one where the
-// subprocess exited on its own: by the time a cancelled or timed-out turn
-// gets here the process has already been killed and waited for, and its
-// session export is just as readable as after a normal exit. Leaving it out
+// A turn that ends by exit, cancellation, read timeout or stdout read error
+// runs this: by the time it gets here the process has been waited for, and
+// its session export is just as readable in each case. Leaving it out of one
 // meant the same completed work reported a figure or reported nothing
-// depending only on which case of the select won.
+// depending only on which case of the select won. A session mismatch does
+// not run it, because the work ran in a session other than the one the
+// export would read.
 func recoverUsage(ctx context.Context, state *sessionState, sinceUnixMS int64) *agentcore.RecoveredUsage {
 	// WithoutCancel: this runs after the turn is over, and on the cancel path
 	// `ctx` is the thing that just fired -- deriving the export's own timeout
